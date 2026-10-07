@@ -25,3 +25,10 @@ Tree 5.10.269 (`calcite` aa10e74) preservada em `xiaomi-backport-5.10/`.
 4. Artefato `marble-ukee-6.12` (Image.gz + dtb/dtbo + defconfig + modules.tar.zst)
 
 Local: `scripts/kconfig/merge_config.sh -m arch/arm64/configs/gki_defconfig arch/arm64/configs/marble_ukee.fragment && make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig && make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image.gz dtbs`
+
+## Estado (run 37575654086 ✅ 33min)
+`marble-ukee-6.12` (92 arquivos, 34MB):
+- `Image` 32M + `Image.gz` 14M + `System.map` + `vendor-modules.tar.zst` 1.9M
+- `diwali.dtb` + overlays (`diwali-idp-amoled` p/ painel marble) + `marble-ukee-defconfig`
+- dtbs 0 erros; build sem LTO (`LTO_NONE=y`).
+- Próximo: fastboot boot de `boot`+`vendor_boot` com ramdisk recovery (não flashar).
