@@ -32,3 +32,13 @@ Local: `scripts/kconfig/merge_config.sh -m arch/arm64/configs/gki_defconfig arch
 - `diwali.dtb` + overlays (`diwali-idp-amoled` p/ painel marble) + `marble-ukee-defconfig`
 - dtbs 0 erros; build sem LTO (`LTO_NONE=y`).
 - Próximo: fastboot boot de `boot`+`vendor_boot` com ramdisk recovery (não flashar).
+
+## Estado (run 37585566341 ✅ 14min, com display)
+- `Image` 33M (`6.11.0-marble-ukee-6.12-gb422fc8b8cdf`) + `Image.gz` + modules
+- Display ligado no defconfig: `DRM_MSM=y`, `VISIONOX_R66451=y` (painel do dtbo stock),
+  `LABIBB=y`, `SPMI_ARB/MFD_SPMI/REG_SPMI=y`, `LTO_NONE=y`, console `ttyMSM0 earlycon`.
+- Fixes de link: `display/Makefile` (bloco marble apagava helpers) + nomes
+  `DRM_DISPLAY_DP_AUX_BUS`/`BRIDGE_CONNECTOR` (C16-C17).
+- Pendente p/ teste físico: `SM_GCC_8450`/`SM_DISPCC_8450` caíram no olddefconfig
+  (revisar deps); GCC ukee (SM7475) não existe na tree — se a tela não acender
+  mas o adb responder, o porte avança pelo pstore/mtdoops.
