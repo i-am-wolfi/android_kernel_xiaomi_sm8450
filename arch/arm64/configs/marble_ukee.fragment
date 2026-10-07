@@ -54,5 +54,8 @@ CONFIG_TCP_CONG_BBR=y
 CONFIG_TCP_CONG_WESTWOOD=y
 CONFIG_DEFAULT_WESTWOOD=y
 CONFIG_BUILD_ARM64_DT_OVERLAY=y
+# zram custom da base (backend_lzorle) incompatível c/ zcomp 6.11
+# (struct zcomp_params/ctx/req mudaram); swap off p/ boot de teste
+# CONFIG_ZRAM is not set
 # CONFIG_QCOM_SPSS is not set
 # CONFIG_RPMSG_QCOM_GLINK_SPSS is not set
