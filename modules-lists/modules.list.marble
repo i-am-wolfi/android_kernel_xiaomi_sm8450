@@ -1,0 +1,5 @@
+# marble / ukee (SM7475) - second_stage, derivado de modules.list.second_stage.marble (5.10)
+# 5.10 originais: qcom_pm8008-regulator.ko gt9916r.ko qcom-hv-haptics.ko fpc1540.ko goodix_3626.ko
+# 6.11 equivalentes upstream (quando disponiveis); manter nomes 5.10 como referencia p/ porte
+goodix_brl.ko
+qcom-hv-haptics.ko
