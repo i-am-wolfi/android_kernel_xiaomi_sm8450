@@ -70,10 +70,10 @@ jobs:
             [ "$(wc -c < "$dst")" -ge 50 ] || { rm -f "$dst"; echo "MISS $1 (miudo)"; return 1; }
             echo "FETCH $1"
           }
-          grep -rhoE "dt-bindings/[^\">]+" vendor/qcom/devicetrees/qcom/ 2>/dev/null | sort -u > /tmp/need.txt
+          grep -rhoE "dt-bindings/[A-Za-z0-9_./-]+\.h" vendor/qcom/devicetrees/qcom/ 2>/dev/null | sort -u > /tmp/need.txt
           wc -l /tmp/need.txt
           for round in 1 2 3 4; do
-            grep -rhoE "dt-bindings/[^\">]+" include/dt-bindings/ 2>/dev/null | sort -u >> /tmp/need.txt || true
+            grep -rhoE "dt-bindings/[A-Za-z0-9_./-]+\.h" include/dt-bindings/ 2>/dev/null | sort -u >> /tmp/need.txt || true
             sort -u /tmp/need.txt -o /tmp/need.txt
             added=0
             while read -r h; do
@@ -82,7 +82,7 @@ jobs:
             [ "$added" = "0" ] && break
           done
           echo "--- ainda faltando: ---"
-          while read -r h; do [ -f "include/$h" ] || echo "  $h"; done < /tmp/need.txt | head -n 30
+          (while read -r h; do [ -f "include/$h" ] || echo "  $h"; done < /tmp/need.txt | head -n 30) || true
           echo "--- event codes (nao sobrescrever o novo 6.11) ---"
           mkdir -p include/dt-bindings/input include/uapi/linux
           if [ ! -f include/uapi/linux/input-event-codes.h ]; then
