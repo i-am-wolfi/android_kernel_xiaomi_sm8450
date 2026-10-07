@@ -128,20 +128,20 @@ jobs:
           cp -v .config out/marble-ukee-defconfig 2>/dev/null || true
           cp -v /tmp/dtbs.log out/dtbs.log 2>/dev/null || true
           cp -v /tmp/build.log out/build.log 2>/dev/null || true
-          find -L arch/arm64/boot/dts -name "diwali*.dtb" -exec cp -v {} out/ \; 2>/dev/null | tail -n 10 || true
-          find -L arch/arm64/boot/dts -name "*.dtbo" -exec cp -v {} out/ \; 2>/dev/null | tail -n 5 || true
-          ls -lh out/ | head -n 40
+          (find -L arch/arm64/boot/dts -name "diwali*.dtb" -exec cp -v {} out/ \; 2>/dev/null | tail -n 10) || true
+          (find -L arch/arm64/boot/dts -name "*.dtbo" -exec cp -v {} out/ \; 2>/dev/null | tail -n 5) || true
+          (ls -lh out/ | head -n 40) || true
           if [ -f arch/arm64/boot/Image.gz ]; then
             mkdir -p /tmp/mods
-            make INSTALL_MOD_PATH=/tmp/mods INSTALL_MOD_STRIP=1 modules_install 2>&1 | tail -n 3 || true
+            (make INSTALL_MOD_PATH=/tmp/mods INSTALL_MOD_STRIP=1 modules_install 2>&1 | tail -n 3) || true
             (cd /tmp/mods && tar --zstd -cf "$GITHUB_WORKSPACE/out/vendor-modules.tar.zst" lib/ 2>/dev/null) || true
           else
             echo "SKIP modules_install (sem Image)"
           fi
           echo "--- erros do build (por arquivo, top 50) ---"
-          grep -aE "\.(c|h|S):[0-9]+:[0-9]+: (error|fatal error)" /tmp/build.log 2>/dev/null | sed -E 's/^.* ([a-zA-Z0-9_\/.-]+\.(c|h|S)):[0-9]+:[0-9]+: ((fatal )?error).*/\1/' | sort | uniq -c | sort -rn | head -n 50 || true
+          (grep -aE "\.(c|h|S):[0-9]+:[0-9]+: (error|fatal error)" /tmp/build.log 2>/dev/null | sed -E 's/^.* ([a-zA-Z0-9_\/.-]+\.(c|h|S)):[0-9]+:[0-9]+: ((fatal )?error).*/\1/' | sort | uniq -c | sort -rn | head -n 50) || true
           echo "--- undefined symbols (top 20) ---"
-          grep -aE "ld.lld: error: undefined symbol" /tmp/build.log 2>/dev/null | sed -E 's/.*undefined symbol: //' | sort | uniq -c | sort -rn | head -n 20 || true
+          (grep -aE "ld.lld: error: undefined symbol" /tmp/build.log 2>/dev/null | sed -E 's/.*undefined symbol: //' | sort | uniq -c | sort -rn | head -n 20) || true
 
       - uses: actions/upload-artifact@v4
         if: always()
