@@ -57,5 +57,19 @@ CONFIG_BUILD_ARM64_DT_OVERLAY=y
 # zram custom da base (backend_lzorle) incompatível c/ zcomp 6.11
 # (struct zcomp_params/ctx/req mudaram); swap off p/ boot de teste
 # CONFIG_ZRAM is not set
+# Display marble (Visionox R66451 AMOLED via DSI): sem DRM_MSM a tela
+# nunca acende (tela preta). Tudo =y (modulos stock sao 5.10, nao carregam no 6.11).
+CONFIG_SPMI_MSM_PMIC_ARB=y
+CONFIG_MFD_SPMI_PMIC=y
+CONFIG_REGULATOR_QCOM_SPMI=y
+CONFIG_REGULATOR_QCOM_LABIBB=y
+CONFIG_SM_GCC_8450=y
+CONFIG_SM_DISPCC_8450=y
+CONFIG_INTERCONNECT_QCOM_SM8450=y
+CONFIG_INTERCONNECT_QCOM_WAIPIO=y
+CONFIG_DRM_MSM=y
+CONFIG_DRM_PANEL_VISIONOX_R66451=y
+# console serial p/ debug de bringup (EXTEND mantem vendor cmdline junto)
+CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon stack_depot_disable=on cgroup_disable=pressure kasan.stacktrace=off kvm-arm.mode=protected bootconfig"
 # CONFIG_QCOM_SPSS is not set
 # CONFIG_RPMSG_QCOM_GLINK_SPSS is not set
