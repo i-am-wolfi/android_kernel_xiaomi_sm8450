@@ -56,7 +56,7 @@ def register_modules(registry):
     registry.register(
         name = "drivers/gpu/drm/display/drm_dp_aux_bus",
         out = "drm_dp_aux_bus.ko",
-        config = "CONFIG_DRM_DP_AUX_BUS",
+        config = "CONFIG_DRM_DISPLAY_DP_AUX_BUS",
         srcs = [
             # do not sort
             "drivers/gpu/drm/display/drm_dp_aux_bus.c",
