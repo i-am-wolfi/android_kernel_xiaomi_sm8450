@@ -2,13 +2,12 @@
 # Base: ltdq lineage-24.0 (6.11 / android16-6.12) + ACK
 # Build: make direto + clang, SEM LTO (mais rapido que thin-LTO p/ compilar)
 CONFIG_ARCH_WAIPIO=y
-CONFIG_ARCH_CAPE=y
 CONFIG_ARCH_DIWALI=y
 CONFIG_LOCALVERSION="-marble-ukee-6.12"
 # Sem LTO nos builds de teste (link LTO e lento); ligar so no final se preciso
+CONFIG_LTO_NONE=y
 # CONFIG_LTO_CLANG_THIN is not set
 # CONFIG_LTO_CLANG_FULL is not set
-# CONFIG_LTO_NONE is not set
 CONFIG_MHI_BUS_MISC=y
 CONFIG_REGMAP=y
 CONFIG_INTERCONNECT=y
