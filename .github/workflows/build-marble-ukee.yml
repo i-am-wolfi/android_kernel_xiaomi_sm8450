@@ -1,0 +1,95 @@
+name: build-marble-ukee-6.12
+
+# calcite-6.12 (5.10 -> 6.12): base ltdq lineage-24.0 (6.11/android16-6.12) + ACK
+# marble (Poco F5) / ukee (SM7475) sobre waipio. Build make direto + clang, SEM LTO.
+on:
+  workflow_dispatch:
+  push:
+    branches: [calcite-6.12]
+    paths:
+      - arch/**
+      - drivers/**
+      - vendor/**
+      - modules-lists/**
+      - build.config.msm.waipio
+      - .github/workflows/build-marble-ukee.yml
+
+env:
+  ARCH: arm64
+  LLVM: 1
+  LLVM_IAS: 1
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  KBUILD_BUILD_USER: marble
+  KBUILD_BUILD_HOST: action
+
+jobs:
+  image:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps + clang-19 + ccache (sem LTO = link rapido)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git-core flex bison build-essential \
+            zlib1g-dev libssl-dev libelf-dev dwarves device-tree-compiler \
+            gcc-aarch64-linux-gnu lz4 zstd cpio python3 lsb-release wget gnupg
+          sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)" -- 19 clang lld 2>&1 | tail -n 3
+          clang-19 --version | head -n 2
+          echo "/usr/lib/llvm-19/bin" >> "$GITHUB_PATH"
+          curl -sL https://github.com/ccache/ccache/releases/download/v4.14.1/ccache-4.14.1-linux-x86_64-glibc.tar.gz -o /tmp/ccache.tgz
+          tar -xzf /tmp/ccache.tgz -C /tmp
+          sudo install -m755 /tmp/ccache-4.14.1-linux-x86_64-glibc/ccache /usr/local/bin/ccache
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          ccache -M 4G; ccache -z; mkdir -p ~/.ccache
+      - uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-marble-ukee-${{ hashFiles('.github/workflows/build-marble-ukee.yml') }}-v1
+          restore-keys: ccache-marble-ukee-
+
+      - name: Defconfig marble/ukee (gki + fragment, sem LTO)
+        run: |
+          ln -sfn ../../../../vendor/qcom/devicetrees arch/arm64/boot/dts/vendor
+          ls -la arch/arm64/boot/dts/ | grep vendor
+          PATH="/usr/lib/llvm-19/bin:$PATH" scripts/kconfig/merge_config.sh -m arch/arm64/configs/gki_defconfig arch/arm64/configs/marble_ukee.fragment
+          PATH="/usr/lib/llvm-19/bin:$PATH" make ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -E "^CONFIG_ARCH_WAIPIO|^CONFIG_ARCH_DIWALI|^CONFIG_LOCALVERSION" .config
+          grep -E "CONFIG_LTO_CLANG_THIN|CONFIG_LTO_CLANG_FULL" .config || echo "LTO off OK"
+
+      - name: DTBs fail-fast
+        run: |
+          export PATH="/usr/lib/llvm-19/bin:/usr/local/bin:$PATH"
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 dtbs 2>&1 | tail -n 8
+        timeout-minutes: 15
+
+      - name: Build Image.gz + modules + dtbs (sem LTO)
+        run: |
+          export PATH="/usr/lib/llvm-19/bin:/usr/local/bin:$PATH"
+          nproc; free -g | head -n 2
+          make -j$(nproc) CC="ccache clang" Image.gz dtbs 2>&1 | tee /tmp/build.log | tail -n 15
+          ccache -s | head -n 12
+        timeout-minutes: 300
+
+      - name: Coleta artefatos
+        if: always()
+        run: |
+          mkdir -p out
+          cp -v arch/arm64/boot/Image* out/ 2>/dev/null || true
+          cp -v System.map out/ 2>/dev/null || true
+          cp -v .config out/marble-ukee-defconfig 2>/dev/null || true
+          find -L arch/arm64/boot/dts -name "diwali*.dtb" -exec cp -v {} out/ \; 2>/dev/null | tail -n 6
+          find -L arch/arm64/boot/dts -name "*.dtbo" -exec cp -v {} out/ \; 2>/dev/null | tail -n 3
+          ls -lh out/ | head -n 30
+          mkdir -p /tmp/mods
+          make INSTALL_MOD_PATH=/tmp/mods INSTALL_MOD_STRIP=1 modules_install 2>&1 | tail -n 3 || true
+          (cd /tmp/mods && tar --zstd -cf "$GITHUB_WORKSPACE/out/vendor-modules.tar.zst" lib/ 2>/dev/null) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marble-ukee-6.12
+          path: out/
+          retention-days: 7
