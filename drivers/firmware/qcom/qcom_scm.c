@@ -40,7 +40,7 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 #include <linux/qti-lcp-ppddr.h>
-#include <include/linux/arm-smccc.h>
+#include <linux/arm-smccc.h>
 #include <linux/qtee_shmbridge.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <linux/firmware/qcom/qcom_scm_hab.h>
