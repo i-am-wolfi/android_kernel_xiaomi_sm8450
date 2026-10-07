@@ -13,7 +13,7 @@
 #define _LINUX_RNDIS_H
 
 #include <linux/rndis.h>
-#include "u_ether.h"
+#include "drivers/usb/gadget/function/u_ether.h"
 #include "ndis.h"
 
 #define RNDIS_MAXIMUM_FRAME_SIZE	1518
@@ -174,6 +174,7 @@ typedef struct rndis_params {
 	void			(*resp_avail)(void *v);
 	void			*v;
 	struct list_head	resp_queue;
+	spinlock_t		resp_lock;
 } rndis_params;
 
 /* RNDIS Message parser and other useless functions */

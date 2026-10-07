@@ -118,7 +118,6 @@ struct xt_hashlimit_htable {
 	refcount_t use;
 	u_int8_t family;
 	bool rnd_initialized;
-	bool ratematch;
 
 	struct hashlimit_cfg3 cfg;	/* config */
 
@@ -326,7 +325,6 @@ static int htable_create(struct net *net, struct hashlimit_cfg3 *cfg,
 		vfree(hinfo);
 		return -ENOMEM;
 	}
-	hinfo->ratematch = !!(cfg->mode & XT_HASHLIMIT_RATE_MATCH);
 	spin_lock_init(&hinfo->lock);
 
 	switch (revision) {
@@ -870,10 +868,7 @@ static int hashlimit_mt_check_common(const struct xt_mtchk_param *par,
 	}
 
 	/* Check for overflow. */
-	if (cfg->mode & XT_HASHLIMIT_RATE_MATCH) {
-		if (revision < 3)
-			return -EINVAL;
-
+	if (revision >= 3 && cfg->mode & XT_HASHLIMIT_RATE_MATCH) {
 		if (cfg->avg == 0 || cfg->avg > U32_MAX) {
 			pr_info_ratelimited("invalid rate\n");
 			return -ERANGE;
@@ -905,15 +900,6 @@ static int hashlimit_mt_check_common(const struct xt_mtchk_param *par,
 		if (ret < 0) {
 			mutex_unlock(&hashlimit_mutex);
 			return ret;
-		}
-	} else {
-		if ((cfg->mode & XT_HASHLIMIT_RATE_MATCH &&
-		     !(*hinfo)->ratematch) ||
-		    (!(cfg->mode & XT_HASHLIMIT_RATE_MATCH) &&
-		      (*hinfo)->ratematch)) {
-			mutex_unlock(&hashlimit_mutex);
-			htable_put(*hinfo);
-			return -EINVAL;
 		}
 	}
 	mutex_unlock(&hashlimit_mutex);
@@ -1066,7 +1052,7 @@ static struct xt_match hashlimit_mt_reg[] __read_mostly = {
 static void *dl_seq_start(struct seq_file *s, loff_t *pos)
 	__acquires(htable->lock)
 {
-	struct xt_hashlimit_htable *htable = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *htable = pde_data(file_inode(s->file));
 	unsigned int *bucket;
 
 	spin_lock_bh(&htable->lock);
@@ -1083,7 +1069,7 @@ static void *dl_seq_start(struct seq_file *s, loff_t *pos)
 
 static void *dl_seq_next(struct seq_file *s, void *v, loff_t *pos)
 {
-	struct xt_hashlimit_htable *htable = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *htable = pde_data(file_inode(s->file));
 	unsigned int *bucket = v;
 
 	*pos = ++(*bucket);
@@ -1097,7 +1083,7 @@ static void *dl_seq_next(struct seq_file *s, void *v, loff_t *pos)
 static void dl_seq_stop(struct seq_file *s, void *v)
 	__releases(htable->lock)
 {
-	struct xt_hashlimit_htable *htable = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *htable = pde_data(file_inode(s->file));
 	unsigned int *bucket = v;
 
 	if (!IS_ERR(bucket))
@@ -1139,7 +1125,7 @@ static void dl_seq_print(struct dsthash_ent *ent, u_int8_t family,
 static int dl_seq_real_show_v2(struct dsthash_ent *ent, u_int8_t family,
 			       struct seq_file *s)
 {
-	struct xt_hashlimit_htable *ht = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *ht = pde_data(file_inode(s->file));
 
 	spin_lock(&ent->lock);
 	/* recalculate to show accurate numbers */
@@ -1154,7 +1140,7 @@ static int dl_seq_real_show_v2(struct dsthash_ent *ent, u_int8_t family,
 static int dl_seq_real_show_v1(struct dsthash_ent *ent, u_int8_t family,
 			       struct seq_file *s)
 {
-	struct xt_hashlimit_htable *ht = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *ht = pde_data(file_inode(s->file));
 
 	spin_lock(&ent->lock);
 	/* recalculate to show accurate numbers */
@@ -1169,7 +1155,7 @@ static int dl_seq_real_show_v1(struct dsthash_ent *ent, u_int8_t family,
 static int dl_seq_real_show(struct dsthash_ent *ent, u_int8_t family,
 			    struct seq_file *s)
 {
-	struct xt_hashlimit_htable *ht = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *ht = pde_data(file_inode(s->file));
 
 	spin_lock(&ent->lock);
 	/* recalculate to show accurate numbers */
@@ -1183,7 +1169,7 @@ static int dl_seq_real_show(struct dsthash_ent *ent, u_int8_t family,
 
 static int dl_seq_show_v2(struct seq_file *s, void *v)
 {
-	struct xt_hashlimit_htable *htable = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *htable = pde_data(file_inode(s->file));
 	unsigned int *bucket = (unsigned int *)v;
 	struct dsthash_ent *ent;
 
@@ -1197,7 +1183,7 @@ static int dl_seq_show_v2(struct seq_file *s, void *v)
 
 static int dl_seq_show_v1(struct seq_file *s, void *v)
 {
-	struct xt_hashlimit_htable *htable = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *htable = pde_data(file_inode(s->file));
 	unsigned int *bucket = v;
 	struct dsthash_ent *ent;
 
@@ -1211,7 +1197,7 @@ static int dl_seq_show_v1(struct seq_file *s, void *v)
 
 static int dl_seq_show(struct seq_file *s, void *v)
 {
-	struct xt_hashlimit_htable *htable = PDE_DATA(file_inode(s->file));
+	struct xt_hashlimit_htable *htable = pde_data(file_inode(s->file));
 	unsigned int *bucket = v;
 	struct dsthash_ent *ent;
 

@@ -2,6 +2,7 @@
 /*
  * Simple kernel console driver for STM devices
  * Copyright (c) 2014, Intel Corporation.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * STM console will send kernel messages over STM devices to a trace host.
  */
@@ -22,6 +23,7 @@ static struct stm_console {
 	.data	= {
 		.name		= "console",
 		.nr_chans	= 1,
+		.type		= STM_USER,
 		.link		= stm_console_link,
 		.unlink		= stm_console_unlink,
 	},

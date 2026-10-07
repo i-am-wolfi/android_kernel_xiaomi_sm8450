@@ -57,6 +57,19 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 	struct iphdr *iph;
 	int err;
 
+	if (unlikely(dev_recursion_level() > IP_TUNNEL_RECURSION_LIMIT)) {
+		if (dev) {
+			net_crit_ratelimited("Dead loop on virtual device %s, fix it urgently!\n",
+					     dev->name);
+			DEV_STATS_INC(dev, tx_errors);
+		}
+		ip_rt_put(rt);
+		kfree_skb(skb);
+		return;
+	}
+
+	dev_xmit_recursion_inc();
+
 	skb_scrub_packet(skb, xnet);
 
 	skb_clear_hash_if_not_l4(skb);
@@ -86,6 +99,8 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 			pkt_len = 0;
 		iptunnel_xmit_stats(dev, pkt_len);
 	}
+
+	dev_xmit_recursion_dec();
 }
 EXPORT_SYMBOL_GPL(iptunnel_xmit);
 
@@ -125,6 +140,7 @@ EXPORT_SYMBOL_GPL(__iptunnel_pull_header);
 struct metadata_dst *iptunnel_metadata_reply(struct metadata_dst *md,
 					     gfp_t flags)
 {
+	IP_TUNNEL_DECLARE_FLAGS(tun_flags) = { };
 	struct metadata_dst *res;
 	struct ip_tunnel_info *dst, *src;
 
@@ -144,10 +160,10 @@ struct metadata_dst *iptunnel_metadata_reply(struct metadata_dst *md,
 		       sizeof(struct in6_addr));
 	else
 		dst->key.u.ipv4.dst = src->key.u.ipv4.src;
-	dst->key.tun_flags = src->key.tun_flags;
+	ip_tunnel_flags_copy(dst->key.tun_flags, src->key.tun_flags);
 	dst->mode = src->mode | IP_TUNNEL_INFO_TX;
 	ip_tunnel_info_opts_set(dst, ip_tunnel_info_opts(src),
-				src->options_len, 0);
+				src->options_len, tun_flags);
 
 	return res;
 }
@@ -194,7 +210,7 @@ EXPORT_SYMBOL_GPL(iptunnel_handle_offloads);
  */
 static int iptunnel_pmtud_build_icmp(struct sk_buff *skb, int mtu)
 {
-	const struct iphdr *iph;
+	const struct iphdr *iph = ip_hdr(skb);
 	struct icmphdr *icmph;
 	struct iphdr *niph;
 	struct ethhdr eh;
@@ -208,6 +224,7 @@ static int iptunnel_pmtud_build_icmp(struct sk_buff *skb, int mtu)
 
 	skb_copy_bits(skb, skb_mac_offset(skb), &eh, ETH_HLEN);
 	pskb_pull(skb, ETH_HLEN);
+	skb_reset_network_header(skb);
 
 	err = pskb_trim(skb, 576 - sizeof(*niph) - sizeof(*icmph));
 	if (err)
@@ -217,14 +234,14 @@ static int iptunnel_pmtud_build_icmp(struct sk_buff *skb, int mtu)
 	err = skb_cow(skb, sizeof(*niph) + sizeof(*icmph) + ETH_HLEN);
 	if (err)
 		return err;
-	iph = ip_hdr(skb);
+
 	icmph = skb_push(skb, sizeof(*icmph));
 	*icmph = (struct icmphdr) {
 		.type			= ICMP_DEST_UNREACH,
 		.code			= ICMP_FRAG_NEEDED,
 		.checksum		= 0,
 		.un.frag.__unused	= 0,
-		.un.frag.mtu		= ntohs(mtu),
+		.un.frag.mtu		= htons(mtu),
 	};
 	icmph->checksum = csum_fold(skb_checksum(skb, 0, len, 0));
 	skb_reset_transport_header(skb);
@@ -247,7 +264,7 @@ static int iptunnel_pmtud_build_icmp(struct sk_buff *skb, int mtu)
 
 	skb->ip_summed = CHECKSUM_NONE;
 
-	eth_header(skb, skb->dev, htons(eh.h_proto), eh.h_source, eh.h_dest, 0);
+	eth_header(skb, skb->dev, ntohs(eh.h_proto), eh.h_source, eh.h_dest, 0);
 	skb_reset_mac_header(skb);
 
 	return skb->len;
@@ -262,6 +279,7 @@ static int iptunnel_pmtud_build_icmp(struct sk_buff *skb, int mtu)
  */
 static int iptunnel_pmtud_check_icmp(struct sk_buff *skb, int mtu)
 {
+	const struct icmphdr *icmph = icmp_hdr(skb);
 	const struct iphdr *iph = ip_hdr(skb);
 
 	if (mtu < 576 || iph->frag_off != htons(IP_DF))
@@ -272,17 +290,9 @@ static int iptunnel_pmtud_check_icmp(struct sk_buff *skb, int mtu)
 	    ipv4_is_lbcast(iph->saddr)  || ipv4_is_multicast(iph->saddr))
 		return 0;
 
-	if (iph->protocol == IPPROTO_ICMP) {
-		const struct icmphdr *icmph;
+	if (iph->protocol == IPPROTO_ICMP && icmp_is_err(icmph->type))
+		return 0;
 
-		if (!pskb_network_may_pull(skb, iph->ihl * 4 +
-						offsetofend(struct icmphdr, type)))
-			return 0;
-		iph = ip_hdr(skb);
-		icmph = (void *)iph + iph->ihl * 4;
-		if (icmp_is_err(icmph->type))
-			return 0;
-	}
 	return iptunnel_pmtud_build_icmp(skb, mtu);
 }
 
@@ -296,7 +306,7 @@ static int iptunnel_pmtud_check_icmp(struct sk_buff *skb, int mtu)
  */
 static int iptunnel_pmtud_build_icmpv6(struct sk_buff *skb, int mtu)
 {
-	const struct ipv6hdr *ip6h;
+	const struct ipv6hdr *ip6h = ipv6_hdr(skb);
 	struct icmp6hdr *icmp6h;
 	struct ipv6hdr *nip6h;
 	struct ethhdr eh;
@@ -311,6 +321,7 @@ static int iptunnel_pmtud_build_icmpv6(struct sk_buff *skb, int mtu)
 
 	skb_copy_bits(skb, skb_mac_offset(skb), &eh, ETH_HLEN);
 	pskb_pull(skb, ETH_HLEN);
+	skb_reset_network_header(skb);
 
 	err = pskb_trim(skb, IPV6_MIN_MTU - sizeof(*nip6h) - sizeof(*icmp6h));
 	if (err)
@@ -321,7 +332,6 @@ static int iptunnel_pmtud_build_icmpv6(struct sk_buff *skb, int mtu)
 	if (err)
 		return err;
 
-	ip6h = ipv6_hdr(skb);
 	icmp6h = skb_push(skb, sizeof(*icmp6h));
 	*icmp6h = (struct icmp6hdr) {
 		.icmp6_type		= ICMPV6_PKT_TOOBIG,
@@ -350,7 +360,7 @@ static int iptunnel_pmtud_build_icmpv6(struct sk_buff *skb, int mtu)
 
 	skb->ip_summed = CHECKSUM_NONE;
 
-	eth_header(skb, skb->dev, htons(eh.h_proto), eh.h_source, eh.h_dest, 0);
+	eth_header(skb, skb->dev, ntohs(eh.h_proto), eh.h_source, eh.h_dest, 0);
 	skb_reset_mac_header(skb);
 
 	return skb->len;
@@ -441,15 +451,6 @@ int skb_tunnel_check_pmtu(struct sk_buff *skb, struct dst_entry *encap_dst,
 }
 EXPORT_SYMBOL(skb_tunnel_check_pmtu);
 
-/* Often modified stats are per cpu, other are shared (netdev->stats) */
-void ip_tunnel_get_stats64(struct net_device *dev,
-			   struct rtnl_link_stats64 *tot)
-{
-	netdev_stats_to_stats64(tot, &dev->stats);
-	dev_fetch_sw_netstats(tot, dev->tstats);
-}
-EXPORT_SYMBOL_GPL(ip_tunnel_get_stats64);
-
 static const struct nla_policy ip_tun_policy[LWTUNNEL_IP_MAX + 1] = {
 	[LWTUNNEL_IP_UNSPEC]	= { .strict_start_type = LWTUNNEL_IP_OPTS },
 	[LWTUNNEL_IP_ID]	= { .type = NLA_U64 },
@@ -518,7 +519,7 @@ static int ip_tun_parse_opts_geneve(struct nlattr *attr,
 		opt->opt_class = nla_get_be16(attr);
 		attr = tb[LWTUNNEL_IP_OPT_GENEVE_TYPE];
 		opt->type = nla_get_u8(attr);
-		info->key.tun_flags |= TUNNEL_GENEVE_OPT;
+		__set_bit(IP_TUNNEL_GENEVE_OPT_BIT, info->key.tun_flags);
 	}
 
 	return sizeof(struct geneve_opt) + data_len;
@@ -546,7 +547,7 @@ static int ip_tun_parse_opts_vxlan(struct nlattr *attr,
 		attr = tb[LWTUNNEL_IP_OPT_VXLAN_GBP];
 		md->gbp = nla_get_u32(attr);
 		md->gbp &= VXLAN_GBP_MASK;
-		info->key.tun_flags |= TUNNEL_VXLAN_OPT;
+		__set_bit(IP_TUNNEL_VXLAN_OPT_BIT, info->key.tun_flags);
 	}
 
 	return sizeof(struct vxlan_metadata);
@@ -595,7 +596,7 @@ static int ip_tun_parse_opts_erspan(struct nlattr *attr,
 			set_hwid(&md->u.md2, nla_get_u8(attr));
 		}
 
-		info->key.tun_flags |= TUNNEL_ERSPAN_OPT;
+		__set_bit(IP_TUNNEL_ERSPAN_OPT_BIT, info->key.tun_flags);
 	}
 
 	return sizeof(struct erspan_metadata);
@@ -604,8 +605,9 @@ static int ip_tun_parse_opts_erspan(struct nlattr *attr,
 static int ip_tun_parse_opts(struct nlattr *attr, struct ip_tunnel_info *info,
 			     struct netlink_ext_ack *extack)
 {
-	int err, rem, opt_len, opts_len = 0, type = 0;
+	int err, rem, opt_len, opts_len = 0;
 	struct nlattr *nla;
+	u32 type = 0;
 
 	if (!attr)
 		return 0;
@@ -618,7 +620,7 @@ static int ip_tun_parse_opts(struct nlattr *attr, struct ip_tunnel_info *info,
 	nla_for_each_attr(nla, nla_data(attr), nla_len(attr), rem) {
 		switch (nla_type(nla)) {
 		case LWTUNNEL_IP_OPTS_GENEVE:
-			if (type && type != TUNNEL_GENEVE_OPT)
+			if (type && type != IP_TUNNEL_GENEVE_OPT_BIT)
 				return -EINVAL;
 			opt_len = ip_tun_parse_opts_geneve(nla, info, opts_len,
 							   extack);
@@ -627,7 +629,7 @@ static int ip_tun_parse_opts(struct nlattr *attr, struct ip_tunnel_info *info,
 			opts_len += opt_len;
 			if (opts_len > IP_TUNNEL_OPTS_MAX)
 				return -EINVAL;
-			type = TUNNEL_GENEVE_OPT;
+			type = IP_TUNNEL_GENEVE_OPT_BIT;
 			break;
 		case LWTUNNEL_IP_OPTS_VXLAN:
 			if (type)
@@ -637,7 +639,7 @@ static int ip_tun_parse_opts(struct nlattr *attr, struct ip_tunnel_info *info,
 			if (opt_len < 0)
 				return opt_len;
 			opts_len += opt_len;
-			type = TUNNEL_VXLAN_OPT;
+			type = IP_TUNNEL_VXLAN_OPT_BIT;
 			break;
 		case LWTUNNEL_IP_OPTS_ERSPAN:
 			if (type)
@@ -647,7 +649,7 @@ static int ip_tun_parse_opts(struct nlattr *attr, struct ip_tunnel_info *info,
 			if (opt_len < 0)
 				return opt_len;
 			opts_len += opt_len;
-			type = TUNNEL_ERSPAN_OPT;
+			type = IP_TUNNEL_ERSPAN_OPT_BIT;
 			break;
 		default:
 			return -EINVAL;
@@ -725,10 +727,16 @@ static int ip_tun_build_state(struct net *net, struct nlattr *attr,
 	if (tb[LWTUNNEL_IP_TOS])
 		tun_info->key.tos = nla_get_u8(tb[LWTUNNEL_IP_TOS]);
 
-	if (tb[LWTUNNEL_IP_FLAGS])
-		tun_info->key.tun_flags |=
-				(nla_get_be16(tb[LWTUNNEL_IP_FLAGS]) &
-				 ~TUNNEL_OPTIONS_PRESENT);
+	if (tb[LWTUNNEL_IP_FLAGS]) {
+		IP_TUNNEL_DECLARE_FLAGS(flags);
+
+		ip_tunnel_flags_from_be16(flags,
+					  nla_get_be16(tb[LWTUNNEL_IP_FLAGS]));
+		ip_tunnel_clear_options_present(flags);
+
+		ip_tunnel_flags_or(tun_info->key.tun_flags,
+				   tun_info->key.tun_flags, flags);
+	}
 
 	tun_info->mode = IP_TUNNEL_INFO_TX;
 	tun_info->options_len = opt_len;
@@ -832,18 +840,18 @@ static int ip_tun_fill_encap_opts(struct sk_buff *skb, int type,
 	struct nlattr *nest;
 	int err = 0;
 
-	if (!(tun_info->key.tun_flags & TUNNEL_OPTIONS_PRESENT))
+	if (!ip_tunnel_is_options_present(tun_info->key.tun_flags))
 		return 0;
 
 	nest = nla_nest_start_noflag(skb, type);
 	if (!nest)
 		return -ENOMEM;
 
-	if (tun_info->key.tun_flags & TUNNEL_GENEVE_OPT)
+	if (test_bit(IP_TUNNEL_GENEVE_OPT_BIT, tun_info->key.tun_flags))
 		err = ip_tun_fill_encap_opts_geneve(skb, tun_info);
-	else if (tun_info->key.tun_flags & TUNNEL_VXLAN_OPT)
+	else if (test_bit(IP_TUNNEL_VXLAN_OPT_BIT, tun_info->key.tun_flags))
 		err = ip_tun_fill_encap_opts_vxlan(skb, tun_info);
-	else if (tun_info->key.tun_flags & TUNNEL_ERSPAN_OPT)
+	else if (test_bit(IP_TUNNEL_ERSPAN_OPT_BIT, tun_info->key.tun_flags))
 		err = ip_tun_fill_encap_opts_erspan(skb, tun_info);
 
 	if (err) {
@@ -866,7 +874,8 @@ static int ip_tun_fill_encap_info(struct sk_buff *skb,
 	    nla_put_in_addr(skb, LWTUNNEL_IP_SRC, tun_info->key.u.ipv4.src) ||
 	    nla_put_u8(skb, LWTUNNEL_IP_TOS, tun_info->key.tos) ||
 	    nla_put_u8(skb, LWTUNNEL_IP_TTL, tun_info->key.ttl) ||
-	    nla_put_be16(skb, LWTUNNEL_IP_FLAGS, tun_info->key.tun_flags) ||
+	    nla_put_be16(skb, LWTUNNEL_IP_FLAGS,
+			 ip_tunnel_flags_to_be16(tun_info->key.tun_flags)) ||
 	    ip_tun_fill_encap_opts(skb, LWTUNNEL_IP_OPTS, tun_info))
 		return -ENOMEM;
 
@@ -877,11 +886,11 @@ static int ip_tun_opts_nlsize(struct ip_tunnel_info *info)
 {
 	int opt_len;
 
-	if (!(info->key.tun_flags & TUNNEL_OPTIONS_PRESENT))
+	if (!ip_tunnel_is_options_present(info->key.tun_flags))
 		return 0;
 
 	opt_len = nla_total_size(0);		/* LWTUNNEL_IP_OPTS */
-	if (info->key.tun_flags & TUNNEL_GENEVE_OPT) {
+	if (test_bit(IP_TUNNEL_GENEVE_OPT_BIT, info->key.tun_flags)) {
 		struct geneve_opt *opt;
 		int offset = 0;
 
@@ -894,10 +903,10 @@ static int ip_tun_opts_nlsize(struct ip_tunnel_info *info)
 							/* OPT_GENEVE_DATA */
 			offset += sizeof(*opt) + opt->length * 4;
 		}
-	} else if (info->key.tun_flags & TUNNEL_VXLAN_OPT) {
+	} else if (test_bit(IP_TUNNEL_VXLAN_OPT_BIT, info->key.tun_flags)) {
 		opt_len += nla_total_size(0)	/* LWTUNNEL_IP_OPTS_VXLAN */
 			   + nla_total_size(4);	/* OPT_VXLAN_GBP */
-	} else if (info->key.tun_flags & TUNNEL_ERSPAN_OPT) {
+	} else if (test_bit(IP_TUNNEL_ERSPAN_OPT_BIT, info->key.tun_flags)) {
 		struct erspan_metadata *md = ip_tunnel_info_opts(info);
 
 		opt_len += nla_total_size(0)	/* LWTUNNEL_IP_OPTS_ERSPAN */
@@ -1004,10 +1013,17 @@ static int ip6_tun_build_state(struct net *net, struct nlattr *attr,
 	if (tb[LWTUNNEL_IP6_TC])
 		tun_info->key.tos = nla_get_u8(tb[LWTUNNEL_IP6_TC]);
 
-	if (tb[LWTUNNEL_IP6_FLAGS])
-		tun_info->key.tun_flags |=
-				(nla_get_be16(tb[LWTUNNEL_IP6_FLAGS]) &
-				 ~TUNNEL_OPTIONS_PRESENT);
+	if (tb[LWTUNNEL_IP6_FLAGS]) {
+		IP_TUNNEL_DECLARE_FLAGS(flags);
+		__be16 data;
+
+		data = nla_get_be16(tb[LWTUNNEL_IP6_FLAGS]);
+		ip_tunnel_flags_from_be16(flags, data);
+		ip_tunnel_clear_options_present(flags);
+
+		ip_tunnel_flags_or(tun_info->key.tun_flags,
+				   tun_info->key.tun_flags, flags);
+	}
 
 	tun_info->mode = IP_TUNNEL_INFO_TX | IP_TUNNEL_INFO_IPV6;
 	tun_info->options_len = opt_len;
@@ -1028,7 +1044,8 @@ static int ip6_tun_fill_encap_info(struct sk_buff *skb,
 	    nla_put_in6_addr(skb, LWTUNNEL_IP6_SRC, &tun_info->key.u.ipv6.src) ||
 	    nla_put_u8(skb, LWTUNNEL_IP6_TC, tun_info->key.tos) ||
 	    nla_put_u8(skb, LWTUNNEL_IP6_HOPLIMIT, tun_info->key.ttl) ||
-	    nla_put_be16(skb, LWTUNNEL_IP6_FLAGS, tun_info->key.tun_flags) ||
+	    nla_put_be16(skb, LWTUNNEL_IP6_FLAGS,
+			 ip_tunnel_flags_to_be16(tun_info->key.tun_flags)) ||
 	    ip_tun_fill_encap_opts(skb, LWTUNNEL_IP6_OPTS, tun_info))
 		return -ENOMEM;
 
@@ -1134,3 +1151,39 @@ bool ip_tunnel_netlink_encap_parms(struct nlattr *data[],
 	return ret;
 }
 EXPORT_SYMBOL_GPL(ip_tunnel_netlink_encap_parms);
+
+void ip_tunnel_netlink_parms(struct nlattr *data[],
+			     struct ip_tunnel_parm_kern *parms)
+{
+	if (data[IFLA_IPTUN_LINK])
+		parms->link = nla_get_u32(data[IFLA_IPTUN_LINK]);
+
+	if (data[IFLA_IPTUN_LOCAL])
+		parms->iph.saddr = nla_get_be32(data[IFLA_IPTUN_LOCAL]);
+
+	if (data[IFLA_IPTUN_REMOTE])
+		parms->iph.daddr = nla_get_be32(data[IFLA_IPTUN_REMOTE]);
+
+	if (data[IFLA_IPTUN_TTL]) {
+		parms->iph.ttl = nla_get_u8(data[IFLA_IPTUN_TTL]);
+		if (parms->iph.ttl)
+			parms->iph.frag_off = htons(IP_DF);
+	}
+
+	if (data[IFLA_IPTUN_TOS])
+		parms->iph.tos = nla_get_u8(data[IFLA_IPTUN_TOS]);
+
+	if (!data[IFLA_IPTUN_PMTUDISC] || nla_get_u8(data[IFLA_IPTUN_PMTUDISC]))
+		parms->iph.frag_off = htons(IP_DF);
+
+	if (data[IFLA_IPTUN_FLAGS]) {
+		__be16 flags;
+
+		flags = nla_get_be16(data[IFLA_IPTUN_FLAGS]);
+		ip_tunnel_flags_from_be16(parms->i_flags, flags);
+	}
+
+	if (data[IFLA_IPTUN_PROTO])
+		parms->iph.protocol = nla_get_u8(data[IFLA_IPTUN_PROTO]);
+}
+EXPORT_SYMBOL_GPL(ip_tunnel_netlink_parms);

@@ -126,10 +126,7 @@ rmnet_map_ingress_handler(struct sk_buff *skb,
 
 		consume_skb(skb);
 	} else {
-		if (rmnet_map_validate_packet_len(skb, port))
-			__rmnet_map_ingress_handler(skb, port);
-		else
-			kfree_skb(skb);
+		__rmnet_map_ingress_handler(skb, port);
 	}
 }
 
@@ -137,7 +134,7 @@ static int rmnet_map_egress_handler(struct sk_buff *skb,
 				    struct rmnet_port *port, u8 mux_id,
 				    struct net_device *orig_dev)
 {
-	int required_headroom, additional_header_len;
+	int required_headroom, additional_header_len, csum_type = 0;
 	struct rmnet_map_header *map_header;
 
 	additional_header_len = 0;
@@ -145,18 +142,23 @@ static int rmnet_map_egress_handler(struct sk_buff *skb,
 
 	if (port->data_format & RMNET_FLAGS_EGRESS_MAP_CKSUMV4) {
 		additional_header_len = sizeof(struct rmnet_map_ul_csum_header);
-		required_headroom += additional_header_len;
+		csum_type = RMNET_FLAGS_EGRESS_MAP_CKSUMV4;
+	} else if (port->data_format & RMNET_FLAGS_EGRESS_MAP_CKSUMV5) {
+		additional_header_len = sizeof(struct rmnet_map_v5_csum_header);
+		csum_type = RMNET_FLAGS_EGRESS_MAP_CKSUMV5;
 	}
 
-	if (skb_headroom(skb) < required_headroom) {
-		if (pskb_expand_head(skb, required_headroom, 0, GFP_ATOMIC))
-			return -ENOMEM;
-	}
+	required_headroom += additional_header_len;
 
-	if (port->data_format & RMNET_FLAGS_EGRESS_MAP_CKSUMV4)
-		rmnet_map_checksum_uplink_packet(skb, orig_dev);
+	if (skb_cow_head(skb, required_headroom) < 0)
+		return -ENOMEM;
 
-	map_header = rmnet_map_add_map_header(skb, additional_header_len, 0);
+	if (csum_type)
+		rmnet_map_checksum_uplink_packet(skb, port, orig_dev,
+						 csum_type);
+
+	map_header = rmnet_map_add_map_header(skb, additional_header_len,
+					      port, 0);
 	if (!map_header)
 		return -ENOMEM;
 
@@ -204,13 +206,18 @@ rx_handler_result_t rmnet_rx_handler(struct sk_buff **pskb)
 	if (!skb)
 		goto done;
 
+	if (skb_linearize(skb)) {
+		kfree_skb(skb);
+		goto done;
+	}
+
 	if (skb->pkt_type == PACKET_LOOPBACK)
 		return RX_HANDLER_PASS;
 
 	dev = skb->dev;
 	port = rmnet_get_port_rcu(dev);
 	if (unlikely(!port)) {
-		atomic_long_inc(&skb->dev->rx_nohandler);
+		dev_core_stats_rx_nohandler_inc(skb->dev);
 		kfree_skb(skb);
 		goto done;
 	}

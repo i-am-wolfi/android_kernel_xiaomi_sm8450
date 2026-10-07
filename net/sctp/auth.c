@@ -738,7 +738,7 @@ void sctp_auth_calculate_hmac(const struct sctp_association *asoc,
 
 	tfm = asoc->ep->auth_hmacs[hmac_id];
 
-	digest = auth->auth_hdr.hmac;
+	digest = (u8 *)(&auth->auth_hdr + 1);
 	if (crypto_shash_setkey(tfm, &asoc_key->data[0], asoc_key->len))
 		goto free;
 
@@ -766,7 +766,7 @@ int sctp_auth_ep_add_chunkid(struct sctp_endpoint *ep, __u8 chunk_id)
 	/* Check if we can add this chunk to the array */
 	param_len = ntohs(p->param_hdr.length);
 	nchunks = param_len - sizeof(struct sctp_paramhdr);
-	if (nchunks == SCTP_AUTH_MAX_CHUNKS)
+	if (nchunks == SCTP_NUM_CHUNK_TYPES)
 		return -EINVAL;
 
 	p->chunks[nchunks] = chunk_id;

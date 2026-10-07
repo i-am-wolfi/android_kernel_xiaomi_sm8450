@@ -1,18 +1,16 @@
-# SPDX-License-Identifier: GPL-2.0-only
-#
-# Makefile for cpuidle governors.
-#
+# SPDX-License-Identifier: GPL-2.0
 
-CFLAGS_qcom_lpm.o := -I$(src)
+ccflags-y += -I$(src)
+
+obj-$(CONFIG_CPU_IDLE_GOV_QCOM_LPM) += qcom_lpm.o
+qcom_lpm-objs += qcom-cluster-lpm.o qcom-lpm-sysfs.o qcom-lpm.o
+
+obj-$(CONFIG_CPU_IDLE_SIMPLE_GOV_QCOM_LPM) += qcom_simple_lpm.o
+qcom_simple_lpm-objs += qcom-simple-cluster-lpm.o qcom-simple-lpm-sysfs.o qcom-simple-lpm.o
+
+
+# --- marble: objs upstream restaurados ---
 obj-$(CONFIG_CPU_IDLE_GOV_LADDER) += ladder.o
 obj-$(CONFIG_CPU_IDLE_GOV_MENU) += menu.o
-obj-$(CONFIG_CPU_IDLE_SIMPLE_GOV_QCOM_LPM) += qcom_simple_lpm.o
-qcom_simple_lpm-y += qcom-simple-lpm.o
-qcom_simple_lpm-y += qcom-simple-cluster-lpm.o
-qcom_simple_lpm-y += qcom-simple-lpm-sysfs.o
-obj-$(CONFIG_CPU_IDLE_GOV_QCOM_LPM) += qcom_lpm.o
-qcom_lpm-y += qcom-lpm.o
-qcom_lpm-y += qcom-cluster-lpm.o
-qcom_lpm-y += qcom-lpm-sysfs.o
 obj-$(CONFIG_CPU_IDLE_GOV_TEO) += teo.o
 obj-$(CONFIG_CPU_IDLE_GOV_HALTPOLL) += haltpoll.o

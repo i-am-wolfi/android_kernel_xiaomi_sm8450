@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
- *
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #ifndef __DRIVERS_IOMMU_QCOM_IOMMU_DEBUG_H__
@@ -12,6 +12,7 @@
 #include <linux/iommu.h>
 #include <linux/completion.h>
 #include <linux/mutex.h>
+#include "qcom-iommu-debug-alloc.h"
 
 #define MSI_IOVA_BASE			0x8000000
 #define MSI_IOVA_LENGTH			0x100000
@@ -26,6 +27,7 @@ struct iommu_debug_device {
 	struct device *test_dev;
 	struct iommu_domain *domain;
 	u32 usecase_nr;
+	bool fastmap_usecase;
 	/* Protects test_dev */
 	struct mutex state_lock;
 	/* For waiting for child probe to complete */
@@ -72,4 +74,10 @@ extern const struct file_operations iommu_debug_dma_unmap_fops;
 extern const struct file_operations iommu_debug_test_virt_addr_fops;
 extern const struct file_operations iommu_debug_profiling_fops;
 
+/* Only one function - share header file */
+#if IS_ENABLED(CONFIG_QCOM_DPD_PROXY)
+void iommu_debug_debugfs_setup_dpd(struct iommu_debug_device *ddev);
+#else
+static inline void iommu_debug_debugfs_setup_dpd(struct iommu_debug_device *ddev) {}
+#endif
 #endif

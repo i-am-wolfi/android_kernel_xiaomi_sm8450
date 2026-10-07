@@ -44,7 +44,7 @@ struct snd_usx2y_async_seq {
 struct snd_usx2y_urb_seq {
 	int	submitted;
 	int	len;
-	struct urb	*urb[];
+	struct urb	*urb[] __counted_by(len);
 };
 
 #include "usx2yhwdeppcm.h"
@@ -72,7 +72,6 @@ struct usx2ydev {
 	struct snd_usx2y_substream	* volatile  prepare_subs;
 	wait_queue_head_t	prepare_wait_queue;
 	struct list_head	midi_list;
-	struct list_head	pcm_list;
 	int			pcm_devs;
 };
 

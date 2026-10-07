@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2019, 2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #undef TRACE_SYSTEM
@@ -27,7 +28,7 @@ DECLARE_EVENT_CLASS(iommu_tlbi,
 	),
 
 	TP_fast_assign(
-		__assign_str(group_name, dev_name(domain->dev));
+		__assign_str(group_name);
 	),
 
 	TP_printk("group=%s",
@@ -64,7 +65,7 @@ DECLARE_EVENT_CLASS(iommu_pgtable,
 	),
 
 	TP_fast_assign(
-		__assign_str(group_name, dev_name(domain->dev));
+		__assign_str(group_name);
 		__entry->iova = iova;
 		__entry->ipa = ipa;
 		__entry->granule = granule;
@@ -107,7 +108,7 @@ DECLARE_EVENT_CLASS(iommu_map_pages,
 	),
 
 	TP_fast_assign(
-		__assign_str(group_name, dev_name(domain->dev));
+		__assign_str(group_name);
 		__entry->iova = iova;
 		__entry->pgsize = pgsize;
 		__entry->pgcount = pgcount;
@@ -152,31 +153,6 @@ static inline unsigned long sum_scatterlist_length(struct scatterlist *sgl,
 }
 #endif
 
-TRACE_EVENT(map_sg,
-
-	TP_PROTO(struct arm_smmu_domain *domain, unsigned long iova,
-		struct scatterlist *sgl, unsigned int nents),
-
-	TP_ARGS(domain, iova, sgl, nents),
-
-	TP_STRUCT__entry(
-		__string(group_name, dev_name(domain->dev))
-		__field(unsigned long, iova)
-		__field(unsigned long, size)
-	),
-
-	TP_fast_assign(
-		__assign_str(group_name, dev_name(domain->dev));
-		__entry->iova = iova;
-		__entry->size = sum_scatterlist_length(sgl, nents);
-	),
-
-	TP_printk("group=%s iova=%lx size=%lx",
-		__get_str(group_name), __entry->iova,
-		__entry->size
-	)
-);
-
 TRACE_EVENT(tlbsync_timeout,
 
 	TP_PROTO(struct device *dev),
@@ -188,7 +164,7 @@ TRACE_EVENT(tlbsync_timeout,
 	),
 
 	TP_fast_assign(
-		__assign_str(device, dev_name(dev));
+		__assign_str(device);
 	),
 
 	TP_printk("smmu=%s",

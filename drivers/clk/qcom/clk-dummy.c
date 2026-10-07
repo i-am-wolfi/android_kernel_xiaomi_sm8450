@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2019, 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/clk-provider.h>
@@ -8,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/slab.h>
 
 #include "common.h"
@@ -18,7 +20,7 @@
 #define RESET_MAX	100
 
 static int dummy_clk_set_rate(struct clk_hw *hw, unsigned long rate,
-					unsigned long parent_rate)
+			      unsigned long parent_rate)
 {
 	struct clk_dummy *dummy = to_clk_dummy(hw);
 
@@ -30,18 +32,18 @@ static int dummy_clk_set_rate(struct clk_hw *hw, unsigned long rate,
 }
 
 static long dummy_clk_round_rate(struct clk_hw *hw, unsigned long rate,
-					unsigned long *parent_rate)
+				  unsigned long *parent_rate)
 {
 	return rate;
 }
 
 static unsigned long dummy_clk_recalc_rate(struct clk_hw *hw,
-		unsigned long parent_rate)
+					    unsigned long parent_rate)
 {
 	struct clk_dummy *dummy = to_clk_dummy(hw);
 
 	pr_debug("%s: returning a clock rate of %lu\n",
-				__func__, dummy->rrate);
+		 __func__, dummy->rrate);
 
 	return dummy->rrate;
 }
@@ -55,18 +57,18 @@ const struct clk_ops clk_dummy_ops = {
 EXPORT_SYMBOL(clk_dummy_ops);
 
 static int dummy_reset_assert(struct reset_controller_dev *rcdev,
-				unsigned long id)
+			       unsigned long id)
 {
 	return 0;
 }
 
 static int dummy_reset_deassert(struct reset_controller_dev *rcdev,
-				unsigned long id)
+				 unsigned long id)
 {
 	return 0;
 }
 
-static struct reset_control_ops dummy_reset_ops = {
+const struct reset_control_ops dummy_reset_ops = {
 	.assert         = dummy_reset_assert,
 	.deassert       = dummy_reset_deassert,
 };
@@ -80,11 +82,13 @@ static struct reset_control_ops dummy_reset_ops = {
  * @node: device node
  */
 static struct clk *clk_register_dummy(struct device *dev, const char *name,
-		unsigned long flags, struct device_node *node)
+				       unsigned long flags, struct device_node *node)
 {
+	struct generic_pm_domain *pd;
 	struct clk_dummy *dummy;
 	struct clk *clk;
 	struct clk_init_data init = {};
+	int ret;
 
 	/* allocate dummy clock */
 	dummy = devm_kzalloc(dev, sizeof(*dummy), GFP_KERNEL);
@@ -109,8 +113,23 @@ static struct clk *clk_register_dummy(struct device *dev, const char *name,
 	if (devm_reset_controller_register(dev, &dummy->reset))
 		pr_err("Failed to register reset controller for %s\n", name);
 	else
-		pr_info("Successfully registered dummy reset controller for %s\n",
-								name);
+		pr_info("Successfully registered dummy reset controller for %s\n", name);
+
+	pd = devm_kzalloc(dev, sizeof(*pd), GFP_KERNEL);
+	if (!pd)
+		return ERR_PTR(-ENOMEM);
+
+	pd->name = name;
+
+	ret = pm_genpd_init(pd, NULL, true);
+	if (ret)
+		pr_err("Failed to initialize genpd for %s, ret=%d\n", name, ret);
+
+	ret = of_genpd_add_provider_simple(node, pd);
+	if (ret)
+		pr_err("Failed to register genpd for %s, ret=%d\n", name, ret);
+	else
+		pr_info("Successfully registered dummy genpd for %s\n", name);
 
 	return clk;
 }
@@ -132,20 +151,18 @@ static int dummy_clk_probe(struct platform_device *pdev)
 	} else {
 		ret = PTR_ERR(clk);
 		pr_err("Failed to register dummy clock controller for %s, ret=%d\n",
-								clk_name, ret);
+		       clk_name, ret);
 		return ret;
 	}
 
 	dev_info(&pdev->dev, "Successfully registered dummy clock controller for %s\n",
-								clk_name);
+		 clk_name);
 	return 0;
 }
 
-static int dummy_clk_remove(struct platform_device *pdev)
+static void dummy_clk_remove(struct platform_device *pdev)
 {
 	of_clk_del_provider(pdev->dev.of_node);
-
-	return 0;
 }
 
 static const struct of_device_id dummy_clk_match_table[] = {
@@ -176,4 +193,4 @@ static void __exit dummy_clk_exit(void)
 module_exit(dummy_clk_exit);
 
 MODULE_DESCRIPTION("QTI Dummy Clock Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

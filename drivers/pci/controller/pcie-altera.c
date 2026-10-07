@@ -9,11 +9,10 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/irqchip/chained_irq.h>
+#include <linux/irqdomain.h>
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
-#include <linux/of_irq.h>
+#include <linux/of.h>
 #include <linux/of_pci.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
@@ -56,12 +55,11 @@
 #define TLP_READ_TAG			0x1d
 #define TLP_WRITE_TAG			0x10
 #define RP_DEVFN			0
-#define TLP_REQ_ID(bus, devfn)		(((bus) << 8) | (devfn))
 #define TLP_CFG_DW0(pcie, cfg)		\
 		(((cfg) << 24) |	\
 		  TLP_PAYLOAD_SIZE)
 #define TLP_CFG_DW1(pcie, tag, be)	\
-	(((TLP_REQ_ID(pcie->root_bus_nr,  RP_DEVFN)) << 16) | (tag << 8) | (be))
+	(((PCI_DEVID(pcie->root_bus_nr,  RP_DEVFN)) << 16) | (tag << 8) | (be))
 #define TLP_CFG_DW2(bus, devfn, offset)	\
 				(((bus) << 24) | ((devfn) << 16) | (offset))
 #define TLP_COMP_STATUS(s)		(((s) >> 13) & 7)
@@ -151,7 +149,7 @@ static bool s10_altera_pcie_link_up(struct altera_pcie *pcie)
  * Altera PCIe port uses BAR0 of RC's configuration space as the translation
  * from PCI bus to native BUS.  Entire DDR region is mapped into PCIe space
  * using these registers, so it can be reached by DMA from EP devices.
- * This BAR0 will also access to MSI vector when receiving MSI/MSIX interrupt
+ * This BAR0 will also access to MSI vector when receiving MSI/MSI-X interrupt
  * from EP devices, eventually trigger interrupt to GIC.  The BAR0 of bridge
  * should be hidden during enumeration to avoid the sizing and resource
  * allocation by PCIe core.
@@ -510,10 +508,8 @@ static int altera_pcie_cfg_read(struct pci_bus *bus, unsigned int devfn,
 	if (altera_pcie_hide_rc_bar(bus, devfn, where))
 		return PCIBIOS_BAD_REGISTER_NUMBER;
 
-	if (!altera_pcie_valid_device(pcie, bus, PCI_SLOT(devfn))) {
-		*value = 0xffffffff;
+	if (!altera_pcie_valid_device(pcie, bus, PCI_SLOT(devfn)))
 		return PCIBIOS_DEVICE_NOT_FOUND;
-	}
 
 	return _altera_pcie_cfg_read(pcie, bus->number, devfn, where, size,
 				     value);
@@ -646,7 +642,7 @@ static void altera_pcie_isr(struct irq_desc *desc)
 	struct device *dev;
 	unsigned long status;
 	u32 bit;
-	u32 virq;
+	int ret;
 
 	chained_irq_enter(chip, desc);
 	pcie = irq_desc_get_handler_data(desc);
@@ -658,11 +654,9 @@ static void altera_pcie_isr(struct irq_desc *desc)
 			/* clear interrupts */
 			cra_writel(pcie, 1 << bit, P2A_INT_STATUS);
 
-			virq = irq_find_mapping(pcie->irq_domain, bit);
-			if (virq)
-				generic_handle_irq(virq);
-			else
-				dev_err(dev, "unexpected IRQ, INT%d\n", bit);
+			ret = generic_handle_domain_irq(pcie->irq_domain, bit);
+			if (ret)
+				dev_err_ratelimited(dev, "unexpected IRQ, INT%d\n", bit);
 		}
 	}
 
@@ -672,9 +666,10 @@ static void altera_pcie_isr(struct irq_desc *desc)
 static int altera_pcie_init_irq_domain(struct altera_pcie *pcie)
 {
 	struct device *dev = &pcie->pdev->dev;
+	struct device_node *node = dev->of_node;
 
 	/* Setup INTx */
-	pcie->irq_domain = irq_domain_create_linear(dev_fwnode(dev), PCI_NUM_INTX,
+	pcie->irq_domain = irq_domain_add_linear(node, PCI_NUM_INTX,
 					&intx_domain_ops, pcie);
 	if (!pcie->irq_domain) {
 		dev_err(dev, "Failed to get a INTx IRQ domain\n");
@@ -684,20 +679,11 @@ static int altera_pcie_init_irq_domain(struct altera_pcie *pcie)
 	return 0;
 }
 
-static void altera_pcie_disable_irq(struct altera_pcie *pcie)
-{
-	if (pcie->pcie_data->version == ALTERA_PCIE_V1 ||
-	    pcie->pcie_data->version == ALTERA_PCIE_V2) {
-		/* Disable all P2A interrupts */
-		cra_writel(pcie, 0, P2A_INT_ENABLE);
-	}
-}
-
 static void altera_pcie_irq_teardown(struct altera_pcie *pcie)
 {
-	altera_pcie_disable_irq(pcie);
 	irq_set_chained_handler_and_data(pcie->irq, NULL, NULL);
 	irq_domain_remove(pcie->irq_domain);
+	irq_dispose_mapping(pcie->irq);
 }
 
 static int altera_pcie_parse_dt(struct altera_pcie *pcie)
@@ -720,6 +706,7 @@ static int altera_pcie_parse_dt(struct altera_pcie *pcie)
 	if (pcie->irq < 0)
 		return pcie->irq;
 
+	irq_set_chained_handler_and_data(pcie->irq, altera_pcie_isr, pcie);
 	return 0;
 }
 
@@ -776,7 +763,7 @@ static int altera_pcie_probe(struct platform_device *pdev)
 	struct altera_pcie *pcie;
 	struct pci_host_bridge *bridge;
 	int ret;
-	const struct of_device_id *match;
+	const struct altera_pcie_data *data;
 
 	bridge = devm_pci_alloc_host_bridge(dev, sizeof(*pcie));
 	if (!bridge)
@@ -786,11 +773,11 @@ static int altera_pcie_probe(struct platform_device *pdev)
 	pcie->pdev = pdev;
 	platform_set_drvdata(pdev, pcie);
 
-	match = of_match_device(altera_pcie_of_match, &pdev->dev);
-	if (!match)
+	data = of_device_get_match_data(&pdev->dev);
+	if (!data)
 		return -ENODEV;
 
-	pcie->pcie_data = match->data;
+	pcie->pcie_data = data;
 
 	ret = altera_pcie_parse_dt(pcie);
 	if (ret) {
@@ -804,12 +791,6 @@ static int altera_pcie_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	/*
-	 * The chained handler uses pcie->irq_domain, so set it only after the
-	 * INTx domain has been created.
-	 */
-	irq_set_chained_handler_and_data(pcie->irq, altera_pcie_isr, pcie);
-
 	/* clear all interrupts */
 	cra_writel(pcie, P2A_INT_STS_ALL, P2A_INT_STATUS);
 	/* enable all interrupts */
@@ -820,19 +801,10 @@ static int altera_pcie_probe(struct platform_device *pdev)
 	bridge->busnr = pcie->root_bus_nr;
 	bridge->ops = &altera_pcie_ops;
 
-	ret = pci_host_probe(bridge);
-	if (ret)
-		goto err_teardown_irq;
-
-	return 0;
-
-err_teardown_irq:
-	altera_pcie_irq_teardown(pcie);
-
-	return ret;
+	return pci_host_probe(bridge);
 }
 
-static int altera_pcie_remove(struct platform_device *pdev)
+static void altera_pcie_remove(struct platform_device *pdev)
 {
 	struct altera_pcie *pcie = platform_get_drvdata(pdev);
 	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
@@ -840,19 +812,18 @@ static int altera_pcie_remove(struct platform_device *pdev)
 	pci_stop_root_bus(bridge->bus);
 	pci_remove_root_bus(bridge->bus);
 	altera_pcie_irq_teardown(pcie);
-
-	return 0;
 }
 
 static struct platform_driver altera_pcie_driver = {
-	.probe		= altera_pcie_probe,
-	.remove		= altera_pcie_remove,
+	.probe = altera_pcie_probe,
+	.remove = altera_pcie_remove,
 	.driver = {
-		.name	= "altera-pcie",
+		.name = "altera-pcie",
 		.of_match_table = altera_pcie_of_match,
 	},
 };
 
 MODULE_DEVICE_TABLE(of, altera_pcie_of_match);
 module_platform_driver(altera_pcie_driver);
+MODULE_DESCRIPTION("Altera PCIe host controller driver");
 MODULE_LICENSE("GPL v2");

@@ -197,7 +197,7 @@ static int ipsps_probe(struct i2c_client *client)
 }
 
 static const struct i2c_device_id ipsps_id[] = {
-	{ "ipsps1", 0 },
+	{ "ipsps1" },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, ipsps_id);
@@ -215,8 +215,7 @@ static struct i2c_driver ipsps_driver = {
 		.name = "inspur-ipsps",
 		.of_match_table = of_match_ptr(ipsps_of_match),
 	},
-	.probe_new = ipsps_probe,
-	.remove = pmbus_do_remove,
+	.probe = ipsps_probe,
 	.id_table = ipsps_id,
 };
 
@@ -225,3 +224,4 @@ module_i2c_driver(ipsps_driver);
 MODULE_AUTHOR("John Wang");
 MODULE_DESCRIPTION("PMBus driver for Inspur Power System power supplies");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(PMBUS);

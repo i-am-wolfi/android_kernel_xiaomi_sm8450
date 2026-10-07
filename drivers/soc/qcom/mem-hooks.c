@@ -2,111 +2,27 @@
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
  *
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  * Took is_el1_instruction_abort() from arch/arm64/mm/fault.c
  * Copyright (C) 2012 ARM Ltd
  */
 
 #include <linux/module.h>
-#include <linux/oom.h>
-#include <trace/hooks/mm.h>
-#include <trace/hooks/signal.h>
-#include <trace/hooks/vmscan.h>
-#include <linux/printk.h>
-#include <linux/dma-mapping.h>
-#include <linux/dma-direct.h>
-#include <trace/hooks/fault.h>
 #include <asm/esr.h>
 #include <asm/ptrace.h>
+#include <linux/cma.h>
+#include <linux/of.h>
+#include <linux/of_fdt.h>
+#include <linux/of_device.h>
+#include <linux/of_reserved_mem.h>
 
-static unsigned long panic_on_oom_timeout;
-struct task_struct *saved_tsk;
-
-#define PANIC_ON_OOM_DEFER_TIMEOUT (5*HZ)
-
-
-static void readahead_set(void *data, gfp_t *flag)
-{
-	if (*flag & __GFP_MOVABLE) {
-		*flag |= __GFP_CMA;
-		*flag &= ~__GFP_HIGHMEM;
-	}
-}
-
-static void gfp_zone_set(void *data, gfp_t *flag)
-{
-	if (!IS_ENABLED(CONFIG_HIGHMEM)) {
-		if ((*flag & __GFP_MOVABLE) && !(*flag & __GFP_CMA))
-			*flag &= ~__GFP_HIGHMEM;
-	}
-}
-
-static void set_swap_cache(void *data, gfp_t *flag)
-{
-	*flag |= __GFP_CMA;
-}
-
-static void reap_eligible(void *data, struct task_struct *task, bool *reap)
-{
-	/* TODO: Can this logic be moved to module params approach? */
-	if (!strcmp(task->comm, "lmkd") || !strcmp(task->comm, "PreKillActionT"))
-		*reap = true;
-}
-
-static void __oom_panic_defer(void *data, struct oom_control *oc, int *val)
-{
-	int ret = 0;
-	struct task_struct *p;
-
-	if (oc->chosen)
-		goto out;
-
-	rcu_read_lock();
-	for_each_process(p) {
-		if (tsk_is_oom_victim(p))
-			break;
-	}
-	rcu_read_unlock();
-
-	if (p == &init_task)
-		goto out;
-
-	if (p != saved_tsk) {
-		panic_on_oom_timeout = jiffies + PANIC_ON_OOM_DEFER_TIMEOUT;
-		saved_tsk = p;
-		ret = -1;
-	} else if (time_before_eq(jiffies, panic_on_oom_timeout)) {
-		ret = -1;
-	}
-
-out:
-	*val = ret;
-}
-
-static void balance_reclaim(void *unused, bool *balance_anon_file_reclaim)
-{
-	*balance_anon_file_reclaim = true;
-}
-
-static void allow_subpage_alloc(void *data, bool *allow_subpage_alloc, struct device *dev,
-				size_t *size)
-{
-	/* Don't enable this when ZONE_DMA32 is present, as the hook isn't needed */
-	if (!zone_dma32_are_empty())
-		return;
-
-	/*
-	 * Only allow an allocation to use the default CMA area for page-sized or smaller
-	 * allocations if (1) the device is not upstream of an IOMMU and (2) one of the
-	 * regular and coherent DMA bit masks hasn't been set to 64 bits.
-	 */
-	if (dev->iommu_group == false && !(dev->coherent_dma_mask == DMA_BIT_MASK(64) &&
-	    dma_get_mask(dev) == DMA_BIT_MASK(64))) {
-		*allow_subpage_alloc = true;
-		*size = PAGE_ALIGN(*size);
-	}
-}
+#define CREATE_TRACE_POINTS
+#include <trace/events/cma.h>
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/mm.h>
+#include <trace/hooks/fault.h>
+#include "mm/cma.h"
 
 static bool is_el1_instruction_abort(unsigned long esr)
 {
@@ -122,62 +38,95 @@ static void can_fixup_sea(void *unused, unsigned long addr, unsigned long esr,
 		*can_fixup = false;
 }
 
-static int __init init_mem_hooks(void)
+static void bitmap_find_best_next_zero_area_off(void *data,
+						unsigned long *bitmap,
+						unsigned long bitmap_maxno,
+						unsigned long start,
+						unsigned int bitmap_count,
+						unsigned long mask,
+						unsigned long offset,
+						unsigned long *bitmap_no,
+						bool best_fit)
 {
-	int ret;
+	if (!best_fit || !IS_ENABLED(CONFIG_CMA_BEST_FIT))
+		return;
 
-	ret = register_trace_android_rvh_set_readahead_gfp_mask(readahead_set, NULL);
-	if (ret) {
-		pr_err("Failed to register readahead_gfp_mask hooks\n");
-		return ret;
+	unsigned long start_bit;
+	unsigned long bitmap_index;
+	unsigned long bitmap_len;
+	unsigned long next_bit;
+
+	start_bit = bitmap_maxno;
+	bitmap_len = bitmap_maxno + 1;
+	bitmap_index = bitmap_find_next_zero_area_off(bitmap,
+			bitmap_maxno, start, bitmap_count, mask,
+			offset);
+
+	while (bitmap_index < bitmap_maxno) {
+		next_bit = find_next_bit(bitmap, bitmap_maxno, bitmap_index + bitmap_count);
+		if ((next_bit - bitmap_index) < bitmap_len) {
+			bitmap_len = next_bit - bitmap_index;
+			start_bit = bitmap_index;
+			if (bitmap_len == bitmap_maxno)
+				goto end;
+			if (bitmap_len == bitmap_count) {
+				bitmap_no = &start_bit;
+				return;
+			}
+		}
+		bitmap_index = bitmap_find_next_zero_area_off(bitmap,
+				bitmap_maxno, next_bit + 1, bitmap_count, mask, offset);
+	}
+end:
+	*bitmap_no = start_bit;
+}
+
+#ifdef CONFIG_CMA_BEST_FIT
+static int cma_best_fit_setup(struct cma *cma, void *data)
+{
+	struct device_node *rmem_node, *rmem;
+
+	rmem_node = of_find_node_by_path("/reserved-memory");
+	if (!rmem_node) {
+		pr_err("Failed to find reserved-memory node\n");
+		return -ENODEV;
 	}
 
-	ret = register_trace_android_rvh_set_gfp_zone_flags(gfp_zone_set, NULL);
-	if (ret) {
-		pr_err("Failed to register gfp_zone_flags hooks\n");
-		return ret;
-	}
-
-	ret = register_trace_android_rvh_set_skip_swapcache_flags(set_swap_cache, NULL);
-	if (ret) {
-		pr_err("Failed to register skip_swapcache_flags hooks\n");
-		return ret;
-	}
-
-	ret = register_trace_android_vh_process_killed(reap_eligible, NULL);
-	if (ret) {
-		pr_err("Failed to register process_killed hooks\n");
-		return ret;
-	}
-
-	ret = register_trace_android_vh_oom_check_panic(__oom_panic_defer,
-							NULL);
-	if (ret) {
-		pr_err("Failed to register oom_check_panic hooks\n");
-		return ret;
-	}
-
-	if (IS_ENABLED(CONFIG_QCOM_BALANCE_ANON_FILE_RECLAIM)) {
-		ret = register_trace_android_rvh_set_balance_anon_file_reclaim(balance_reclaim,
-							NULL);
-		if (ret) {
-			pr_err("Failed to register balance_anon_file_reclaim hooks\n");
-			return ret;
+	for_each_child_of_node(rmem_node, rmem) {
+		if (!strcmp(rmem->name, cma->name)) {
+			spin_lock_irq(&cma->lock);
+			cma->android_vendor_data1 =
+				(of_get_property(rmem, "cma-best-fit", NULL) ? true : false);
+			spin_unlock_irq(&cma->lock);
 		}
 	}
 
-	ret = register_trace_android_vh_subpage_dma_contig_alloc(allow_subpage_alloc, NULL);
-	if (ret) {
-		pr_err("Failed to register set_dma_mask hook\n");
-		return ret;
-	}
+	return 0;
+}
+#else
+static int cma_best_fit_setup(struct cma *cma, void *data)
+{
+	return 0;
+}
+#endif
 
+static void register_cma_hooks(void)
+{
+	register_trace_android_rvh_bitmap_find_best_next_area
+			(bitmap_find_best_next_zero_area_off, NULL);
+	cma_for_each_area(cma_best_fit_setup, NULL);
+}
+
+static int __init init_mem_hooks(void)
+{
+	int ret;
 
 	ret = register_trace_android_vh_try_fixup_sea(can_fixup_sea, NULL);
 	if (ret) {
 		pr_err("Failed to register try_fixup_sea\n");
 		return ret;
 	}
+	register_cma_hooks();
 
 	return 0;
 }
@@ -185,4 +134,4 @@ static int __init init_mem_hooks(void)
 module_init(init_mem_hooks);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Memory Trace Hook Call-Back Registration");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

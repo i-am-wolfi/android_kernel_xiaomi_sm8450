@@ -22,6 +22,18 @@
 #include "xfs_inode.h"
 #include "xfs_dir2.h"
 #include "xfs_quota.h"
+#include "xfs_alloc.h"
+#include "xfs_ag.h"
+#include "xfs_sb.h"
+
+/*
+ * This is the number of entries in the l_buf_cancel_table used during
+ * recovery.
+ */
+#define	XLOG_BC_TABLE_SIZE	64
+
+#define XLOG_BUF_CANCEL_BUCKET(log, blkno) \
+	((log)->l_buf_cancel_table + ((uint64_t)blkno % XLOG_BC_TABLE_SIZE))
 
 /*
  * This structure is used during recovery to record the buf log items which
@@ -76,7 +88,7 @@ xlog_add_buffer_cancelled(
 		return false;
 	}
 
-	bcp = kmem_alloc(sizeof(struct xfs_buf_cancel), 0);
+	bcp = kmalloc(sizeof(struct xfs_buf_cancel), GFP_KERNEL | __GFP_NOFAIL);
 	bcp->bc_blkno = blkno;
 	bcp->bc_len = len;
 	bcp->bc_refcount = 1;
@@ -120,7 +132,7 @@ xlog_put_buffer_cancelled(
 
 	if (--bcp->bc_refcount == 0) {
 		list_del(&bcp->bc_list);
-		kmem_free(bcp);
+		kfree(bcp);
 	}
 	return true;
 }
@@ -219,7 +231,7 @@ xlog_recover_validate_buf_type(
 	 * inconsistent state resulting in verification failures. Hence for now
 	 * just avoid the verification stage for non-crc filesystems
 	 */
-	if (!xfs_sb_version_hascrc(&mp->m_sb))
+	if (!xfs_has_crc(mp))
 		return;
 
 	magic32 = be32_to_cpu(*(__be32 *)bp->b_addr);
@@ -432,7 +444,7 @@ xlog_recover_validate_buf_type(
  * given buffer.  The bitmap in the buf log format structure indicates
  * where to place the logged data.
  */
-STATIC int
+STATIC void
 xlog_recover_do_reg_buffer(
 	struct xfs_mount		*mp,
 	struct xlog_recover_item	*item,
@@ -460,24 +472,8 @@ xlog_recover_do_reg_buffer(
 		ASSERT(nbits > 0);
 		ASSERT(item->ri_buf[i].i_addr != NULL);
 		ASSERT(item->ri_buf[i].i_len % XFS_BLF_CHUNK == 0);
-		/*
-		 * The bitmap is only trustworthy to the extent that it
-		 * describes a region that actually fits inside the buffer we
-		 * read in based on the (attacker-controlled) blf_len.  Do not
-		 * rely on an ASSERT() for this -- it compiles away entirely on
-		 * non-DEBUG kernels, which is exactly where this matters, so
-		 * validate it for real and abort recovery of this buffer rather
-		 * than copying past the end of it.
-		 */
-		if (XFS_IS_CORRUPT(mp, BBTOB(bp->b_length) <
-				((uint)bit << XFS_BLF_SHIFT) +
-				(nbits << XFS_BLF_SHIFT))) {
-			xfs_alert(mp,
-	"Bad buffer log item dirty bitmap (bit %d, nbits %d) for %d-byte buffer at daddr 0x%llx.",
-				bit, nbits, BBTOB(bp->b_length),
-				bp->b_bn);
-			return -EFSCORRUPTED;
-		}
+		ASSERT(BBTOB(bp->b_length) >=
+		       ((uint)bit << XFS_BLF_SHIFT) + (nbits << XFS_BLF_SHIFT));
 
 		/*
 		 * The dirty regions logged in the buffer, even though
@@ -513,7 +509,7 @@ xlog_recover_do_reg_buffer(
 			if (fa) {
 				xfs_alert(mp,
 	"dquot corrupt at %pS trying to replay into block 0x%llx",
-					fa, bp->b_bn);
+					fa, xfs_buf_daddr(bp));
 				goto next;
 			}
 		}
@@ -531,7 +527,6 @@ xlog_recover_do_reg_buffer(
 	ASSERT(i == item->ri_total);
 
 	xlog_recover_validate_buf_type(mp, bp, buf_f, current_lsn);
-	return 0;
 }
 
 /*
@@ -540,10 +535,10 @@ xlog_recover_do_reg_buffer(
  * (ie. USR or GRP), then just toss this buffer away; don't recover it.
  * Else, treat it as a regular buffer and do recovery.
  *
- * Return 0 if the buffer was not recovered (tossed), 1 if it was recovered and
- * needs writing, or a negative errno if recovery of the buffer failed.
+ * Return false if the buffer was tossed and true if we recovered the buffer to
+ * indicate to the caller if the buffer needs writing.
  */
-STATIC int
+STATIC bool
 xlog_recover_do_dquot_buffer(
 	struct xfs_mount		*mp,
 	struct xlog			*log,
@@ -552,7 +547,6 @@ xlog_recover_do_dquot_buffer(
 	struct xfs_buf_log_format	*buf_f)
 {
 	uint			type;
-	int			error;
 
 	trace_xfs_log_recover_buf_dquot_buf(log, buf_f);
 
@@ -560,7 +554,7 @@ xlog_recover_do_dquot_buffer(
 	 * Filesystems are required to send in quota flags at mount time.
 	 */
 	if (!mp->m_qflags)
-		return 0;
+		return false;
 
 	type = 0;
 	if (buf_f->blf_flags & XFS_BLF_UDQUOT_BUF)
@@ -573,12 +567,10 @@ xlog_recover_do_dquot_buffer(
 	 * This type of quotas was turned off, so ignore this buffer
 	 */
 	if (log->l_quotaoffs_flag & type)
-		return 0;
+		return false;
 
-	error = xlog_recover_do_reg_buffer(mp, item, bp, buf_f, NULLCOMMITLSN);
-	if (error)
-		return error;
-	return 1;
+	xlog_recover_do_reg_buffer(mp, item, bp, buf_f, NULLCOMMITLSN);
+	return true;
 }
 
 /*
@@ -617,13 +609,13 @@ xlog_recover_do_inode_buffer(
 	 * Post recovery validation only works properly on CRC enabled
 	 * filesystems.
 	 */
-	if (xfs_sb_version_hascrc(&mp->m_sb))
+	if (xfs_has_crc(mp))
 		bp->b_ops = &xfs_inode_buf_ops;
 
 	inodes_per_buf = BBTOB(bp->b_length) >> mp->m_sb.sb_inodelog;
 	for (i = 0; i < inodes_per_buf; i++) {
 		next_unlinked_offset = (i * mp->m_sb.sb_inodesize) +
-			offsetof(xfs_dinode_t, di_next_unlinked);
+			offsetof(struct xfs_dinode, di_next_unlinked);
 
 		while (next_unlinked_offset >=
 		       (reg_buf_offset + reg_buf_bytes)) {
@@ -696,6 +688,67 @@ xlog_recover_do_inode_buffer(
 }
 
 /*
+ * Update the in-memory superblock and perag structures from the primary SB
+ * buffer.
+ *
+ * This is required because transactions running after growfs may require the
+ * updated values to be set in a previous fully commit transaction.
+ */
+static int
+xlog_recover_do_primary_sb_buffer(
+	struct xfs_mount		*mp,
+	struct xlog_recover_item	*item,
+	struct xfs_buf			*bp,
+	struct xfs_buf_log_format	*buf_f,
+	xfs_lsn_t			current_lsn)
+{
+	struct xfs_dsb			*dsb = bp->b_addr;
+	xfs_agnumber_t			orig_agcount = mp->m_sb.sb_agcount;
+	int				error;
+
+	xlog_recover_do_reg_buffer(mp, item, bp, buf_f, current_lsn);
+
+	if (orig_agcount == 0) {
+		xfs_alert(mp, "Trying to grow file system without AGs");
+		return -EFSCORRUPTED;
+	}
+
+	/*
+	 * Update the in-core super block from the freshly recovered on-disk one.
+	 */
+	xfs_sb_from_disk(&mp->m_sb, dsb);
+
+	if (mp->m_sb.sb_agcount < orig_agcount) {
+		xfs_alert(mp, "Shrinking AG count in log recovery not supported");
+		return -EFSCORRUPTED;
+	}
+
+	/*
+	 * Growfs can also grow the last existing AG.  In this case we also need
+	 * to update the length in the in-core perag structure and values
+	 * depending on it.
+	 */
+	error = xfs_update_last_ag_size(mp, orig_agcount);
+	if (error)
+		return error;
+
+	/*
+	 * Initialize the new perags, and also update various block and inode
+	 * allocator setting based off the number of AGs or total blocks.
+	 * Because of the latter this also needs to happen if the agcount did
+	 * not change.
+	 */
+	error = xfs_initialize_perag(mp, orig_agcount, mp->m_sb.sb_agcount,
+			mp->m_sb.sb_dblocks, &mp->m_maxagi);
+	if (error) {
+		xfs_warn(mp, "Failed recovery per-ag init: %d", error);
+		return error;
+	}
+	mp->m_alloc_set_aside = xfs_alloc_set_aside(mp);
+	return 0;
+}
+
+/*
  * V5 filesystems know the age of the buffer on disk being recovered. We can
  * have newer objects on disk than we are replaying, and so for these cases we
  * don't want to replay the current change as that will make the buffer contents
@@ -718,7 +771,8 @@ xlog_recover_do_inode_buffer(
 static xfs_lsn_t
 xlog_recover_get_buf_lsn(
 	struct xfs_mount	*mp,
-	struct xfs_buf		*bp)
+	struct xfs_buf		*bp,
+	struct xfs_buf_log_format *buf_f)
 {
 	uint32_t		magic32;
 	uint16_t		magic16;
@@ -726,9 +780,18 @@ xlog_recover_get_buf_lsn(
 	void			*blk = bp->b_addr;
 	uuid_t			*uuid;
 	xfs_lsn_t		lsn = -1;
+	uint16_t		blft;
 
 	/* v4 filesystems always recover immediately */
-	if (!xfs_sb_version_hascrc(&mp->m_sb))
+	if (!xfs_has_crc(mp))
+		goto recover_immediately;
+
+	/*
+	 * realtime bitmap and summary file blocks do not have magic numbers or
+	 * UUIDs, so we must recover them immediately.
+	 */
+	blft = xfs_blft_from_flags(buf_f);
+	if (blft == XFS_BLFT_RTBITMAP_BUF || blft == XFS_BLFT_RTSUMMARY_BUF)
 		goto recover_immediately;
 
 	magic32 = be32_to_cpu(*(__be32 *)blk);
@@ -797,7 +860,7 @@ xlog_recover_get_buf_lsn(
 		 * the relevant UUID in the superblock.
 		 */
 		lsn = be64_to_cpu(((struct xfs_dsb *)blk)->sb_lsn);
-		if (xfs_sb_version_hasmetauuid(&mp->m_sb))
+		if (xfs_has_metauuid(mp))
 			uuid = &((struct xfs_dsb *)blk)->sb_meta_uuid;
 		else
 			uuid = &((struct xfs_dsb *)blk)->sb_uuid;
@@ -940,7 +1003,7 @@ xlog_recover_buf_commit_pass2(
 	 * the verifier will be reset to match whatever recover turns that
 	 * buffer into.
 	 */
-	lsn = xlog_recover_get_buf_lsn(mp, bp);
+	lsn = xlog_recover_get_buf_lsn(mp, bp, buf_f);
 	if (lsn && lsn != -1 && XFS_LSN_CMP(lsn, current_lsn) >= 0) {
 		trace_xfs_log_recover_buf_skip(log, buf_f);
 		xlog_recover_validate_buf_type(mp, bp, buf_f, NULLCOMMITLSN);
@@ -963,17 +1026,29 @@ xlog_recover_buf_commit_pass2(
 			goto out_release;
 	} else if (buf_f->blf_flags &
 		  (XFS_BLF_UDQUOT_BUF|XFS_BLF_PDQUOT_BUF|XFS_BLF_GDQUOT_BUF)) {
-		error = xlog_recover_do_dquot_buffer(mp, log, item, bp, buf_f);
-		if (error <= 0)
+		bool	dirty;
+
+		dirty = xlog_recover_do_dquot_buffer(mp, log, item, bp, buf_f);
+		if (!dirty)
 			goto out_release;
-		/* write dirty buffer */
-		error = 0;
-	} else {
-		error = xlog_recover_do_reg_buffer(mp, item, bp, buf_f,
-						   current_lsn);
+	} else if ((xfs_blft_from_flags(buf_f) & XFS_BLFT_SB_BUF) &&
+			xfs_buf_daddr(bp) == 0) {
+		error = xlog_recover_do_primary_sb_buffer(mp, item, bp, buf_f,
+				current_lsn);
 		if (error)
-			goto out_release;
+			goto out_writebuf;
+	} else {
+		xlog_recover_do_reg_buffer(mp, item, bp, buf_f, current_lsn);
 	}
+
+	/*
+	 * Buffer held by buf log item during 'normal' buffer recovery must
+	 * be committed through buffer I/O submission path to ensure proper
+	 * release. When error occurs during sb buffer recovery, log shutdown
+	 * will be done before submitting buffer list so that buffers can be
+	 * released correctly through ioend failure path.
+	 */
+out_writebuf:
 
 	/*
 	 * Perform delayed write on the buffer.  Asynchronous writes will be
@@ -1016,3 +1091,60 @@ const struct xlog_recover_item_ops xlog_buf_item_ops = {
 	.commit_pass1		= xlog_recover_buf_commit_pass1,
 	.commit_pass2		= xlog_recover_buf_commit_pass2,
 };
+
+#ifdef DEBUG
+void
+xlog_check_buf_cancel_table(
+	struct xlog	*log)
+{
+	int		i;
+
+	for (i = 0; i < XLOG_BC_TABLE_SIZE; i++)
+		ASSERT(list_empty(&log->l_buf_cancel_table[i]));
+}
+#endif
+
+int
+xlog_alloc_buf_cancel_table(
+	struct xlog	*log)
+{
+	void		*p;
+	int		i;
+
+	ASSERT(log->l_buf_cancel_table == NULL);
+
+	p = kmalloc_array(XLOG_BC_TABLE_SIZE, sizeof(struct list_head),
+			  GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	log->l_buf_cancel_table = p;
+	for (i = 0; i < XLOG_BC_TABLE_SIZE; i++)
+		INIT_LIST_HEAD(&log->l_buf_cancel_table[i]);
+
+	return 0;
+}
+
+void
+xlog_free_buf_cancel_table(
+	struct xlog	*log)
+{
+	int		i;
+
+	if (!log->l_buf_cancel_table)
+		return;
+
+	for (i = 0; i < XLOG_BC_TABLE_SIZE; i++) {
+		struct xfs_buf_cancel	*bc;
+
+		while ((bc = list_first_entry_or_null(
+				&log->l_buf_cancel_table[i],
+				struct xfs_buf_cancel, bc_list))) {
+			list_del(&bc->bc_list);
+			kfree(bc);
+		}
+	}
+
+	kfree(log->l_buf_cancel_table);
+	log->l_buf_cancel_table = NULL;
+}

@@ -37,7 +37,7 @@
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/uaccess.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include <linux/usb/ch9.h>
 #include <linux/usb/composite.h>
@@ -54,7 +54,10 @@
 #define DEFAULT_Q_LEN		10 /* same as legacy g_printer gadget */
 
 static int major, minors;
-static struct class *usb_gadget_class;
+static const struct class usb_gadget_class = {
+	.name = "usb_printer_gadget",
+};
+
 static DEFINE_IDA(printer_ida);
 static DEFINE_MUTEX(printer_ida_lock); /* protects access do printer_ida */
 
@@ -360,10 +363,11 @@ printer_open(struct inode *inode, struct file *fd)
 		ret = 0;
 		/* Change the printer status to show that it's on-line. */
 		dev->printer_status |= PRINTER_SELECTED;
-		kref_get(&dev->kref);
 	}
 
 	spin_unlock_irqrestore(&dev->lock, flags);
+
+	kref_get(&dev->kref);
 
 	return ret;
 }
@@ -428,7 +432,7 @@ printer_read(struct file *fd, char __user *buf, size_t len, loff_t *ptr)
 {
 	struct printer_dev		*dev = fd->private_data;
 	unsigned long			flags;
-	size_t				size, not_copied, copied;
+	size_t				size;
 	size_t				bytes_copied;
 	struct usb_request		*req;
 	/* This is a pointer to the current USB rx request. */
@@ -521,12 +525,10 @@ printer_read(struct file *fd, char __user *buf, size_t len, loff_t *ptr)
 		else
 			size = len;
 
-		not_copied = copy_to_user(buf, current_rx_buf, size);
-		copied = size - not_copied;
-
-		bytes_copied += copied;
-		len -= copied;
-		buf += copied;
+		size -= copy_to_user(buf, current_rx_buf, size);
+		bytes_copied += size;
+		len -= size;
+		buf += size;
 
 		spin_lock_irqsave(&dev->lock, flags);
 
@@ -540,17 +542,6 @@ printer_read(struct file *fd, char __user *buf, size_t len, loff_t *ptr)
 
 		if (dev->interface < 0)
 			goto out_disabled;
-
-		if (!copied) {
-			dev->current_rx_req = current_rx_req;
-			dev->current_rx_bytes = current_rx_bytes;
-			dev->current_rx_buf = current_rx_buf;
-			spin_unlock_irqrestore(&dev->lock, flags);
-			mutex_unlock(&dev->lock_printer_io);
-			return bytes_copied ? bytes_copied : -EFAULT;
-		}
-
-		size = copied;
 
 		/* If we not returning all the data left in this RX request
 		 * buffer then adjust the amount of data left in the buffer.
@@ -691,8 +682,7 @@ printer_write(struct file *fd, const char __user *buf, size_t len, loff_t *ptr)
 		value = usb_ep_queue(dev->in_ep, req, GFP_ATOMIC);
 		spin_lock(&dev->lock);
 		if (value) {
-			list_del(&req->list);
-			list_add(&req->list, &dev->tx_reqs);
+			list_move(&req->list, &dev->tx_reqs);
 			spin_unlock_irqrestore(&dev->lock, flags);
 			mutex_unlock(&dev->lock_printer_io);
 			return -EAGAIN;
@@ -856,7 +846,7 @@ set_printer_interface(struct printer_dev *dev)
 
 	result = usb_ep_enable(dev->out_ep);
 	if (result != 0) {
-		DBG(dev, "enable %s --> %d\n", dev->in_ep->name, result);
+		DBG(dev, "enable %s --> %d\n", dev->out_ep->name, result);
 		goto done;
 	}
 
@@ -1153,7 +1143,7 @@ autoconf_fail:
 
 	/* Setup the sysfs files for the printer gadget. */
 	devt = MKDEV(major, dev->minor);
-	pdev = device_create(usb_gadget_class, NULL, devt,
+	pdev = device_create(&usb_gadget_class, NULL, devt,
 				  NULL, "g_printer%d", dev->minor);
 	if (IS_ERR(pdev)) {
 		ERROR(dev, "Failed to create device: g_printer\n");
@@ -1176,7 +1166,7 @@ autoconf_fail:
 	return 0;
 
 fail_cdev_add:
-	device_destroy(usb_gadget_class, devt);
+	device_destroy(&usb_gadget_class, devt);
 
 fail_rx_reqs:
 	while (!list_empty(&dev->rx_reqs)) {
@@ -1244,8 +1234,8 @@ static ssize_t f_printer_opts_pnp_string_show(struct config_item *item,
 	if (!opts->pnp_string)
 		goto unlock;
 
-	result = strlcpy(page, opts->pnp_string, PAGE_SIZE);
-	if (result >= PAGE_SIZE) {
+	result = strscpy(page, opts->pnp_string, PAGE_SIZE);
+	if (result < 1) {
 		result = PAGE_SIZE;
 	} else if (page[result - 1] != '\n' && result + 1 < PAGE_SIZE) {
 		page[result++] = '\n';
@@ -1342,9 +1332,9 @@ static inline int gprinter_get_minor(void)
 {
 	int ret;
 
-	ret = ida_simple_get(&printer_ida, 0, 0, GFP_KERNEL);
+	ret = ida_alloc(&printer_ida, GFP_KERNEL);
 	if (ret >= PRINTER_MINORS) {
-		ida_simple_remove(&printer_ida, ret);
+		ida_free(&printer_ida, ret);
 		ret = -ENODEV;
 	}
 
@@ -1353,7 +1343,7 @@ static inline int gprinter_get_minor(void)
 
 static inline void gprinter_put_minor(int minor)
 {
-	ida_simple_remove(&printer_ida, minor);
+	ida_free(&printer_ida, minor);
 }
 
 static int gprinter_setup(int);
@@ -1443,7 +1433,7 @@ static void printer_func_unbind(struct usb_configuration *c,
 
 	dev = func_to_printer(f);
 
-	device_destroy(usb_gadget_class, MKDEV(major, dev->minor));
+	device_destroy(&usb_gadget_class, MKDEV(major, dev->minor));
 
 	/* Remove Character Device */
 	cdev_del(&dev->printer_cdev);
@@ -1537,6 +1527,7 @@ static struct usb_function *gprinter_alloc(struct usb_function_instance *fi)
 }
 
 DECLARE_USB_FUNCTION_INIT(printer, gprinter_alloc_inst, gprinter_alloc);
+MODULE_DESCRIPTION("USB printer function driver");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Craig Nadler");
 
@@ -1545,19 +1536,14 @@ static int gprinter_setup(int count)
 	int status;
 	dev_t devt;
 
-	usb_gadget_class = class_create(THIS_MODULE, "usb_printer_gadget");
-	if (IS_ERR(usb_gadget_class)) {
-		status = PTR_ERR(usb_gadget_class);
-		usb_gadget_class = NULL;
-		pr_err("unable to create usb_gadget class %d\n", status);
+	status = class_register(&usb_gadget_class);
+	if (status)
 		return status;
-	}
 
 	status = alloc_chrdev_region(&devt, 0, count, "USB printer gadget");
 	if (status) {
 		pr_err("alloc_chrdev_region %d\n", status);
-		class_destroy(usb_gadget_class);
-		usb_gadget_class = NULL;
+		class_unregister(&usb_gadget_class);
 		return status;
 	}
 
@@ -1573,6 +1559,5 @@ static void gprinter_cleanup(void)
 		unregister_chrdev_region(MKDEV(major, 0), minors);
 		major = minors = 0;
 	}
-	class_destroy(usb_gadget_class);
-	usb_gadget_class = NULL;
+	class_unregister(&usb_gadget_class);
 }

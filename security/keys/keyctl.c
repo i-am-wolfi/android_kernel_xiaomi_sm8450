@@ -506,7 +506,7 @@ error:
  * keyring, otherwise replace the link to the matching key with a link to the
  * new key.
  *
- * The key must grant the caller Link permission and the the keyring must grant
+ * The key must grant the caller Link permission and the keyring must grant
  * the caller Write permission.  Furthermore, if an additional link is created,
  * the keyring's quota will be extended.
  *
@@ -954,6 +954,7 @@ long keyctl_chown_key(key_serial_t id, uid_t user, gid_t group)
 	long ret;
 	kuid_t uid;
 	kgid_t gid;
+	unsigned long flags;
 
 	uid = make_kuid(current_user_ns(), user);
 	gid = make_kgid(current_user_ns(), group);
@@ -1010,7 +1011,7 @@ long keyctl_chown_key(key_serial_t id, uid_t user, gid_t group)
 			unsigned maxbytes = uid_eq(uid, GLOBAL_ROOT_UID) ?
 				key_quota_root_maxbytes : key_quota_maxbytes;
 
-			spin_lock(&newowner->lock);
+			spin_lock_irqsave(&newowner->lock, flags);
 			if (newowner->qnkeys + 1 > maxkeys ||
 			    newowner->qnbytes + key->quotalen > maxbytes ||
 			    newowner->qnbytes + key->quotalen <
@@ -1019,12 +1020,12 @@ long keyctl_chown_key(key_serial_t id, uid_t user, gid_t group)
 
 			newowner->qnkeys++;
 			newowner->qnbytes += key->quotalen;
-			spin_unlock(&newowner->lock);
+			spin_unlock_irqrestore(&newowner->lock, flags);
 
-			spin_lock(&key->user->lock);
+			spin_lock_irqsave(&key->user->lock, flags);
 			key->user->qnkeys--;
 			key->user->qnbytes -= key->quotalen;
-			spin_unlock(&key->user->lock);
+			spin_unlock_irqrestore(&key->user->lock, flags);
 		}
 
 		atomic_dec(&key->user->nkeys);
@@ -1056,7 +1057,7 @@ error:
 	return ret;
 
 quota_overrun:
-	spin_unlock(&newowner->lock);
+	spin_unlock_irqrestore(&newowner->lock, flags);
 	zapowner = newowner;
 	ret = -EDQUOT;
 	goto error_put;
@@ -1196,13 +1197,9 @@ static long keyctl_instantiate_key_common(key_serial_t id,
 	if (!instkey)
 		goto error;
 
-	rka = request_key_auth_get(instkey);
-	if (!rka) {
-		ret = -EKEYREVOKED;
-		goto error;
-	}
+	rka = instkey->payload.data[0];
 	if (rka->target_key->serial != id)
-		goto error_put_rka;
+		goto error;
 
 	/* pull the payload in if one was supplied */
 	payload = NULL;
@@ -1211,7 +1208,7 @@ static long keyctl_instantiate_key_common(key_serial_t id,
 		ret = -ENOMEM;
 		payload = kvmalloc(plen, GFP_KERNEL);
 		if (!payload)
-			goto error_put_rka;
+			goto error;
 
 		ret = -EFAULT;
 		if (!copy_from_iter_full(payload, plen, from))
@@ -1237,8 +1234,6 @@ static long keyctl_instantiate_key_common(key_serial_t id,
 
 error2:
 	kvfree_sensitive(payload, plen);
-error_put_rka:
-	request_key_auth_put(rka);
 error:
 	return ret;
 }
@@ -1258,12 +1253,11 @@ long keyctl_instantiate_key(key_serial_t id,
 			    key_serial_t ringid)
 {
 	if (_payload && plen) {
-		struct iovec iov;
 		struct iov_iter from;
 		int ret;
 
-		ret = import_single_range(ITER_SOURCE, (void __user *)_payload, plen,
-					  &iov, &from);
+		ret = import_ubuf(ITER_SOURCE, (void __user *)_payload, plen,
+				  &from);
 		if (unlikely(ret))
 			return ret;
 
@@ -1364,19 +1358,15 @@ long keyctl_reject_key(key_serial_t id, unsigned timeout, unsigned error,
 	if (!instkey)
 		goto error;
 
-	rka = request_key_auth_get(instkey);
-	if (!rka) {
-		ret = -EKEYREVOKED;
-		goto error;
-	}
+	rka = instkey->payload.data[0];
 	if (rka->target_key->serial != id)
-		goto error_put_rka;
+		goto error;
 
 	/* find the destination keyring if present (which must also be
 	 * writable) */
 	ret = get_instantiation_keyring(ringid, rka, &dest_keyring);
 	if (ret < 0)
-		goto error_put_rka;
+		goto error;
 
 	/* instantiate the key and link it into a keyring */
 	ret = key_reject_and_link(rka->target_key, timeout, error,
@@ -1389,8 +1379,6 @@ long keyctl_reject_key(key_serial_t id, unsigned timeout, unsigned error,
 	if (ret == 0)
 		keyctl_change_reqkey_auth(NULL);
 
-error_put_rka:
-	request_key_auth_put(rka);
 error:
 	return ret;
 }

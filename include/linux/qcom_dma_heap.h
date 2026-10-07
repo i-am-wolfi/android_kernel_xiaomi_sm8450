@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #ifndef _QCOM_DMA_HEAP_H
 #define _QCOM_DMA_HEAP_H
@@ -36,39 +37,7 @@
 
 #define QCOM_DMA_HEAP_FLAG_SECURE	BIT(31)
 
-/**
- * carveout_heap_add_memory - Dynamically add reserved heap memory
- * @heap_name:	The name of the DMA-BUF Heap we're giving memory to
- * @sgt:	An SGT corresponding to the memory adding to the heap
- * @cookie:	Cookie for managing refcount.
- * @get:	Function callback for increasing refcount.
- * @put:	Function callback for decreasing refcount.
- *
- * Return: 0 on success, a negative error value otherwise.
- */
-int carveout_heap_add_memory(char *heap_name, struct sg_table *sgt, void *cookie,
-			int (*get)(void *), void (*put)(void *));
-
-
-/**
- * carveout_heap_remove_memory - Dynamically remove reserved heap memory
- * @heap_name:	The name of the DMA-BUF Heap we're taking memory away from
- * @sgt:	An SGT corresponding to the memory we're removing from the heap
- *
- * Return: 0 on success, a negative error value otherwise.
- */
-int carveout_heap_remove_memory(char *heap_name, struct sg_table *sgt);
-
-struct dma_buf_heap_prefetch_region {
-	u64 size;
-	struct dma_heap *heap;
-};
-
-int qcom_secure_system_heap_prefetch(struct dma_buf_heap_prefetch_region *regions,
-				     size_t nr_regions);
-
-int qcom_secure_system_heap_drain(struct dma_buf_heap_prefetch_region *regions,
-				  size_t nr_regions);
+bool qcom_is_dma_buf_file(struct file *file);
 
 /**
  * dma_buf_heap_hyp_assign - wrapper function for hyp-assigning a dma_buf

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2017, Linaro Ltd
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
@@ -33,10 +34,6 @@ static const struct qcom_apcs_ipc_data ipq6018_apcs_data = {
 	.offset = 8, .clk_name = "qcom,apss-ipq6018-clk"
 };
 
-static const struct qcom_apcs_ipc_data ipq8074_apcs_data = {
-	.offset = 8, .clk_name = NULL
-};
-
 static const struct qcom_apcs_ipc_data msm8916_apcs_data = {
 	.offset = 8, .clk_name = "qcom-apcs-msm8916-clk"
 };
@@ -46,18 +43,30 @@ static const struct qcom_apcs_ipc_data msm8994_apcs_data = {
 };
 
 static const struct qcom_apcs_ipc_data msm8996_apcs_data = {
-	.offset = 16, .clk_name = NULL
-};
-
-static const struct qcom_apcs_ipc_data msm8998_apcs_data = {
-	.offset = 8, .clk_name = NULL
-};
-
-static const struct qcom_apcs_ipc_data sdm660_apcs_data = {
-	.offset = 8, .clk_name = NULL
+	.offset = 16, .clk_name = "qcom-apcs-msm8996-clk"
 };
 
 static const struct qcom_apcs_ipc_data apps_shared_apcs_data = {
+	.offset = 12, .clk_name = NULL
+};
+
+static const struct qcom_apcs_ipc_data bengal_apcs_data = {
+	.offset = 8, .clk_name = NULL
+};
+
+static const struct qcom_apcs_ipc_data scuba_apcs_data = {
+	.offset = 8, .clk_name = NULL
+};
+
+static const struct qcom_apcs_ipc_data sdx55_apcs_data = {
+	.offset = 0x1008, .clk_name = "qcom-sdx55-acps-clk"
+};
+
+static const struct qcom_apcs_ipc_data monaco_apcs_data = {
+	.offset = 8, .clk_name = NULL
+};
+
+static const struct qcom_apcs_ipc_data shikra_apcs_data = {
 	.offset = 12, .clk_name = NULL
 };
 
@@ -65,7 +74,7 @@ static const struct regmap_config apcs_regmap_config = {
 	.reg_bits = 32,
 	.reg_stride = 4,
 	.val_bits = 32,
-	.max_register = 0xFFC,
+	.max_register = 0x1008,
 	.fast_io = true,
 };
 
@@ -87,7 +96,6 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
 	struct qcom_apcs_ipc *apcs;
 	const struct qcom_apcs_ipc_data *apcs_data;
 	struct regmap *regmap;
-	struct resource *res;
 	void __iomem *base;
 	unsigned long i;
 	int ret;
@@ -96,8 +104,7 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
 	if (!apcs)
 		return -ENOMEM;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	base = devm_ioremap_resource(&pdev->dev, res);
+	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
@@ -139,29 +146,42 @@ static int qcom_apcs_ipc_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int qcom_apcs_ipc_remove(struct platform_device *pdev)
+static void qcom_apcs_ipc_remove(struct platform_device *pdev)
 {
 	struct qcom_apcs_ipc *apcs = platform_get_drvdata(pdev);
 	struct platform_device *clk = apcs->clk;
 
 	platform_device_unregister(clk);
-
-	return 0;
 }
 
 /* .data is the offset of the ipc register within the global block */
 static const struct of_device_id qcom_apcs_ipc_of_match[] = {
 	{ .compatible = "qcom,ipq6018-apcs-apps-global", .data = &ipq6018_apcs_data },
-	{ .compatible = "qcom,ipq8074-apcs-apps-global", .data = &ipq8074_apcs_data },
 	{ .compatible = "qcom,msm8916-apcs-kpss-global", .data = &msm8916_apcs_data },
+	{ .compatible = "qcom,msm8939-apcs-kpss-global", .data = &msm8916_apcs_data },
+	{ .compatible = "qcom,msm8953-apcs-kpss-global", .data = &msm8994_apcs_data },
+	{ .compatible = "qcom,msm8976-apcs-kpss-global", .data = &msm8994_apcs_data },
 	{ .compatible = "qcom,msm8994-apcs-kpss-global", .data = &msm8994_apcs_data },
 	{ .compatible = "qcom,msm8996-apcs-hmss-global", .data = &msm8996_apcs_data },
-	{ .compatible = "qcom,msm8998-apcs-hmss-global", .data = &msm8998_apcs_data },
+	{ .compatible = "qcom,msm8998-apcs-hmss-global", .data = &msm8994_apcs_data },
+	{ .compatible = "qcom,qcm2290-apcs-hmss-global", .data = &msm8994_apcs_data },
 	{ .compatible = "qcom,qcs404-apcs-apps-global", .data = &msm8916_apcs_data },
-	{ .compatible = "qcom,sc7180-apss-shared", .data = &apps_shared_apcs_data },
-	{ .compatible = "qcom,sdm660-apcs-hmss-global", .data = &sdm660_apcs_data },
+	{ .compatible = "qcom,sdm660-apcs-hmss-global", .data = &msm8994_apcs_data },
 	{ .compatible = "qcom,sdm845-apss-shared", .data = &apps_shared_apcs_data },
+	{ .compatible = "qcom,sm4250-apcs-hmss-global", .data = &msm8994_apcs_data },
+	{ .compatible = "qcom,sm6125-apcs-hmss-global", .data = &msm8994_apcs_data },
+	{ .compatible = "qcom,sm6115-apcs-hmss-global", .data = &msm8994_apcs_data },
+	{ .compatible = "qcom,sdx55-apcs-gcc", .data = &sdx55_apcs_data },
+	/* Do not add any more entries using existing driver data */
+	{ .compatible = "qcom,ipq5332-apcs-apps-global", .data = &ipq6018_apcs_data },
+	{ .compatible = "qcom,ipq8074-apcs-apps-global", .data = &ipq6018_apcs_data },
+	{ .compatible = "qcom,monaco-apcs-hmss-global", .data = &monaco_apcs_data  },
+	{ .compatible = "qcom,sc7180-apss-shared", .data = &apps_shared_apcs_data },
+	{ .compatible = "qcom,sc8180x-apss-shared", .data = &apps_shared_apcs_data },
 	{ .compatible = "qcom,sm8150-apss-shared", .data = &apps_shared_apcs_data },
+	{ .compatible = "qcom,bengal-apcs-hmss-global", .data = &bengal_apcs_data },
+	{ .compatible = "qcom,shikra-apcs-hmss-global", .data = &shikra_apcs_data },
+	{ .compatible = "qcom,scuba-apcs-hmss-global", .data = &scuba_apcs_data },
 	{}
 };
 MODULE_DEVICE_TABLE(of, qcom_apcs_ipc_of_match);
@@ -187,5 +207,5 @@ static void __exit qcom_apcs_ipc_exit(void)
 }
 module_exit(qcom_apcs_ipc_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Qualcomm APCS IPC driver");

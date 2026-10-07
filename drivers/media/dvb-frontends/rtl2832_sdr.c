@@ -245,7 +245,7 @@ static void rtl2832_sdr_urb_complete(struct urb *urb)
 		if (unlikely(fbuf == NULL)) {
 			dev->vb_full++;
 			dev_notice_ratelimited(&pdev->dev,
-					       "videobuf is full, %d packets dropped\n",
+					       "video buffer is full, %d packets dropped\n",
 					       dev->vb_full);
 			goto skip;
 		}
@@ -376,8 +376,11 @@ static int rtl2832_sdr_alloc_urbs(struct rtl2832_sdr_dev *dev)
 		dev_dbg(&pdev->dev, "alloc urb=%d\n", i);
 		dev->urb_list[i] = usb_alloc_urb(0, GFP_KERNEL);
 		if (!dev->urb_list[i]) {
-			for (j = 0; j < i; j++)
+			for (j = 0; j < i; j++) {
 				usb_free_urb(dev->urb_list[j]);
+				dev->urb_list[j] = NULL;
+			}
+			dev->urbs_initialized = 0;
 			return -ENOMEM;
 		}
 		usb_fill_bulk_urb(dev->urb_list[i],
@@ -396,8 +399,7 @@ static int rtl2832_sdr_alloc_urbs(struct rtl2832_sdr_dev *dev)
 }
 
 /* Must be called with vb_queue_lock hold */
-static void rtl2832_sdr_cleanup_queued_bufs(struct rtl2832_sdr_dev *dev,
-					    enum vb2_buffer_state state)
+static void rtl2832_sdr_cleanup_queued_bufs(struct rtl2832_sdr_dev *dev)
 {
 	struct platform_device *pdev = dev->pdev;
 	unsigned long flags;
@@ -411,7 +413,7 @@ static void rtl2832_sdr_cleanup_queued_bufs(struct rtl2832_sdr_dev *dev,
 		buf = list_entry(dev->queued_bufs.next,
 				struct rtl2832_sdr_frame_buf, list);
 		list_del(&buf->list);
-		vb2_buffer_done(&buf->vb.vb2_buf, state);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 	}
 	spin_unlock_irqrestore(&dev->queued_bufs_lock, flags);
 }
@@ -437,12 +439,13 @@ static int rtl2832_sdr_queue_setup(struct vb2_queue *vq,
 {
 	struct rtl2832_sdr_dev *dev = vb2_get_drv_priv(vq);
 	struct platform_device *pdev = dev->pdev;
+	unsigned int q_num_bufs = vb2_get_num_buffers(vq);
 
 	dev_dbg(&pdev->dev, "nbuffers=%d\n", *nbuffers);
 
 	/* Need at least 8 buffers */
-	if (vq->num_buffers + *nbuffers < 8)
-		*nbuffers = 8 - vq->num_buffers;
+	if (q_num_bufs + *nbuffers < 8)
+		*nbuffers = 8 - q_num_bufs;
 	*nplanes = 1;
 	sizes[0] = PAGE_ALIGN(dev->buffersize);
 	dev_dbg(&pdev->dev, "nbuffers=%d sizes[0]=%d\n", *nbuffers, sizes[0]);
@@ -852,15 +855,11 @@ static int rtl2832_sdr_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 	dev_dbg(&pdev->dev, "\n");
 
-	if (!dev->udev) {
-		rtl2832_sdr_cleanup_queued_bufs(dev, VB2_BUF_STATE_QUEUED);
+	if (!dev->udev)
 		return -ENODEV;
-	}
 
-	if (mutex_lock_interruptible(&dev->v4l2_lock)) {
-		rtl2832_sdr_cleanup_queued_bufs(dev, VB2_BUF_STATE_QUEUED);
+	if (mutex_lock_interruptible(&dev->v4l2_lock))
 		return -ERESTARTSYS;
-	}
 
 	if (d->props->power_ctrl)
 		d->props->power_ctrl(d, 1);
@@ -901,11 +900,7 @@ static int rtl2832_sdr_start_streaming(struct vb2_queue *vq, unsigned int count)
 	if (ret)
 		goto err;
 
-	mutex_unlock(&dev->v4l2_lock);
-	return 0;
-
 err:
-	rtl2832_sdr_cleanup_queued_bufs(dev, VB2_BUF_STATE_QUEUED);
 	mutex_unlock(&dev->v4l2_lock);
 
 	return ret;
@@ -925,7 +920,7 @@ static void rtl2832_sdr_stop_streaming(struct vb2_queue *vq)
 	rtl2832_sdr_kill_urbs(dev);
 	rtl2832_sdr_free_urbs(dev);
 	rtl2832_sdr_free_stream_bufs(dev);
-	rtl2832_sdr_cleanup_queued_bufs(dev, VB2_BUF_STATE_ERROR);
+	rtl2832_sdr_cleanup_queued_bufs(dev);
 	rtl2832_sdr_unset_adc(dev);
 
 	/* sleep tuner */
@@ -1139,8 +1134,6 @@ static int rtl2832_sdr_g_fmt_sdr_cap(struct file *file, void *priv,
 	f->fmt.sdr.pixelformat = dev->pixelformat;
 	f->fmt.sdr.buffersize = dev->buffersize;
 
-	memset(f->fmt.sdr.reserved, 0, sizeof(f->fmt.sdr.reserved));
-
 	return 0;
 }
 
@@ -1158,7 +1151,6 @@ static int rtl2832_sdr_s_fmt_sdr_cap(struct file *file, void *priv,
 	if (vb2_is_busy(q))
 		return -EBUSY;
 
-	memset(f->fmt.sdr.reserved, 0, sizeof(f->fmt.sdr.reserved));
 	for (i = 0; i < dev->num_formats; i++) {
 		if (formats[i].pixelformat == f->fmt.sdr.pixelformat) {
 			dev->pixelformat = formats[i].pixelformat;
@@ -1186,7 +1178,6 @@ static int rtl2832_sdr_try_fmt_sdr_cap(struct file *file, void *priv,
 	dev_dbg(&pdev->dev, "pixelformat fourcc %4.4s\n",
 		(char *)&f->fmt.sdr.pixelformat);
 
-	memset(f->fmt.sdr.reserved, 0, sizeof(f->fmt.sdr.reserved));
 	for (i = 0; i < dev->num_formats; i++) {
 		if (formats[i].pixelformat == f->fmt.sdr.pixelformat) {
 			f->fmt.sdr.buffersize = formats[i].buffersize;
@@ -1473,7 +1464,7 @@ err:
 	return ret;
 }
 
-static int rtl2832_sdr_remove(struct platform_device *pdev)
+static void rtl2832_sdr_remove(struct platform_device *pdev)
 {
 	struct rtl2832_sdr_dev *dev = platform_get_drvdata(pdev);
 
@@ -1489,8 +1480,6 @@ static int rtl2832_sdr_remove(struct platform_device *pdev)
 	mutex_unlock(&dev->vb_queue_lock);
 	v4l2_device_put(&dev->v4l2_dev);
 	module_put(pdev->dev.parent->driver->owner);
-
-	return 0;
 }
 
 static struct platform_driver rtl2832_sdr_driver = {
@@ -1498,7 +1487,7 @@ static struct platform_driver rtl2832_sdr_driver = {
 		.name   = "rtl2832_sdr",
 	},
 	.probe          = rtl2832_sdr_probe,
-	.remove         = rtl2832_sdr_remove,
+	.remove_new     = rtl2832_sdr_remove,
 };
 module_platform_driver(rtl2832_sdr_driver);
 

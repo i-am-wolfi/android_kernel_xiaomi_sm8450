@@ -2,6 +2,7 @@
 /*
  * Copyright (C) 2011 Google, Inc
  * Copyright (c) 2011-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/highmem.h>
@@ -13,7 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <soc/qcom/secure_buffer.h>
 
 #define CREATE_TRACE_POINTS
@@ -25,8 +26,12 @@
 #define BATCH_MAX_SIZE SZ_2M
 #define BATCH_MAX_SECTIONS 32
 
+#define HLOS_DEST_ARR_SIZE 1
+
 static struct device *qcom_secure_buffer_dev;
 static bool vmid_cp_camera_preview_ro;
+
+SRCU_NOTIFIER_HEAD_STATIC(hyp_assign_notifier);
 
 struct hyp_assign_debug_track {
 	depot_stack_handle_t hdl;
@@ -36,7 +41,7 @@ struct hyp_assign_debug_track {
 	u32 refcount;
 };
 
-#ifdef CONFIG_HYP_ASSIGN_DEBUG
+#if IS_ENABLED(CONFIG_HYP_ASSIGN_DEBUG)
 /*
  * Contains a pointer to struct hyp_assign_debug_track for each pfn which
  * is in an assigned state.
@@ -98,7 +103,6 @@ alloc_debug_tracking(int *dst_vmids, int *dst_perms, int dest_nelems)
 	memcpy(track->vmids, dst_vmids, nr_acl_entries * sizeof(*dst_vmids));
 	memcpy(track->perms, dst_perms, nr_acl_entries * sizeof(*dst_perms));
 
-
 	nr_stack_entries = stack_trace_save(stack_entries, ARRAY_SIZE(stack_entries), 2);
 	track->hdl = stack_depot_save(stack_entries, nr_stack_entries, GFP_KERNEL);
 	if (!track->hdl)
@@ -138,8 +142,7 @@ static bool is_reclaim(struct qcom_scm_current_perm_info *newvms, size_t newvms_
 }
 
 static void check_debug_tracking(struct qcom_scm_mem_map_info *mem_regions,
-				size_t mem_regions_sz, u32 *srcvms,
-				size_t src_sz,
+				size_t mem_regions_sz,
 				struct qcom_scm_current_perm_info *newvms,
 				size_t newvms_sz)
 {
@@ -175,8 +178,7 @@ static void check_debug_tracking(struct qcom_scm_mem_map_info *mem_regions,
 }
 
 static void update_debug_tracking(struct qcom_scm_mem_map_info *mem_regions,
-				size_t mem_regions_sz, u32 *srcvms,
-				size_t src_sz,
+				size_t mem_regions_sz,
 				struct qcom_scm_current_perm_info *newvms,
 				size_t newvms_sz,
 				struct hyp_assign_debug_track *new)
@@ -218,15 +220,13 @@ static void put_track(struct hyp_assign_debug_track *track)
 {
 }
 static void check_debug_tracking(struct qcom_scm_mem_map_info *mem_regions,
-				size_t mem_regions_sz, u32 *srcvms,
-				size_t src_sz,
+				size_t mem_regions_sz,
 				struct qcom_scm_current_perm_info *newvms,
 				size_t newvms_sz)
 {
 }
 static void update_debug_tracking(struct qcom_scm_mem_map_info *mem_regions,
-				size_t mem_regions_sz, u32 *srcvms,
-				size_t src_sz,
+				size_t mem_regions_sz,
 				struct qcom_scm_current_perm_info *newvms,
 				size_t newvms_sz,
 				struct hyp_assign_debug_track *new)
@@ -282,11 +282,66 @@ static unsigned int get_batches_from_sgl(struct qcom_scm_mem_map_info *sgt_copy,
 	return i;
 }
 
-static int batched_hyp_assign(struct sg_table *table, u32 *source_vmids,
-			      size_t source_size,
+static inline int _hyp_assign_table(struct sg_table *table, unsigned int sg_nents_to_assign,
+				    u32 *source_vm_list, int source_nelems,
+				    int *dest_vmids, int *dest_perms,
+				    int dest_nelems,
+				    bool rollback_on_assign_failure);
+
+static inline int rollback_batched_assign(struct sg_table *table, unsigned int nents_assigned,
+					  struct qcom_scm_current_perm_info *destvms,
+					  size_t destvms_size_bytes)
+{
+	u32 *new_source_vm_list;
+	int new_source_nelems;
+
+	/* Hard-coded to work with HLOS as the source */
+	int hlos_dest[HLOS_DEST_ARR_SIZE] = {VMID_HLOS};
+	int hlos_perms[HLOS_DEST_ARR_SIZE] = {PERM_READ | PERM_WRITE | PERM_EXEC};
+
+	int ret;
+
+	new_source_nelems = sizeof(*destvms) / destvms_size_bytes;
+	new_source_vm_list = kmalloc_array(new_source_nelems,
+					   sizeof(*new_source_vm_list),
+					   GFP_KERNEL);
+	if (!new_source_vm_list)
+		return -ENOMEM;
+
+	for (int i = 0; i < new_source_nelems; i++)
+		new_source_vm_list[i] = le32_to_cpu(destvms[i].vmid);
+
+	ret = _hyp_assign_table(table, nents_assigned,
+				new_source_vm_list, new_source_nelems,
+				hlos_dest, hlos_perms, HLOS_DEST_ARR_SIZE,
+				false);
+
+	kfree(new_source_vm_list);
+
+	return ret;
+}
+
+/*
+ * batched_hyp_assign() - assigns memory to destvms in batches
+ * @table: sg_table of memory to assign
+ * @nents: the number of entries in @table in the range [0, nents - 1)
+ *	   that we want to assign
+ * @source_vmids: array of source VMIDs
+ * @source_size_bytes: size of @source_vmids in _bytes_, pass directly into
+ *		       qcom_scm_assign_mem()
+ * @destvms: array of VMIDs + permissions for each VMID that we're assigning to
+ * @destvms_size_bytes: size of @destvms in bytes
+ * @track: debug structure used for tracking which pages are and aren't
+ *	   assigned
+ * @rollback_on_assign_failureue: indicates if we should try rolling back an
+ *				  assign attempt
+ */
+static int batched_hyp_assign(struct sg_table *table, unsigned int nents,
+			      u32 *source_vmids, size_t source_size_bytes,
 			      struct qcom_scm_current_perm_info *destvms,
-			      size_t destvms_size,
-			      struct hyp_assign_debug_track *track)
+			      size_t destvms_size_bytes,
+			      struct hyp_assign_debug_track *track,
+			      bool rollback_on_assign_failure)
 {
 	unsigned int batch_start = 0;
 	unsigned int batches_processed;
@@ -307,7 +362,7 @@ static int batched_hyp_assign(struct sg_table *table, u32 *source_vmids,
 		return -ENOMEM;
 
 	first_assign_ts = ktime_get();
-	while (batch_start < table->nents) {
+	while (batch_start < nents) {
 		batches_processed = get_batches_from_sgl(mem_regions_buf,
 							 curr_sgl, &next_sgl);
 		curr_sgl = next_sgl;
@@ -324,37 +379,73 @@ static int batched_hyp_assign(struct sg_table *table, u32 *source_vmids,
 		}
 
 		check_debug_tracking(mem_regions_buf, mem_regions_buf_size,
-				     source_vmids, source_size,
-				     destvms, destvms_size);
+				     destvms, destvms_size_bytes);
 
 		trace_hyp_assign_batch_start(mem_regions_buf,
 					     batches_processed);
 		batch_assign_start_ts = ktime_get();
 		ret = qcom_scm_assign_mem_regions(mem_regions_buf,
 						  mem_regions_buf_size,
-						  source_vmids, source_size,
-						  destvms, destvms_size);
+						  source_vmids, source_size_bytes,
+						  destvms, destvms_size_bytes);
 
 		trace_hyp_assign_batch_end(ret, ktime_us_delta(ktime_get(),
 					   batch_assign_start_ts));
 		dma_unmap_single(qcom_secure_buffer_dev, entries_dma_addr,
 				 mem_regions_buf_size, DMA_TO_DEVICE);
-		i++;
 
 		if (ret) {
-			pr_info("%s: Failed to assign memory protection, ret = %d\n",
-				__func__, ret);
+			int reclaim_ret;
+
+			pr_err("%s: Failed to assign memory protection, ret = %d, batch = %d\n",
+			       __func__, ret, i);
+
+			if (!rollback_on_assign_failure)
+				/*
+				 * Only called from outer invocation of batched_hyp_assign(),
+				 * user will get -EADDRNOTAVAIL
+				 */
+				break;
+
 			/*
-			 * Make it clear to clients that the memory may no
-			 * longer be in a usable state.
+			 * If we haven't assigned anything yet, there's nothing to roll back,
+			 * don't return -EADDRNOTAVAIL
 			 */
-			ret = -EADDRNOTAVAIL;
+			if (batch_start == 0)
+				break;
+
+			/* We shouldn't roll back if the source VM is not HLOS */
+			if (source_size_bytes > sizeof(*source_vmids) ||
+			    source_vmids[0] != VMID_HLOS) {
+				pr_err("%s: Can only reclaim memory coming from HLOS\n",
+				       __func__);
+				ret = -EADDRNOTAVAIL;
+				break;
+			}
+
+			/* Attempt to reclaim the i - 1 entries we already assigned */
+			reclaim_ret = rollback_batched_assign(table, batch_start - 1, destvms,
+							      destvms_size_bytes);
+
+			if (reclaim_ret) {
+				pr_err("%s: Failed to reclaim memory, ret = %d\n", __func__,
+				       reclaim_ret);
+				/*
+				 * Make it clear to clients that the memory may no
+				 * longer be in a usable state.
+				 */
+				ret = -EADDRNOTAVAIL;
+			} else {
+				pr_err("%s: Reclaimed memory\n", __func__);
+			}
+
 			break;
 		}
 
+		i++;
+
 		update_debug_tracking(mem_regions_buf, mem_regions_buf_size,
-				     source_vmids, source_size,
-				     destvms, destvms_size, track);
+				      destvms, destvms_size_bytes, track);
 		batch_start += batches_processed;
 	}
 	total_delta = ktime_us_delta(ktime_get(), first_assign_ts);
@@ -393,10 +484,11 @@ int page_accessible(unsigned long pfn)
  *  When -EADDRNOTAVAIL is returned the memory may no longer be in
  *  a usable state and should no longer be accessed by the HLOS.
  */
-int hyp_assign_table(struct sg_table *table,
-			u32 *source_vm_list, int source_nelems,
-			int *dest_vmids, int *dest_perms,
-			int dest_nelems)
+static inline int _hyp_assign_table(struct sg_table *table, unsigned int sg_nents_to_assign,
+				    u32 *source_vm_list, int source_nelems,
+				    int *dest_vmids, int *dest_perms,
+				    int dest_nelems,
+				    bool rollback_on_assign_failure)
 {
 	int ret = 0;
 	u32 *source_vm_copy;
@@ -446,13 +538,23 @@ int hyp_assign_table(struct sg_table *table,
 
 	/* Save stacktrace & hyp_assign parameters */
 	track = alloc_debug_tracking(dest_vmids, dest_perms, dest_nelems);
+#if IS_ENABLED(CONFIG_HYP_ASSIGN_DEBUG)
+	if (!track) {
+		ret = -ENOMEM;
+		dma_unmap_single(qcom_secure_buffer_dev, dest_dma_addr,
+				 dest_vm_copy_size, DMA_TO_DEVICE);
+		goto out_free_dest;
+	}
+#endif /* CONFIG_HYP_ASSIGN_DEBUG */
 
 	trace_hyp_assign_info(source_vm_list, source_nelems, dest_vmids,
 			      dest_perms, dest_nelems);
 
 
-	ret = batched_hyp_assign(table, source_vm_copy, source_vm_copy_size,
-				 dest_vm_copy, dest_vm_copy_size, track);
+	ret = batched_hyp_assign(table, sg_nents_to_assign, source_vm_copy,
+				 source_vm_copy_size, dest_vm_copy,
+				 dest_vm_copy_size, track,
+				 rollback_on_assign_failure);
 
 	if (!ret) {
 		while (dest_nelems--) {
@@ -481,31 +583,65 @@ out_free_source:
 	kfree(source_vm_copy);
 	return ret;
 }
-EXPORT_SYMBOL(hyp_assign_table);
 
-int hyp_assign_phys(phys_addr_t addr, u64 size, u32 *source_vm_list,
-			int source_nelems, int *dest_vmids,
-			int *dest_perms, int dest_nelems)
+static int hyp_assign_table_notify(struct sg_table *table,
+		     u32 *source_vm_list, int source_nelems,
+		     int *dest_vmids, int *dest_perms,
+		     int dest_nelems)
 {
-	struct sg_table table;
+	struct hyp_assign_notifier_data data = {
+		.table = table,
+		.source_vm_list = source_vm_list,
+		.source_nelems = source_nelems,
+		.dest_vmids = dest_vmids,
+		.dest_perms = dest_perms,
+		.dest_nelems = dest_nelems,
+	};
+
+	return srcu_notifier_call_chain(&hyp_assign_notifier, 0, &data);
+}
+
+int hyp_assign_table(struct sg_table *table,
+		     u32 *source_vm_list, int source_nelems,
+		     int *dest_vmids, int *dest_perms,
+		     int dest_nelems)
+{
 	int ret;
 
-	if (!qcom_secure_buffer_dev)
-		return -EPROBE_DEFER;
+	ret = hyp_assign_table_notify(table, source_vm_list, source_nelems,
+				      dest_vmids, dest_perms, dest_nelems);
+	/* If notifier handled it (NOTIFY_STOP) or returned an error, return early */
+	if (ret & NOTIFY_STOP_MASK)
+		return notifier_to_errno(ret);
 
-	ret = sg_alloc_table(&table, 1, GFP_KERNEL);
-	if (ret)
-		return ret;
-
-	sg_set_page(table.sgl, phys_to_page(addr), size, 0);
-
-	ret = hyp_assign_table(&table, source_vm_list, source_nelems,
-			       dest_vmids, dest_perms, dest_nelems);
-
-	sg_free_table(&table);
-	return ret;
+	return _hyp_assign_table(table, table->nents, source_vm_list, source_nelems,
+				 dest_vmids, dest_perms, dest_nelems, true);
 }
-EXPORT_SYMBOL(hyp_assign_phys);
+EXPORT_SYMBOL(hyp_assign_table);
+
+/**
+ * hyp_assign_notifier_register() -
+ * Register a handler for hyp_assign_table().
+ * The values returned by this notifier have the following interpretation:
+ * NOTIFY_STOP - Success. No fallback to arm 'smc' instruction.
+ * NOTIFY_OK   - No error. Fallback to arm 'smc'.
+ * values that notifier_to_errno() would consider errors -
+ *               Stop. Do not call futher notifiers nor arm 'smc'.
+ *
+ * This notifier is intended to support a compatibility layer between
+ * client-facing apis and different secure memory implemenations.
+ */
+int hyp_assign_notifier_register(struct notifier_block *nb)
+{
+	return srcu_notifier_chain_register(&hyp_assign_notifier, nb);
+}
+EXPORT_SYMBOL_GPL(hyp_assign_notifier_register);
+
+int hyp_assign_notifier_unregister(struct notifier_block *nb)
+{
+	return srcu_notifier_chain_unregister(&hyp_assign_notifier, nb);
+}
+EXPORT_SYMBOL_GPL(hyp_assign_notifier_unregister);
 
 const char *msm_secure_vmid_to_string(int secure_vmid)
 {
@@ -605,7 +741,7 @@ static struct platform_driver qcom_secure_buffer_driver = {
 
 static int __init qcom_secure_buffer_init(void)
 {
-#ifdef CONFIG_HYP_ASSIGN_DEBUG
+#if IS_ENABLED(CONFIG_HYP_ASSIGN_DEBUG)
 	failure_handle = create_dummy_stack();
 #endif
 
@@ -619,4 +755,4 @@ static void __exit qcom_secure_buffer_exit(void)
 }
 module_exit(qcom_secure_buffer_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -17,6 +17,8 @@
 #include <linux/time.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <media/dvbdev.h>
+#include <media/media-device.h>
 
 #include "vidtv_bridge.h"
 #include "vidtv_common.h"
@@ -43,28 +45,28 @@
 #define LNB_HIGH_FREQ		10600000	/* transition frequency */
 
 static unsigned int drop_tslock_prob_on_low_snr;
-module_param(drop_tslock_prob_on_low_snr, uint, 0);
+module_param(drop_tslock_prob_on_low_snr, uint, 0444);
 MODULE_PARM_DESC(drop_tslock_prob_on_low_snr,
 		 "Probability of losing the TS lock if the signal quality is bad");
 
 static unsigned int recover_tslock_prob_on_good_snr;
-module_param(recover_tslock_prob_on_good_snr, uint, 0);
+module_param(recover_tslock_prob_on_good_snr, uint, 0444);
 MODULE_PARM_DESC(recover_tslock_prob_on_good_snr,
 		 "Probability recovering the TS lock when the signal improves");
 
 static unsigned int mock_power_up_delay_msec;
-module_param(mock_power_up_delay_msec, uint, 0);
+module_param(mock_power_up_delay_msec, uint, 0444);
 MODULE_PARM_DESC(mock_power_up_delay_msec, "Simulate a power up delay");
 
 static unsigned int mock_tune_delay_msec;
-module_param(mock_tune_delay_msec, uint, 0);
+module_param(mock_tune_delay_msec, uint, 0444);
 MODULE_PARM_DESC(mock_tune_delay_msec, "Simulate a tune delay");
 
 static unsigned int vidtv_valid_dvb_t_freqs[NUM_VALID_TUNER_FREQS] = {
 	474000000
 };
 
-module_param_array(vidtv_valid_dvb_t_freqs, uint, NULL, 0);
+module_param_array(vidtv_valid_dvb_t_freqs, uint, NULL, 0444);
 MODULE_PARM_DESC(vidtv_valid_dvb_t_freqs,
 		 "Valid DVB-T frequencies to simulate, in Hz");
 
@@ -72,19 +74,19 @@ static unsigned int vidtv_valid_dvb_c_freqs[NUM_VALID_TUNER_FREQS] = {
 	474000000
 };
 
-module_param_array(vidtv_valid_dvb_c_freqs, uint, NULL, 0);
+module_param_array(vidtv_valid_dvb_c_freqs, uint, NULL, 0444);
 MODULE_PARM_DESC(vidtv_valid_dvb_c_freqs,
 		 "Valid DVB-C frequencies to simulate, in Hz");
 
 static unsigned int vidtv_valid_dvb_s_freqs[NUM_VALID_TUNER_FREQS] = {
 	11362000
 };
-module_param_array(vidtv_valid_dvb_s_freqs, uint, NULL, 0);
+module_param_array(vidtv_valid_dvb_s_freqs, uint, NULL, 0444);
 MODULE_PARM_DESC(vidtv_valid_dvb_s_freqs,
 		 "Valid DVB-S/S2 frequencies to simulate at Ku-Band, in kHz");
 
 static unsigned int max_frequency_shift_hz;
-module_param(max_frequency_shift_hz, uint, 0);
+module_param(max_frequency_shift_hz, uint, 0444);
 MODULE_PARM_DESC(max_frequency_shift_hz,
 		 "Maximum shift in HZ allowed when tuning in a channel");
 
@@ -94,24 +96,24 @@ DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nums);
  * Influences the signal acquisition time. See ISO/IEC 13818-1 : 2000. p. 113.
  */
 static unsigned int si_period_msec = 40;
-module_param(si_period_msec, uint, 0);
+module_param(si_period_msec, uint, 0444);
 MODULE_PARM_DESC(si_period_msec, "How often to send SI packets. Default: 40ms");
 
 static unsigned int pcr_period_msec = 40;
-module_param(pcr_period_msec, uint, 0);
+module_param(pcr_period_msec, uint, 0444);
 MODULE_PARM_DESC(pcr_period_msec,
 		 "How often to send PCR packets. Default: 40ms");
 
 static unsigned int mux_rate_kbytes_sec = 4096;
-module_param(mux_rate_kbytes_sec, uint, 0);
+module_param(mux_rate_kbytes_sec, uint, 0444);
 MODULE_PARM_DESC(mux_rate_kbytes_sec, "Mux rate: will pad stream if below");
 
 static unsigned int pcr_pid = 0x200;
-module_param(pcr_pid, uint, 0);
+module_param(pcr_pid, uint, 0444);
 MODULE_PARM_DESC(pcr_pid, "PCR PID for all channels: defaults to 0x200");
 
 static unsigned int mux_buf_sz_pkts;
-module_param(mux_buf_sz_pkts, uint, 0);
+module_param(mux_buf_sz_pkts, uint, 0444);
 MODULE_PARM_DESC(mux_buf_sz_pkts,
 		 "Size for the internal mux buffer in multiples of 188 bytes");
 
@@ -235,10 +237,8 @@ static int vidtv_start_feed(struct dvb_demux_feed *feed)
 
 	if (dvb->nfeeds == 1) {
 		ret = vidtv_start_streaming(dvb);
-		if (ret < 0) {
-			dvb->nfeeds--;
+		if (ret < 0)
 			rc = ret;
-		}
 	}
 
 	mutex_unlock(&dvb->feed_lock);
@@ -422,6 +422,7 @@ static int vidtv_bridge_dvb_init(struct vidtv_dvb *dvb)
 	ret = vidtv_bridge_register_adap(dvb);
 	if (ret < 0)
 		goto fail_adapter;
+	dvb_register_media_controller(&dvb->adapter, &dvb->mdev);
 
 	for (i = 0; i < NUM_FE; ++i) {
 		ret = vidtv_bridge_probe_demod(dvb, i);
@@ -495,6 +496,15 @@ static int vidtv_bridge_probe(struct platform_device *pdev)
 
 	dvb->pdev = pdev;
 
+#ifdef CONFIG_MEDIA_CONTROLLER_DVB
+	dvb->mdev.dev = &pdev->dev;
+
+	strscpy(dvb->mdev.model, "vidtv", sizeof(dvb->mdev.model));
+	strscpy(dvb->mdev.bus_info, "platform:vidtv", sizeof(dvb->mdev.bus_info));
+
+	media_device_init(&dvb->mdev);
+#endif
+
 	ret = vidtv_bridge_dvb_init(dvb);
 	if (ret < 0)
 		goto err_dvb;
@@ -503,20 +513,38 @@ static int vidtv_bridge_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, dvb);
 
+#ifdef CONFIG_MEDIA_CONTROLLER_DVB
+	ret = media_device_register(&dvb->mdev);
+	if (ret) {
+		dev_err(dvb->mdev.dev,
+			"media device register failed (err=%d)\n", ret);
+		goto err_media_device_register;
+	}
+#endif /* CONFIG_MEDIA_CONTROLLER_DVB */
+
 	dev_info(&pdev->dev, "Successfully initialized vidtv!\n");
 	return ret;
 
+#ifdef CONFIG_MEDIA_CONTROLLER_DVB
+err_media_device_register:
+	media_device_cleanup(&dvb->mdev);
+#endif /* CONFIG_MEDIA_CONTROLLER_DVB */
 err_dvb:
 	kfree(dvb);
 	return ret;
 }
 
-static int vidtv_bridge_remove(struct platform_device *pdev)
+static void vidtv_bridge_remove(struct platform_device *pdev)
 {
 	struct vidtv_dvb *dvb;
 	u32 i;
 
 	dvb = platform_get_drvdata(pdev);
+
+#ifdef CONFIG_MEDIA_CONTROLLER_DVB
+	media_device_unregister(&dvb->mdev);
+	media_device_cleanup(&dvb->mdev);
+#endif /* CONFIG_MEDIA_CONTROLLER_DVB */
 
 	mutex_destroy(&dvb->feed_lock);
 
@@ -529,26 +557,28 @@ static int vidtv_bridge_remove(struct platform_device *pdev)
 	dvb_dmxdev_release(&dvb->dmx_dev);
 	dvb_dmx_release(&dvb->demux);
 	dvb_unregister_adapter(&dvb->adapter);
-
-	return 0;
+	dev_info(&pdev->dev, "Successfully removed vidtv\n");
 }
 
 static void vidtv_bridge_dev_release(struct device *dev)
 {
+	struct vidtv_dvb *dvb;
+
+	dvb = dev_get_drvdata(dev);
+	kfree(dvb);
 }
 
 static struct platform_device vidtv_bridge_dev = {
-	.name		= "vidtv_bridge",
+	.name		= VIDTV_PDEV_NAME,
 	.dev.release	= vidtv_bridge_dev_release,
 };
 
 static struct platform_driver vidtv_bridge_driver = {
 	.driver = {
-		.name                = "vidtv_bridge",
-		.suppress_bind_attrs = true,
+		.name = VIDTV_PDEV_NAME,
 	},
 	.probe    = vidtv_bridge_probe,
-	.remove   = vidtv_bridge_remove,
+	.remove_new = vidtv_bridge_remove,
 };
 
 static void __exit vidtv_bridge_exit(void)
@@ -562,10 +592,8 @@ static int __init vidtv_bridge_init(void)
 	int ret;
 
 	ret = platform_device_register(&vidtv_bridge_dev);
-	if (ret) {
-		platform_device_put(&vidtv_bridge_dev);
+	if (ret)
 		return ret;
-	}
 
 	ret = platform_driver_register(&vidtv_bridge_driver);
 	if (ret)

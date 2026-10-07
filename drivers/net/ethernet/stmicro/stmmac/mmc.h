@@ -21,6 +21,7 @@
 						 * current value.*/
 #define MMC_CNTRL_PRESET		0x10
 #define MMC_CNTRL_FULL_HALF_PRESET	0x20
+#define MMC_CNTRL_DRCHM			BIT(31)
 
 #define MMC_GMAC4_OFFSET		0x700
 #define MMC_GMAC3_X_OFFSET		0x100
@@ -52,6 +53,9 @@ struct stmmac_counters {
 	unsigned int mmc_tx_excessdef;
 	unsigned int mmc_tx_pause_frame;
 	unsigned int mmc_tx_vlan_frame_g;
+	unsigned int mmc_tx_oversize_g;
+	unsigned int mmc_tx_lpi_usec;
+	unsigned int mmc_tx_lpi_tran;
 
 	/* MMC RX counter registers */
 	unsigned int mmc_rx_framecount_gb;
@@ -78,6 +82,12 @@ struct stmmac_counters {
 	unsigned int mmc_rx_fifo_overflow;
 	unsigned int mmc_rx_vlan_frames_gb;
 	unsigned int mmc_rx_watchdog_error;
+	unsigned int mmc_rx_error;
+	unsigned int mmc_rx_lpi_usec;
+	unsigned int mmc_rx_lpi_tran;
+	unsigned int mmc_rx_discard_frames_gb;
+	unsigned int mmc_rx_discard_octets_gb;
+	unsigned int mmc_rx_align_err_frames;
 	/* IPC */
 	unsigned int mmc_rx_ipc_intr_mask;
 	unsigned int mmc_rx_ipc_intr;
@@ -118,9 +128,14 @@ struct stmmac_counters {
 	unsigned int mmc_rx_icmp_gd_octets;
 	unsigned int mmc_rx_icmp_err_octets;
 
+	/* Stream-Gate Filter */
+	unsigned int mmc_sgf_pass_fragment_cntr;
+	unsigned int mmc_sgf_fail_fragment_cntr;
+
 	/* FPE */
 	unsigned int mmc_tx_fpe_fragment_cntr;
 	unsigned int mmc_tx_hold_req_cntr;
+	unsigned int mmc_tx_gate_overrun_cntr;
 	unsigned int mmc_rx_packet_assembly_err_cntr;
 	unsigned int mmc_rx_packet_smd_err_cntr;
 	unsigned int mmc_rx_packet_assembly_ok_cntr;

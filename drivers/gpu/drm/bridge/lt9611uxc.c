@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
-
 #define pr_fmt(fmt) "%s: " fmt, __func__
-
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -40,7 +39,6 @@
 #define READ_BUF_MAX_SIZE 128
 #define WRITE_BUF_MAX_SIZE 128
 #define EDID_TIMEOUT_MS 2000
-
 struct lt9611uxc_reg_cfg {
 	u8 reg;
 	u8 val;
@@ -1070,7 +1068,7 @@ static int lt9611uxc_get_dt_supply(struct device *dev,
 			goto error;
 		}
 
-		strlcpy(pdata->vreg_config[i].vreg_name, st,
+		strscpy(pdata->vreg_config[i].vreg_name, st,
 				sizeof(pdata->vreg_config[i].vreg_name));
 
 		rc = of_property_read_u32(supply_node,
@@ -1395,6 +1393,8 @@ static int lt9611uxc_connector_get_modes(struct drm_connector *connector)
 	struct drm_display_mode *mode, *m;
 	unsigned int count = 0;
 	long ret = 0;
+	const struct drm_edid *drm_edid = NULL;
+	const struct edid *edid_raw = NULL;
 
 	mutex_lock(&pdata->lock);
 	if (pdata->pending_edid || pdata->edid_complete) {
@@ -1417,8 +1417,15 @@ static int lt9611uxc_connector_get_modes(struct drm_connector *connector)
 read_edid:
 	if (!pdata->edid) {
 		lt9611uxc_read_edid(pdata);
-		pdata->edid = drm_do_get_edid(connector,
+		drm_edid = drm_edid_read_custom(connector,
 				lt9611uxc_get_edid_block, pdata);
+		edid_raw = drm_edid_raw(drm_edid);
+		drm_edid_free(drm_edid);
+
+		if (edid_raw) {
+			pdata->edid = kmemdup(edid_raw, sizeof(struct edid), GFP_KERNEL);
+			kfree(edid_raw);
+		}
 	}
 
 skip_read_edid:
@@ -1570,8 +1577,7 @@ static int lt9611uxc_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_at
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
-			  MIPI_DSI_MODE_VIDEO_HSE | MIPI_DSI_MODE_VIDEO_BLLP |
-			  MIPI_DSI_MODE_VIDEO_EOF_BLLP;
+			  MIPI_DSI_MODE_VIDEO_HSE;
 
 	ret = mipi_dsi_attach(dsi);
 	if (ret < 0) {
@@ -1764,8 +1770,7 @@ static void lt9611uxc_sysfs_remove(struct device *dev)
 	sysfs_remove_group(&dev->kobj, &lt9611uxc_sysfs_attr_grp);
 }
 
-static int lt9611uxc_probe(struct i2c_client *client,
-	 const struct i2c_device_id *id)
+static int lt9611uxc_probe(struct i2c_client *client)
 {
 	struct lt9611uxc *pdata;
 	int ret = 0;
@@ -1780,7 +1785,7 @@ static int lt9611uxc_probe(struct i2c_client *client,
 		return -ENODEV;
 	}
 
-	pr_err("@lt9611 lt9611uxc_probe\n");
+	pr_err("@lt9611 %s...\n", __func__);
 
 	pdata = devm_kzalloc(&client->dev,
 		sizeof(struct lt9611uxc), GFP_KERNEL);
@@ -1882,14 +1887,13 @@ err_dt_parse:
 	return ret;
 }
 
-static int lt9611uxc_remove(struct i2c_client *client)
+static void lt9611uxc_remove(struct i2c_client *client)
 {
-	int ret = -EINVAL;
 	struct lt9611uxc *pdata = i2c_get_clientdata(client);
 	struct drm_display_mode *mode, *n;
 
 	if (!pdata)
-		goto end;
+		return;
 
 	mipi_dsi_detach(pdata->dsi);
 	mipi_dsi_device_unregister(pdata->dsi);
@@ -1901,7 +1905,7 @@ static int lt9611uxc_remove(struct i2c_client *client)
 	disable_irq(pdata->irq);
 	free_irq(pdata->irq, pdata);
 
-	ret = lt9611uxc_gpio_configure(pdata, false);
+	lt9611uxc_gpio_configure(pdata, false);
 
 	lt9611uxc_put_dt_supply(&client->dev, pdata);
 
@@ -1912,8 +1916,6 @@ static int lt9611uxc_remove(struct i2c_client *client)
 
 	if (pdata->wq)
 		destroy_workqueue(pdata->wq);
-end:
-	return ret;
 }
 
 
@@ -1930,7 +1932,7 @@ MODULE_DEVICE_TABLE(of, lt9611uxc_match_table);
 
 static struct i2c_driver lt9611uxc_driver = {
 	.driver = {
-		.name = "lt9611uxc",
+		.name = "lt-lt9611uxc",
 		.of_match_table = lt9611uxc_match_table,
 	},
 	.probe = lt9611uxc_probe,
@@ -1950,4 +1952,4 @@ static void __exit lt9611uxc_exit(void)
 
 module_init(lt9611uxc_init);
 module_exit(lt9611uxc_exit);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -70,6 +70,10 @@ int inv_sensors_timestamp_update_odr(struct inv_sensors_timestamp *ts,
 	if (mult != ts->mult)
 		ts->new_mult = mult;
 
+	/* When FIFO is off, directly apply the new ODR */
+	if (!fifo)
+		inv_sensors_timestamp_apply_odr(ts, 0, 0, 0);
+
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(inv_sensors_timestamp_update_odr, IIO_INV_SENSORS_TIMESTAMP);
@@ -87,8 +91,8 @@ static bool inv_validate_period(struct inv_sensors_timestamp *ts, uint32_t perio
 		return false;
 }
 
-static bool inv_compute_chip_period(struct inv_sensors_timestamp *ts,
-				    uint32_t period)
+static bool inv_update_chip_period(struct inv_sensors_timestamp *ts,
+				   uint32_t period)
 {
 	uint32_t new_chip_period;
 
@@ -98,8 +102,34 @@ static bool inv_compute_chip_period(struct inv_sensors_timestamp *ts,
 	/* update chip internal period estimation */
 	new_chip_period = period / ts->mult;
 	inv_update_acc(&ts->chip_period, new_chip_period);
+	ts->period = ts->mult * ts->chip_period.val;
 
 	return true;
+}
+
+static void inv_align_timestamp_it(struct inv_sensors_timestamp *ts)
+{
+	const int64_t period_min = ts->min_period * ts->mult;
+	const int64_t period_max = ts->max_period * ts->mult;
+	int64_t add_max, sub_max;
+	int64_t delta, jitter;
+	int64_t adjust;
+
+	/* delta time between last sample and last interrupt */
+	delta = ts->it.lo - ts->timestamp;
+
+	/* adjust timestamp while respecting jitter */
+	add_max = period_max - (int64_t)ts->period;
+	sub_max = period_min - (int64_t)ts->period;
+	jitter = INV_SENSORS_TIMESTAMP_JITTER((int64_t)ts->period, ts->chip.jitter);
+	if (delta > jitter)
+		adjust = add_max;
+	else if (delta < -jitter)
+		adjust = sub_max;
+	else
+		adjust = 0;
+
+	ts->timestamp += adjust;
 }
 
 void inv_sensors_timestamp_interrupt(struct inv_sensors_timestamp *ts,
@@ -108,7 +138,6 @@ void inv_sensors_timestamp_interrupt(struct inv_sensors_timestamp *ts,
 	struct inv_sensors_timestamp_interval *it;
 	int64_t delta, interval;
 	uint32_t period;
-	int32_t m;
 	bool valid = false;
 
 	if (sample_nb == 0)
@@ -122,10 +151,7 @@ void inv_sensors_timestamp_interrupt(struct inv_sensors_timestamp *ts,
 	if (it->lo != 0) {
 		/* compute period: delta time divided by number of samples */
 		period = div_s64(delta, sample_nb);
-		valid = inv_compute_chip_period(ts, period);
-		/* update sensor period if chip internal period is updated */
-		if (valid)
-			ts->period = ts->mult * ts->chip_period.val;
+		valid = inv_update_chip_period(ts, period);
 	}
 
 	/* no previous data, compute theoritical value from interrupt */
@@ -137,20 +163,8 @@ void inv_sensors_timestamp_interrupt(struct inv_sensors_timestamp *ts,
 	}
 
 	/* if interrupt interval is valid, sync with interrupt timestamp */
-	if (valid) {
-		/* delta time between last sample and last interrupt */
-		delta = it->lo - ts->timestamp;
-		/* if there are multiple samples, go back to first one */
-		while (delta >= (ts->period * 3 / 2))
-			delta -= ts->period;
-		/* compute maximal adjustment value */
-		m = INV_SENSORS_TIMESTAMP_JITTER((int64_t)ts->period, ts->chip.jitter);
-		if (delta > m)
-			delta = m;
-		else if (delta < -m)
-			delta = -m;
-		ts->timestamp += delta;
-	}
+	if (valid)
+		inv_align_timestamp_it(ts);
 }
 EXPORT_SYMBOL_NS_GPL(inv_sensors_timestamp_interrupt, IIO_INV_SENSORS_TIMESTAMP);
 

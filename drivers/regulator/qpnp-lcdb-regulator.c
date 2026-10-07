@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2016-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"LCDB: %s: " fmt, __func__
@@ -18,7 +18,6 @@
 #include <linux/regulator/driver.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/regulator/machine.h>
-#include <linux/qpnp/qpnp-revid.h>
 
 #define QPNP_LCDB_REGULATOR_DRIVER_NAME		"qcom,qpnp-lcdb-regulator"
 #define QPNP_LCDB_REGULATOR_DRIVER_660		"qcom,lcdb-pm660"
@@ -285,6 +284,7 @@ struct qpnp_lcdb {
 	u32				base;
 	u32				wa_flags;
 	int				sc_irq;
+	int				pwrdn_delay_ms;
 	int				pwrup_delay_ms;
 	int				min_voltage_mv;
 	int				max_voltage_mv;
@@ -292,8 +292,6 @@ struct qpnp_lcdb {
 	int				high_p2_blk_ns;
 	int				low_p2_blk_ns;
 	int				mpc_current_thr_ma;
-	int				pwrdn_delay_ms;
-
 	bool			ncp_symmetry;
 
 	/* TTW params */
@@ -501,8 +499,8 @@ static int qpnp_lcdb_write(struct qpnp_lcdb *lcdb,
 static int qpnp_lcdb_secure_write(struct qpnp_lcdb *lcdb,
 					u16 addr, u8 value)
 {
-	int rc;
 	u8 val = SECURE_UNLOCK_VALUE;
+	int rc;
 
 	mutex_lock(&lcdb->read_write_mutex);
 	if (lcdb->subtype == PM660L) {
@@ -539,8 +537,8 @@ static int qpnp_lcdb_masked_write(struct qpnp_lcdb *lcdb,
 
 static bool is_lcdb_enabled(struct qpnp_lcdb *lcdb)
 {
-	int rc;
 	u8 val = 0;
+	int rc;
 
 	rc = qpnp_lcdb_read(lcdb, lcdb->base + LCDB_ENABLE_CTL1_REG, &val, 1);
 	if (rc < 0)
@@ -626,8 +624,8 @@ static struct settings lcdb_settings_pm7325b[] = {
 
 static int qpnp_lcdb_save_settings(struct qpnp_lcdb *lcdb)
 {
-	int i, size, rc = 0;
 	struct settings *setting;
+	int i, size, rc = 0;
 
 	switch (lcdb->subtype) {
 	case PM660L:
@@ -662,8 +660,8 @@ static int qpnp_lcdb_save_settings(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_restore_settings(struct qpnp_lcdb *lcdb)
 {
-	int i, size, rc = 0;
 	struct settings *setting;
+	int i, size, rc = 0;
 
 	switch (lcdb->subtype) {
 	case PM660L:
@@ -994,8 +992,8 @@ static int qpnp_lcdb_ttw_exit(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_enable_wa(struct qpnp_lcdb *lcdb)
 {
-	int rc;
 	u8 val = 0;
+	int rc;
 
 	/* required only for PM660L */
 	if (lcdb->subtype != PM660L)
@@ -1025,8 +1023,8 @@ static int qpnp_lcdb_enable_wa(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_enable(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0, timeout, delay;
 	int voltage_mv = VOLTAGE_START_MV;
+	int rc = 0, timeout, delay;
 	u8 val = 0;
 
 	if (lcdb->lcdb_enabled || lcdb->lcdb_sc_disable) {
@@ -1190,8 +1188,8 @@ static int qpnp_lcdb_disable(struct qpnp_lcdb *lcdb)
 #define LCDB_SC_CNT_MAX			10
 static int qpnp_lcdb_handle_sc_event(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0;
 	s64 elapsed_time_us;
+	int rc = 0;
 
 	mutex_lock(&lcdb->lcdb_mutex);
 	rc = qpnp_lcdb_disable(lcdb);
@@ -1229,8 +1227,8 @@ unlock_mutex:
 static irqreturn_t qpnp_lcdb_sc_irq_handler(int irq, void *data)
 {
 	struct qpnp_lcdb *lcdb = data;
-	int rc;
 	u8 val, val2[2] = {0};
+	int rc;
 
 	mutex_lock(&lcdb->lcdb_mutex);
 	rc = qpnp_lcdb_read(lcdb, lcdb->base + INT_RT_STATUS_REG, &val, 1);
@@ -1319,12 +1317,12 @@ irq_handled:
 static int qpnp_lcdb_set_bst_voltage(struct qpnp_lcdb *lcdb,
 					int voltage_mv, u8 type)
 {
-	int rc = 0;
-	u8 val, voltage_step, mask = 0;
-	int bst_voltage_mv, min_bst_voltage;
 	struct ldo_regulator *ldo = &lcdb->ldo;
 	struct ncp_regulator *ncp = &lcdb->ncp;
+	int bst_voltage_mv, min_bst_voltage;
 	struct bst_params *bst = &lcdb->bst;
+	u8 val, voltage_step, mask = 0;
+	int rc = 0;
 
 	/* Vout_Boost = headroom_mv + max( Vout_LDO, abs (Vout_NCP)) */
 	bst_voltage_mv = max(voltage_mv, max(ldo->voltage_mv, ncp->voltage_mv));
@@ -1388,8 +1386,8 @@ static int qpnp_lcdb_set_bst_voltage(struct qpnp_lcdb *lcdb,
 static int qpnp_lcdb_get_bst_voltage(struct qpnp_lcdb *lcdb,
 					int *voltage_mv)
 {
-	int rc, min_bst_voltage;
 	u8 val, voltage_step, mask = 0;
+	int rc, min_bst_voltage;
 
 	rc = qpnp_lcdb_read(lcdb, lcdb->base + LCDB_BST_OUTPUT_VOLTAGE_REG,
 						&val, 1);
@@ -1424,11 +1422,11 @@ static int qpnp_lcdb_get_bst_voltage(struct qpnp_lcdb *lcdb,
 static int qpnp_lcdb_set_voltage(struct qpnp_lcdb *lcdb,
 					int voltage_mv, u8 type)
 {
-	int rc = 0;
-	u16 offset = LCDB_LDO_OUTPUT_VOLTAGE_REG;
-	u8 val = 0;
 	int voltage_mask = (lcdb->subtype == PM7325B) ?
 		PM7325B_SET_OUTPUT_VOLTAGE_MASK : SET_OUTPUT_VOLTAGE_MASK;
+	u16 offset = LCDB_LDO_OUTPUT_VOLTAGE_REG;
+	int rc = 0;
+	u8 val = 0;
 
 	if (!is_between(voltage_mv, lcdb->min_voltage_mv, lcdb->max_voltage_mv)) {
 		pr_err("Invalid voltage %dmv (min=%d max=%d)\n",
@@ -1520,11 +1518,11 @@ static int qpnp_lcdb_set_voltage_step(struct qpnp_lcdb *lcdb,
 static int qpnp_lcdb_get_voltage(struct qpnp_lcdb *lcdb,
 					u32 *voltage_mv, u8 type)
 {
-	int rc = 0;
-	u16 offset = LCDB_LDO_OUTPUT_VOLTAGE_REG;
-	u8 val = 0;
 	int voltage_mask = (lcdb->subtype == PM7325B) ?
 		PM7325B_SET_OUTPUT_VOLTAGE_MASK : SET_OUTPUT_VOLTAGE_MASK;
+	u16 offset = LCDB_LDO_OUTPUT_VOLTAGE_REG;
+	int rc = 0;
+	u8 val = 0;
 
 	if (type == BST)
 		return qpnp_lcdb_get_bst_voltage(lcdb, voltage_mv);
@@ -1560,8 +1558,8 @@ static int qpnp_lcdb_get_voltage(struct qpnp_lcdb *lcdb,
 static int qpnp_lcdb_set_soft_start(struct qpnp_lcdb *lcdb,
 					u32 ss_us, u8 type)
 {
-	int rc = 0, i = 0;
 	u16 offset = LCDB_LDO_SOFT_START_CTL_REG;
+	int rc = 0, i = 0;
 	u8 val = 0;
 
 	if (type == NCP)
@@ -1589,8 +1587,8 @@ static int qpnp_lcdb_set_soft_start(struct qpnp_lcdb *lcdb,
 
 static int qpnp_lcdb_ldo_regulator_enable(struct regulator_dev *rdev)
 {
-	int rc = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	int rc = 0;
 
 	mutex_lock(&lcdb->lcdb_mutex);
 	rc = qpnp_lcdb_enable(lcdb);
@@ -1603,8 +1601,8 @@ static int qpnp_lcdb_ldo_regulator_enable(struct regulator_dev *rdev)
 
 static int qpnp_lcdb_ldo_regulator_disable(struct regulator_dev *rdev)
 {
-	int rc = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	int rc = 0;
 
 	mutex_lock(&lcdb->lcdb_mutex);
 	rc = qpnp_lcdb_disable(lcdb);
@@ -1625,8 +1623,8 @@ static int qpnp_lcdb_ldo_regulator_is_enabled(struct regulator_dev *rdev)
 static int qpnp_lcdb_ldo_regulator_set_voltage(struct regulator_dev *rdev,
 				int min_uV, int max_uV, unsigned int *selector)
 {
-	int rc = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	int rc = 0;
 
 	lcdb->ldo.voltage_mv = min_uV / 1000;
 	if (lcdb->voltage_step_ramp)
@@ -1645,9 +1643,9 @@ static int qpnp_lcdb_ldo_regulator_set_voltage(struct regulator_dev *rdev,
 
 static int qpnp_lcdb_ldo_regulator_get_voltage(struct regulator_dev *rdev)
 {
-	int rc = 0;
-	u32 voltage_mv = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	u32 voltage_mv = 0;
+	int rc = 0;
 
 	rc = qpnp_lcdb_get_voltage(lcdb, &voltage_mv, LDO);
 	if (rc < 0) {
@@ -1658,7 +1656,7 @@ static int qpnp_lcdb_ldo_regulator_get_voltage(struct regulator_dev *rdev)
 	return voltage_mv * 1000;
 }
 
-static struct regulator_ops qpnp_lcdb_ldo_ops = {
+static const struct regulator_ops qpnp_lcdb_ldo_ops = {
 	.enable			= qpnp_lcdb_ldo_regulator_enable,
 	.disable		= qpnp_lcdb_ldo_regulator_disable,
 	.is_enabled		= qpnp_lcdb_ldo_regulator_is_enabled,
@@ -1668,8 +1666,8 @@ static struct regulator_ops qpnp_lcdb_ldo_ops = {
 
 static int qpnp_lcdb_ncp_regulator_enable(struct regulator_dev *rdev)
 {
-	int rc = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	int rc = 0;
 
 	mutex_lock(&lcdb->lcdb_mutex);
 	rc = qpnp_lcdb_enable(lcdb);
@@ -1682,8 +1680,8 @@ static int qpnp_lcdb_ncp_regulator_enable(struct regulator_dev *rdev)
 
 static int qpnp_lcdb_ncp_regulator_disable(struct regulator_dev *rdev)
 {
-	int rc = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	int rc = 0;
 
 	mutex_lock(&lcdb->lcdb_mutex);
 	rc = qpnp_lcdb_disable(lcdb);
@@ -1704,8 +1702,8 @@ static int qpnp_lcdb_ncp_regulator_is_enabled(struct regulator_dev *rdev)
 static int qpnp_lcdb_ncp_regulator_set_voltage(struct regulator_dev *rdev,
 				int min_uV, int max_uV, unsigned int *selector)
 {
-	int rc = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	int rc = 0;
 
 	lcdb->ncp.voltage_mv = min_uV / 1000;
 	if (lcdb->voltage_step_ramp)
@@ -1724,9 +1722,9 @@ static int qpnp_lcdb_ncp_regulator_set_voltage(struct regulator_dev *rdev,
 
 static int qpnp_lcdb_ncp_regulator_get_voltage(struct regulator_dev *rdev)
 {
-	int rc;
-	u32 voltage_mv = 0;
 	struct qpnp_lcdb *lcdb  = rdev_get_drvdata(rdev);
+	u32 voltage_mv = 0;
+	int rc;
 
 	rc = qpnp_lcdb_get_voltage(lcdb, &voltage_mv, NCP);
 	if (rc < 0) {
@@ -1737,7 +1735,7 @@ static int qpnp_lcdb_ncp_regulator_get_voltage(struct regulator_dev *rdev)
 	return voltage_mv * 1000;
 }
 
-static struct regulator_ops qpnp_lcdb_ncp_ops = {
+static const struct regulator_ops qpnp_lcdb_ncp_ops = {
 	.enable			= qpnp_lcdb_ncp_regulator_enable,
 	.disable		= qpnp_lcdb_ncp_regulator_disable,
 	.is_enabled		= qpnp_lcdb_ncp_regulator_is_enabled,
@@ -1821,10 +1819,10 @@ static int qpnp_lcdb_regulator_register(struct qpnp_lcdb *lcdb, u8 type)
 
 static int qpnp_lcdb_parse_ttw(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0;
-	u32 temp;
-	u8 val = 0;
 	struct device_node *node = lcdb->dev->of_node;
+	int rc = 0;
+	u8 val = 0;
+	u32 temp;
 
 	/* LCDB_AUTO_TOUCH_WAKE_CTL_REG is removed for PM7325B, but TTW is supported */
 	if (lcdb->subtype == PM7325B)
@@ -1871,10 +1869,10 @@ static int qpnp_lcdb_parse_ttw(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_ldo_dt_init(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0;
-	struct device_node *node = lcdb->ldo.node;
 	int ilim_min = (lcdb->subtype == PM7325B) ? PM7325B_MIN_LDO_ILIM_MA : MIN_LDO_ILIM_MA;
 	int ilim_max = (lcdb->subtype == PM7325B) ? PM7325B_MAX_LDO_ILIM_MA : MAX_LDO_ILIM_MA;
+	struct device_node *node = lcdb->ldo.node;
+	int rc = 0;
 
 	/* LDO output voltage */
 	lcdb->ldo.voltage_mv = -EINVAL;
@@ -1913,10 +1911,10 @@ static int qpnp_lcdb_ldo_dt_init(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_ncp_dt_init(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0;
-	struct device_node *node = lcdb->ncp.node;
 	int ilim_min = (lcdb->subtype == PM7325B) ? PM7325B_MIN_NCP_ILIM_MA : MIN_NCP_ILIM_MA;
 	int ilim_max = (lcdb->subtype == PM7325B) ? PM7325B_MAX_NCP_ILIM_MA : MAX_NCP_ILIM_MA;
+	struct device_node *node = lcdb->ncp.node;
+	int rc = 0;
 
 	/* NCP output voltage */
 	lcdb->ncp.voltage_mv = -EINVAL;
@@ -1955,11 +1953,11 @@ static int qpnp_lcdb_ncp_dt_init(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_bst_dt_init(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0;
-	struct device_node *node = lcdb->bst.node;
-	u16 default_headroom_mv;
 	int ilim_min = (lcdb->subtype == PM7325B) ? PM7325B_MIN_BST_ILIM_MA : MIN_BST_ILIM_MA;
 	int ilim_max = (lcdb->subtype == PM7325B) ? PM7325B_MAX_BST_ILIM_MA : MAX_BST_ILIM_MA;
+	struct device_node *node = lcdb->bst.node;
+	u16 default_headroom_mv;
+	int rc = 0;
 
 	/* Boost PD  configuration */
 	lcdb->bst.pd = -EINVAL;
@@ -2019,8 +2017,8 @@ static int qpnp_lcdb_bst_dt_init(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_init_ldo(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0, ilim_ma, i = 0;
 	u8 val = 0, pd_mask, pd_enable, ilim_ctl_reg, ilim_mask, ilim_sd_shift;
+	int rc = 0, ilim_ma, i = 0;
 
 	if (lcdb->subtype == PM7325B) {
 		pd_mask = (u8)PM7325B_LDO_EN_PULLDOWN_BIT;
@@ -2153,9 +2151,9 @@ static int qpnp_lcdb_init_ldo(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_init_ncp(struct qpnp_lcdb *lcdb)
 {
-	int rc = 0, i = 0;
-	const u32 *ncp_ilim, *dbc_ncp;
 	u8 val = 0, pd_enable, ilim_ctl_reg, ilim_mask, ilim_sd_shift;
+	const u32 *ncp_ilim, *dbc_ncp;
+	int rc = 0, i = 0;
 
 	if (lcdb->subtype == PM7325B) {
 		pd_enable = (u8)PM7325B_EN_NCP_PULLDOWN_BIT;
@@ -2277,9 +2275,9 @@ static int qpnp_lcdb_init_ncp(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_init_bst(struct qpnp_lcdb *lcdb)
 {
+	u8 val = 0, pd_mask, pd_enable, mask = 0, bst_ilim_en, bst_vreg_ok_reg;
 	int rc = 0, bst_ps_min, bst_ps_step;
 	const u32 *dbc_bst;
-	u8 val = 0, pd_mask, pd_enable, mask = 0, bst_ilim_en, bst_vreg_ok_reg;
 
 	if (lcdb->subtype == PM7325B) {
 		pd_mask = (u8)PM7325B_BOOST_EN_PULLDOWN_BIT;
@@ -2440,16 +2438,6 @@ static int qpnp_lcdb_hw_init(struct qpnp_lcdb *lcdb)
 			return rc;
 	}
 
-
-	if (lcdb->ncp_symmetry) {
-		rc = qpnp_lcdb_masked_write(lcdb, lcdb->base +
-					    LCDB_NCP_OUTPUT_VOLTAGE_REG,
-					    EN_NCP_VOUT_SYMMETRY_BIT,
-					    EN_NCP_VOUT_SYMMETRY_BIT);
-		if (rc < 0)
-			return rc;
-	}
-
 	if (lcdb->pwrup_delay_ms != -EINVAL) {
 		rc = qpnp_lcdb_masked_write(lcdb, lcdb->base +
 					    LCDB_PWRUP_PWRDN_CTL_REG,
@@ -2491,6 +2479,15 @@ static int qpnp_lcdb_hw_init(struct qpnp_lcdb *lcdb)
 					    PM7325B_LCDB_MPC_CTL_REG,
 					    MPC_NCP_SD_SEL_MASK,
 					    lcdb->mpc_current_thr_ma);
+		if (rc < 0)
+			return rc;
+	}
+
+	if (lcdb->ncp_symmetry) {
+		rc = qpnp_lcdb_masked_write(lcdb, lcdb->base +
+					    LCDB_NCP_OUTPUT_VOLTAGE_REG,
+					    EN_NCP_VOUT_SYMMETRY_BIT,
+					    EN_NCP_VOUT_SYMMETRY_BIT);
 		if (rc < 0)
 			return rc;
 	}
@@ -2604,10 +2601,10 @@ static int qpnp_lcdb_mpc_current(int val, int *cur)
 
 static int qpnp_lcdb_parse_dt(struct qpnp_lcdb *lcdb)
 {
+	struct device_node *temp, *node = lcdb->dev->of_node;
+	const char *label;
 	int rc = 0;
 	u32 tmp;
-	const char *label;
-	struct device_node *temp, *node = lcdb->dev->of_node;
 
 	for_each_available_child_of_node(node, temp) {
 		rc = of_property_read_string(temp, "label", &label);
@@ -2707,10 +2704,10 @@ static int qpnp_lcdb_parse_dt(struct qpnp_lcdb *lcdb)
 
 static int qpnp_lcdb_regulator_probe(struct platform_device *pdev)
 {
-	int rc;
+	const struct of_device_id *dev_id;
 	struct device_node *node;
 	struct qpnp_lcdb *lcdb;
-	const struct of_device_id *dev_id;
+	int rc;
 
 	node = pdev->dev.of_node;
 	if (!node) {
@@ -2764,14 +2761,12 @@ static int qpnp_lcdb_regulator_probe(struct platform_device *pdev)
 	return rc;
 }
 
-static int qpnp_lcdb_regulator_remove(struct platform_device *pdev)
+static void qpnp_lcdb_regulator_remove(struct platform_device *pdev)
 {
 	struct qpnp_lcdb *lcdb = dev_get_drvdata(&pdev->dev);
 
 	mutex_destroy(&lcdb->lcdb_mutex);
 	mutex_destroy(&lcdb->read_write_mutex);
-
-	return 0;
 }
 
 static const struct of_device_id lcdb_match_table[] = {
@@ -2810,4 +2805,4 @@ static void __exit qpnp_lcdb_regulator_exit(void)
 module_exit(qpnp_lcdb_regulator_exit);
 
 MODULE_DESCRIPTION("QPNP LCDB regulator driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

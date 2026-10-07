@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * usbusy2y.c - ALSA USB US-428 Driver
+ * usbusx2y.c - ALSA USB US-428 Driver
  *
 2005-04-14 Karsten Wiese
 	Version 0.8.7.2:
@@ -134,7 +134,6 @@
 MODULE_AUTHOR("Karsten Wiese <annabellesgarden@yahoo.de>");
 MODULE_DESCRIPTION("TASCAM "NAME_ALLCAPS" Version 0.8.7.2");
 MODULE_LICENSE("GPL");
-MODULE_SUPPORTED_DEVICE("{{TASCAM(0x1604),"NAME_ALLCAPS"(0x8001)(0x8005)(0x8007)}}");
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX; /* Index 0-max */
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR; /* Id for this card */
@@ -150,6 +149,7 @@ MODULE_PARM_DESC(enable, "Enable "NAME_ALLCAPS".");
 static int snd_usx2y_card_used[SNDRV_CARDS];
 
 static void snd_usx2y_card_private_free(struct snd_card *card);
+static void usx2y_unlinkseq(struct snd_usx2y_async_seq *s);
 
 #ifdef USX2Y_NRPACKS_VARIABLE
 int nrpacks = USX2Y_NRPACKS; /* number of packets per urb */
@@ -169,7 +169,7 @@ static void i_usx2y_out04_int(struct urb *urb)
 
 		for (i = 0; i < 10 && usx2y->as04.urb[i] != urb; i++)
 			;
-		snd_printdd("%s urb %i status=%i\n", __func__, i, urb->status);
+		dev_dbg(&urb->dev->dev, "%s urb %i status=%i\n", __func__, i, urb->status);
 	}
 #endif
 }
@@ -185,11 +185,10 @@ static void i_usx2y_in04_int(struct urb *urb)
 	usx2y->in04_int_calls++;
 
 	if (urb->status) {
-		snd_printdd("Interrupt Pipe 4 came back with status=%i\n", urb->status);
+		dev_dbg(&urb->dev->dev, "Interrupt Pipe 4 came back with status=%i\n", urb->status);
 		return;
 	}
 
-	//	printk("%i:0x%02X ", 8, (int)((unsigned char*)usx2y->in04_buf)[8]); Master volume shows 0 here if fader is at max during boot ?!?
 	if (us428ctls) {
 		diff = -1;
 		if (us428ctls->ctl_snapshot_last == -2) {
@@ -245,7 +244,7 @@ static void i_usx2y_in04_int(struct urb *urb)
 	}
 
 	if (err)
-		snd_printk(KERN_ERR "in04_int() usb_submit_urb err=%i\n", err);
+		dev_err(&urb->dev->dev, "in04_int() usb_submit_urb err=%i\n", err);
 
 	urb->dev = usx2y->dev;
 	usb_submit_urb(urb, GFP_ATOMIC);
@@ -257,6 +256,9 @@ static void i_usx2y_in04_int(struct urb *urb)
 int usx2y_async_seq04_init(struct usx2ydev *usx2y)
 {
 	int	err = 0, i;
+
+	if (WARN_ON(usx2y->as04.buffer))
+		return -EBUSY;
 
 	usx2y->as04.buffer = kmalloc_array(URBS_ASYNC_SEQ,
 					   URB_DATA_LEN_ASYNC_SEQ, GFP_KERNEL);
@@ -278,27 +280,47 @@ int usx2y_async_seq04_init(struct usx2ydev *usx2y)
 				break;
 		}
 	}
+	if (err)
+		usx2y_unlinkseq(&usx2y->as04);
 	return err;
 }
 
 int usx2y_in04_init(struct usx2ydev *usx2y)
 {
+	int err;
+
+	if (WARN_ON(usx2y->in04_urb))
+		return -EBUSY;
+
 	usx2y->in04_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!usx2y->in04_urb)
-		return -ENOMEM;
+	if (!usx2y->in04_urb) {
+		err = -ENOMEM;
+		goto error;
+	}
 
 	usx2y->in04_buf = kmalloc(21, GFP_KERNEL);
-	if (!usx2y->in04_buf)
-		return -ENOMEM;
+	if (!usx2y->in04_buf) {
+		err = -ENOMEM;
+		goto error;
+	}
 
 	init_waitqueue_head(&usx2y->in04_wait_queue);
 	usb_fill_int_urb(usx2y->in04_urb, usx2y->dev, usb_rcvintpipe(usx2y->dev, 0x4),
 			 usx2y->in04_buf, 21,
 			 i_usx2y_in04_int, usx2y,
 			 10);
-	if (usb_urb_ep_type_check(usx2y->in04_urb))
-		return -EINVAL;
+	if (usb_urb_ep_type_check(usx2y->in04_urb)) {
+		err = -EINVAL;
+		goto error;
+	}
 	return usb_submit_urb(usx2y->in04_urb, GFP_KERNEL);
+
+ error:
+	kfree(usx2y->in04_buf);
+	usb_free_urb(usx2y->in04_urb);
+	usx2y->in04_buf = NULL;
+	usx2y->in04_urb = NULL;
+	return err;
 }
 
 static void usx2y_unlinkseq(struct snd_usx2y_async_seq *s)
@@ -306,11 +328,14 @@ static void usx2y_unlinkseq(struct snd_usx2y_async_seq *s)
 	int	i;
 
 	for (i = 0; i < URBS_ASYNC_SEQ; ++i) {
+		if (!s->urb[i])
+			continue;
 		usb_kill_urb(s->urb[i]);
 		usb_free_urb(s->urb[i]);
 		s->urb[i] = NULL;
 	}
 	kfree(s->buffer);
+	s->buffer = NULL;
 }
 
 static const struct usb_device_id snd_usx2y_usb_id_table[] = {
@@ -354,6 +379,7 @@ static int usx2y_create_card(struct usb_device *device,
 	card->private_free = snd_usx2y_card_private_free;
 	usx2y(card)->dev = device;
 	init_waitqueue_head(&usx2y(card)->prepare_wait_queue);
+	init_waitqueue_head(&usx2y(card)->us428ctls_wait_queue_head);
 	mutex_init(&usx2y(card)->pcm_mutex);
 	INIT_LIST_HEAD(&usx2y(card)->midi_list);
 	strcpy(card->driver, "USB "NAME_ALLCAPS"");

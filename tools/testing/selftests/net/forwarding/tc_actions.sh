@@ -3,7 +3,9 @@
 
 ALL_TESTS="gact_drop_and_ok_test mirred_egress_redirect_test \
 	mirred_egress_mirror_test matchall_mirred_egress_mirror_test \
-	gact_trap_test mirred_egress_to_ingress_tcp_test"
+	gact_trap_test mirred_egress_to_ingress_test \
+	mirred_egress_to_ingress_tcp_test \
+	ingress_2nd_vlan_push egress_2nd_vlan_push"
 NUM_NETIFS=4
 source tc_common.sh
 source lib.sh
@@ -15,10 +17,12 @@ tcflags="skip_hw"
 h1_create()
 {
 	simple_if_init $h1 192.0.2.1/24
+	tc qdisc add dev $h1 clsact
 }
 
 h1_destroy()
 {
+	tc qdisc del dev $h1 clsact
 	simple_if_fini $h1 192.0.2.1/24
 }
 
@@ -60,7 +64,7 @@ mirred_egress_test()
 	RET=0
 
 	tc filter add dev $h2 ingress protocol ip pref 1 handle 101 flower \
-		$tcflags dst_ip 192.0.2.2 action drop
+		dst_ip 192.0.2.2 action drop
 
 	$MZ $h1 -c 1 -p 64 -a $h1mac -b $h2mac -A 192.0.2.1 -B 192.0.2.2 \
 		-t ip -q
@@ -155,6 +159,49 @@ gact_trap_test()
 	log_test "trap ($tcflags)"
 }
 
+mirred_egress_to_ingress_test()
+{
+	RET=0
+
+	tc filter add dev $h1 protocol ip pref 100 handle 100 egress flower \
+		ip_proto icmp src_ip 192.0.2.1 dst_ip 192.0.2.2 type 8 action \
+			ct commit nat src addr 192.0.2.2 pipe \
+			ct clear pipe \
+			ct commit nat dst addr 192.0.2.1 pipe \
+			mirred ingress redirect dev $h1
+
+	tc filter add dev $swp1 protocol ip pref 11 handle 111 ingress flower \
+		ip_proto icmp src_ip 192.0.2.1 dst_ip 192.0.2.2 type 8 action drop
+	tc filter add dev $swp1 protocol ip pref 12 handle 112 ingress flower \
+		ip_proto icmp src_ip 192.0.2.1 dst_ip 192.0.2.2 type 0 action pass
+
+	$MZ $h1 -c 1 -p 64 -a $h1mac -b $h2mac -A 192.0.2.1 -B 192.0.2.2 \
+		-t icmp "ping,id=42,seq=10" -q
+
+	tc_check_packets "dev $h1 egress" 100 1
+	check_err $? "didn't mirror first packet"
+
+	tc_check_packets "dev $swp1 ingress" 111 1
+	check_fail $? "didn't redirect first packet"
+	tc_check_packets "dev $swp1 ingress" 112 1
+	check_err $? "didn't receive reply to first packet"
+
+	ping 192.0.2.2 -I$h1 -c1 -w1 -q 1>/dev/null 2>&1
+
+	tc_check_packets "dev $h1 egress" 100 2
+	check_err $? "didn't mirror second packet"
+	tc_check_packets "dev $swp1 ingress" 111 1
+	check_fail $? "didn't redirect second packet"
+	tc_check_packets "dev $swp1 ingress" 112 2
+	check_err $? "didn't receive reply to second packet"
+
+	tc filter del dev $h1 egress protocol ip pref 100 handle 100 flower
+	tc filter del dev $swp1 ingress protocol ip pref 11 handle 111 flower
+	tc filter del dev $swp1 ingress protocol ip pref 12 handle 112 flower
+
+	log_test "mirred_egress_to_ingress ($tcflags)"
+}
+
 mirred_egress_to_ingress_tcp_test()
 {
 	mirred_e2i_tf1=$(mktemp) mirred_e2i_tf2=$(mktemp)
@@ -189,9 +236,6 @@ mirred_egress_to_ingress_tcp_test()
 	check_err $? "didn't mirred redirect ICMP"
 	tc_check_packets "dev $h1 ingress" 102 10
 	check_err $? "didn't drop mirred ICMP"
-	local overlimits=$(tc_rule_stats_get ${h1} 101 egress .overlimits)
-	test ${overlimits} = 10
-	check_err $? "wrong overlimits, expected 10 got ${overlimits}"
 
 	tc filter del dev $h1 egress protocol ip pref 100 handle 100 flower
 	tc filter del dev $h1 egress protocol ip pref 101 handle 101 flower
@@ -199,6 +243,49 @@ mirred_egress_to_ingress_tcp_test()
 
 	rm -f $mirred_e2i_tf1 $mirred_e2i_tf2
 	log_test "mirred_egress_to_ingress_tcp ($tcflags)"
+}
+
+ingress_2nd_vlan_push()
+{
+	tc filter add dev $swp1 ingress pref 20 chain 0 handle 20 flower \
+		$tcflags num_of_vlans 1 \
+		action vlan push id 100 protocol 0x8100 action goto chain 5
+	tc filter add dev $swp1 ingress pref 30 chain 5 handle 30 flower \
+		$tcflags num_of_vlans 2 \
+		cvlan_ethtype 0x800 action pass
+
+	$MZ $h1 -c 1 -p 64 -a $h1mac -b $h2mac -A 192.0.2.1 -B 192.0.2.2 \
+		-t ip -Q 10 -q
+
+	tc_check_packets "dev $swp1 ingress" 30 1
+	check_err $? "No double-vlan packets received"
+
+	tc filter del dev $swp1 ingress pref 20 chain 0 handle 20 flower
+	tc filter del dev $swp1 ingress pref 30 chain 5 handle 30 flower
+
+	log_test "ingress_2nd_vlan_push ($tcflags)"
+}
+
+egress_2nd_vlan_push()
+{
+	tc filter add dev $h1 egress pref 20 chain 0 handle 20 flower \
+		$tcflags num_of_vlans 0 \
+		action vlan push id 10 protocol 0x8100 \
+		pipe action vlan push id 100 protocol 0x8100 action goto chain 5
+	tc filter add dev $h1 egress pref 30 chain 5 handle 30 flower \
+		$tcflags num_of_vlans 2 \
+		cvlan_ethtype 0x800 action pass
+
+	$MZ $h1 -c 1 -p 64 -a $h1mac -b $h2mac -A 192.0.2.1 -B 192.0.2.2 \
+		-t ip -q
+
+	tc_check_packets "dev $h1 egress" 30 1
+	check_err $? "No double-vlan packets received"
+
+	tc filter del dev $h1 egress pref 20 chain 0 handle 20 flower
+	tc filter del dev $h1 egress pref 30 chain 5 handle 30 flower
+
+	log_test "egress_2nd_vlan_push ($tcflags)"
 }
 
 setup_prepare()

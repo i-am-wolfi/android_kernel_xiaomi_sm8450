@@ -1,53 +1,139 @@
 # SPDX-License-Identifier: GPL-2.0
 
-icc-bcm-voter-objs			:= bcm-voter.o
-qnoc-msm8916-objs			:= msm8916.o
-qnoc-msm8974-objs			:= msm8974.o
-icc-osm-l3-objs				:= osm-l3.o
-qnoc-holi-objs			:= holi.o
-qnoc-qcs404-objs			:= qcs404.o
-icc-rpmh-obj				:= icc-rpmh.o
-qnoc-sc7180-objs			:= sc7180.o
-qnoc-sdm845-objs			:= sdm845.o
-qnoc-sm8150-objs			:= sm8150.o
-qnoc-sm8250-objs			:= sm8250.o
-qnoc-waipio-objs			:= waipio.o
-qnoc-anorak-objs			:= anorak.o
-qnoc-diwali-objs			:= diwali.o
-qnoc-lahaina-objs			:= lahaina.o
-qnoc-neo-objs			:= neo.o
-qnoc-parrot-objs			:= parrot.o
-qnoc-ravelin-objs			:= ravelin.o
-qnoc-sdxlemur-objs			:= sdxlemur.o
-qnoc-shima-objs				:= shima.o
-icc-smd-rpm-objs			:= smd-rpm.o
-icc-rpm-obj			:= icc-rpm.o
-qnoc-qos-obj			:= qnoc-qos.o
+ccflags-y += -I$(src)
 
 obj-$(CONFIG_INTERCONNECT_QCOM_BCM_VOTER) += icc-bcm-voter.o
-obj-$(CONFIG_INTERCONNECT_QCOM_MSM8916) += qnoc-msm8916.o
-obj-$(CONFIG_INTERCONNECT_QCOM_MSM8974) += qnoc-msm8974.o
-obj-$(CONFIG_INTERCONNECT_QCOM_OSM_L3) += icc-osm-l3.o
-obj-$(CONFIG_INTERCONNECT_QCOM_HOLI) += qnoc-holi.o
-obj-$(CONFIG_INTERCONNECT_QCOM_QCS404) += qnoc-qcs404.o
+icc-bcm-voter-objs += bcm-voter.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_DEBUG) += icc-debug.o
+
 obj-$(CONFIG_INTERCONNECT_QCOM_RPMH) += icc-rpmh.o
-obj-$(CONFIG_INTERCONNECT_QCOM_SC7180) += qnoc-sc7180.o
-obj-$(CONFIG_INTERCONNECT_QCOM_SDM845) += qnoc-sdm845.o
-obj-$(CONFIG_INTERCONNECT_QCOM_ANORAK) += qnoc-anorak.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_RPM) += icc-rpm.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_SHIKRA) += qnoc-shikra.o
+qnoc-shikra-objs += shikra.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_CANOE) += qnoc-canoe.o
+qnoc-canoe-objs += canoe.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_CHORA) += qnoc-chora.o
+qnoc-chora-objs += chora.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_X1P42100) += qnoc-x1p42100.o
+qnoc-x1p42100-objs += x1p42100.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_X1E80100) += qnoc-x1e80100.o
+qnoc-x1e80100-objs += x1e80100.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_MALABAR) += qnoc-malabar.o
+qnoc-malabar-objs += malabar.o
+
 obj-$(CONFIG_INTERCONNECT_QCOM_LAHAINA) += qnoc-lahaina.o
-obj-$(CONFIG_INTERCONNECT_QCOM_NEO) += qnoc-neo.o
-obj-$(CONFIG_INTERCONNECT_QCOM_PARROT) += qnoc-parrot.o
+qnoc-lahaina-objs += lahaina.o
+
 obj-$(CONFIG_INTERCONNECT_QCOM_RAVELIN) += qnoc-ravelin.o
-obj-$(CONFIG_INTERCONNECT_QCOM_WAIPIO) += qnoc-waipio.o
-obj-$(CONFIG_INTERCONNECT_QCOM_DIWALI) += qnoc-diwali.o
+qnoc-ravelin-objs += ravelin.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_YUPIK) += qnoc-yupik.o
+qnoc-yupik-objs += yupik.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_QOS) += qnoc-qos.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_QOS_RPM) += qnoc-qos-rpm.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_BENGAL) += qnoc-bengal.o
+qnoc-bengal-objs += bengal.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_SCUBA) += qnoc-scuba.o
+qnoc-scuba-objs += scuba.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_MONACO) += qnoc-monaco.o
+qnoc-monaco-objs += monaco.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_SUN) += qnoc-sun.o
+qnoc-sun-objs += sun.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_VIENNA) += qnoc-vienna.o
+qnoc-vienna-objs += vienna.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_ALOR) += qnoc-alor.o
+qnoc-alor-objs += alor.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_SERAPH) += qnoc-seraph.o
+qnoc-seraph-objs += seraph.o
+
+obj-$(CONFIG_INTERCONNECT_QCOM_PIKACHU) += qnoc-pikachu.o
+qnoc-pikachu-objs += pikachu.o
+
+
+# --- marble: objs upstream restaurados ---
+obj-$(CONFIG_INTERCONNECT_QCOM) += interconnect_qcom.o
+interconnect_qcom-y			:= icc-common.o
+qnoc-msm8909-objs			:= msm8909.o
+qnoc-msm8916-objs			:= msm8916.o
+qnoc-msm8937-objs			:= msm8937.o
+qnoc-msm8939-objs			:= msm8939.o
+qnoc-msm8953-objs			:= msm8953.o
+qnoc-msm8974-objs			:= msm8974.o
+qnoc-msm8976-objs			:= msm8976.o
+qnoc-msm8996-objs			:= msm8996.o
+icc-osm-l3-objs				:= osm-l3.o
+qnoc-qcm2290-objs			:= qcm2290.o
+qnoc-qcs404-objs			:= qcs404.o
+qnoc-qdu1000-objs			:= qdu1000.o
+icc-rpmh-obj				:= icc-rpmh.o
+qnoc-sa8775p-objs			:= sa8775p.o
+qnoc-sc7180-objs			:= sc7180.o
+qnoc-sc7280-objs                        := sc7280.o
+qnoc-sc8180x-objs			:= sc8180x.o
+qnoc-sc8280xp-objs			:= sc8280xp.o
+qnoc-sdm660-objs			:= sdm660.o
+qnoc-sdm670-objs			:= sdm670.o
+qnoc-sdm845-objs			:= sdm845.o
+qnoc-sdx55-objs				:= sdx55.o
+qnoc-sdx65-objs				:= sdx65.o
+qnoc-sdx75-objs				:= sdx75.o
+qnoc-sm6115-objs			:= sm6115.o
+qnoc-sm6350-objs			:= sm6350.o
+qnoc-sm7150-objs			:= sm7150.o
+qnoc-sm8150-objs			:= sm8150.o
+qnoc-sm8250-objs			:= sm8250.o
+qnoc-sm8350-objs			:= sm8350.o
+qnoc-sm8450-objs			:= sm8450.o
+qnoc-sm8550-objs			:= sm8550.o
+qnoc-sm8650-objs			:= sm8650.o
+icc-smd-rpm-objs			:= smd-rpm.o icc-rpm.o icc-rpm-clocks.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8909) += qnoc-msm8909.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8916) += qnoc-msm8916.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8937) += qnoc-msm8937.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8939) += qnoc-msm8939.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8953) += qnoc-msm8953.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8974) += qnoc-msm8974.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8976) += qnoc-msm8976.o
+obj-$(CONFIG_INTERCONNECT_QCOM_MSM8996) += qnoc-msm8996.o
+obj-$(CONFIG_INTERCONNECT_QCOM_OSM_L3) += icc-osm-l3.o
+obj-$(CONFIG_INTERCONNECT_QCOM_QCM2290) += qnoc-qcm2290.o
+obj-$(CONFIG_INTERCONNECT_QCOM_QCS404) += qnoc-qcs404.o
+obj-$(CONFIG_INTERCONNECT_QCOM_QDU1000) += qnoc-qdu1000.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SA8775P) += qnoc-sa8775p.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SC7180) += qnoc-sc7180.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SC7280) += qnoc-sc7280.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SC8180X) += qnoc-sc8180x.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SC8280XP) += qnoc-sc8280xp.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SDM660) += qnoc-sdm660.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SDM670) += qnoc-sdm670.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SDM845) += qnoc-sdm845.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SDX55) += qnoc-sdx55.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SDX65) += qnoc-sdx65.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SDX75) += qnoc-sdx75.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SM6115) += qnoc-sm6115.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SM6350) += qnoc-sm6350.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SM7150) += qnoc-sm7150.o
 obj-$(CONFIG_INTERCONNECT_QCOM_SM8150) += qnoc-sm8150.o
 obj-$(CONFIG_INTERCONNECT_QCOM_SM8250) += qnoc-sm8250.o
-obj-$(CONFIG_INTERCONNECT_QCOM_SHIMA) += qnoc-shima.o
-obj-$(CONFIG_INTERCONNECT_QCOM_SDXLEMUR) += qnoc-sdxlemur.o
-obj-$(CONFIG_INTERCONNECT_QCOM_RPM) += icc-rpm.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SM8350) += qnoc-sm8350.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SM8450) += qnoc-sm8450.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SM8550) += qnoc-sm8550.o
+obj-$(CONFIG_INTERCONNECT_QCOM_SM8650) += qnoc-sm8650.o
 obj-$(CONFIG_INTERCONNECT_QCOM_SMD_RPM) += icc-smd-rpm.o
-obj-$(CONFIG_INTERCONNECT_QCOM_RPMH) += icc-rpmh.o
-obj-$(CONFIG_INTERCONNECT_QCOM_QOS) += qnoc-qos.o
-obj-$(CONFIG_INTERCONNECT_QCOM_EPSS_L3) += epss-l3.o
-obj-$(CONFIG_INTERCONNECT_QCOM_CPUCP_L3) += cpucp-l3.o
-obj-$(CONFIG_INTERCONNECT_QCOM_DEBUG) += icc-debug.o

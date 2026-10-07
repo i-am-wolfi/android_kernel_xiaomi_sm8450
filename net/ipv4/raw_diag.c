@@ -34,7 +34,7 @@ raw_get_hashinfo(const struct inet_diag_req_v2 *r)
  * use helper to figure it out.
  */
 
-static bool raw_lookup(struct net *net, struct sock *sk,
+static bool raw_lookup(struct net *net, const struct sock *sk,
 		       const struct inet_diag_req_v2 *req)
 {
 	struct inet_diag_req_raw *r = (void *)req;
@@ -57,31 +57,31 @@ static bool raw_lookup(struct net *net, struct sock *sk,
 static struct sock *raw_sock_get(struct net *net, const struct inet_diag_req_v2 *r)
 {
 	struct raw_hashinfo *hashinfo = raw_get_hashinfo(r);
+	struct hlist_head *hlist;
 	struct sock *sk;
 	int slot;
 
 	if (IS_ERR(hashinfo))
 		return ERR_CAST(hashinfo);
 
-	read_lock(&hashinfo->lock);
+	rcu_read_lock();
 	for (slot = 0; slot < RAW_HTABLE_SIZE; slot++) {
-		sk_for_each(sk, &hashinfo->ht[slot]) {
+		hlist = &hashinfo->ht[slot];
+		sk_for_each_rcu(sk, hlist) {
 			if (raw_lookup(net, sk, r)) {
 				/*
 				 * Grab it and keep until we fill
-				 * diag meaage to be reported, so
+				 * diag message to be reported, so
 				 * caller should call sock_put then.
-				 * We can do that because we're keeping
-				 * hashinfo->lock here.
 				 */
-				sock_hold(sk);
-				goto out_unlock;
+				if (refcount_inc_not_zero(&sk->sk_refcnt))
+					goto out_unlock;
 			}
 		}
 	}
 	sk = ERR_PTR(-ENOENT);
 out_unlock:
-	read_unlock(&hashinfo->lock);
+	rcu_read_unlock();
 
 	return sk;
 }
@@ -142,6 +142,7 @@ static void raw_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
 	struct net *net = sock_net(skb->sk);
 	struct inet_diag_dump_data *cb_data;
 	int num, s_num, slot, s_slot;
+	struct hlist_head *hlist;
 	struct sock *sk = NULL;
 	struct nlattr *bc;
 
@@ -153,11 +154,12 @@ static void raw_diag_dump(struct sk_buff *skb, struct netlink_callback *cb,
 	s_slot = cb->args[0];
 	num = s_num = cb->args[1];
 
-	read_lock(&hashinfo->lock);
+	rcu_read_lock();
 	for (slot = s_slot; slot < RAW_HTABLE_SIZE; s_num = 0, slot++) {
 		num = 0;
 
-		sk_for_each(sk, &hashinfo->ht[slot]) {
+		hlist = &hashinfo->ht[slot];
+		sk_for_each_rcu(sk, hlist) {
 			struct inet_sock *inet = inet_sk(sk);
 
 			if (!net_eq(sock_net(sk), net))
@@ -180,7 +182,7 @@ next:
 	}
 
 out_unlock:
-	read_unlock(&hashinfo->lock);
+	rcu_read_unlock();
 
 	cb->args[0] = slot;
 	cb->args[1] = num;
@@ -211,6 +213,7 @@ static int raw_diag_destroy(struct sk_buff *in_skb,
 #endif
 
 static const struct inet_diag_handler raw_diag_handler = {
+	.owner			= THIS_MODULE,
 	.dump			= raw_diag_dump,
 	.dump_one		= raw_diag_dump_one,
 	.idiag_get_info		= raw_diag_get_info,
@@ -255,5 +258,6 @@ static void __exit raw_diag_exit(void)
 module_init(raw_diag_init);
 module_exit(raw_diag_exit);
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("RAW socket monitoring via SOCK_DIAG");
 MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_NETLINK, NETLINK_SOCK_DIAG, 2-255 /* AF_INET - IPPROTO_RAW */);
 MODULE_ALIAS_NET_PF_PROTO_TYPE(PF_NETLINK, NETLINK_SOCK_DIAG, 10-255 /* AF_INET6 - IPPROTO_RAW */);

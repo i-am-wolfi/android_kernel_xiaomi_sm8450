@@ -19,9 +19,9 @@
 #include <linux/log2.h>
 #include <linux/kthread.h>
 #include <linux/regmap.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/util_macros.h>
-#include <linux/sched.h>
 
 /* Addresses to scan */
 static const unsigned short normal_i2c[] = { 0x2C, 0x2E, 0x2F, I2C_CLIENT_END };
@@ -70,8 +70,8 @@ static const unsigned short normal_i2c[] = { 0x2C, 0x2E, 0x2F, I2C_CLIENT_END };
 #define		ADT7470_PWM1_AUTO_MASK		0x80
 #define		ADT7470_PWM_AUTO_MASK		0xC0
 #define ADT7470_REG_PWM34_CFG			0x69
-#define		ADT7470_PWM4_AUTO_MASK		0x40
-#define		ADT7470_PWM3_AUTO_MASK		0x80
+#define		ADT7470_PWM3_AUTO_MASK		0x40
+#define		ADT7470_PWM4_AUTO_MASK		0x80
 #define	ADT7470_REG_PWM_MIN_BASE_ADDR		0x6A
 #define ADT7470_REG_PWM_MIN_MAX_ADDR		0x6D
 #define ADT7470_REG_PWM_TEMP_MIN_BASE_ADDR	0x6E
@@ -205,12 +205,11 @@ static inline int adt7470_write_word_data(struct adt7470_data *data, unsigned in
 /* Probe for temperature sensors.  Assumes lock is held */
 static int adt7470_read_temperatures(struct adt7470_data *data)
 {
-	struct device *dev = regmap_get_device(data->regmap);
-	u8 pwm[ADT7470_FAN_COUNT];
-	unsigned int pwm_cfg[2];
 	unsigned long res;
-	int err, err2;
+	unsigned int pwm_cfg[2];
+	int err;
 	int i;
+	u8 pwm[ADT7470_FAN_COUNT];
 
 	/* save pwm[1-4] config register */
 	err = regmap_read(data->regmap, ADT7470_REG_PWM_CFG(0), &pwm_cfg[0]);
@@ -234,19 +233,19 @@ static int adt7470_read_temperatures(struct adt7470_data *data)
 	err = regmap_update_bits(data->regmap, ADT7470_REG_PWM_CFG(2),
 				 ADT7470_PWM_AUTO_MASK, 0);
 	if (err < 0)
-		goto out_restore;
+		return err;
 
 	/* write pwm control to whatever it was */
 	err = regmap_bulk_write(data->regmap, ADT7470_REG_PWM(0), &pwm[0],
 				ADT7470_PWM_COUNT);
 	if (err < 0)
-		goto out_restore;
+		return err;
 
 	/* start reading temperature sensors */
 	err = regmap_update_bits(data->regmap, ADT7470_REG_CFG,
 				 ADT7470_T05_STB_MASK, ADT7470_T05_STB_MASK);
 	if (err < 0)
-		goto out_restore;
+		return err;
 
 	/* Delay is 200ms * number of temp sensors. */
 	res = msleep_interruptible((data->num_temp_sensors >= 0 ?
@@ -257,30 +256,13 @@ static int adt7470_read_temperatures(struct adt7470_data *data)
 	err = regmap_update_bits(data->regmap, ADT7470_REG_CFG,
 				 ADT7470_T05_STB_MASK, 0);
 	if (err < 0)
-		goto out_restore;
+		return err;
 
-out_restore:
 	/* restore pwm[1-4] config registers */
-	err2 = regmap_write(data->regmap, ADT7470_REG_PWM_CFG(0), pwm_cfg[0]);
-	if (err2 < 0) {
-		dev_warn_ratelimited(dev,
-				     "failed to restore PWM{1,2} config (%d)\n",
-				     err2);
-
-		if (!err)
-			err = err2;
-	}
-
-	err2 = regmap_write(data->regmap, ADT7470_REG_PWM_CFG(2), pwm_cfg[1]);
-	if (err2 < 0) {
-		dev_warn_ratelimited(dev,
-				     "failed to restore PWM{3,4} config (%d)\n",
-				     err2);
-
-		if (!err)
-			err = err2;
-	}
-
+	err = regmap_write(data->regmap, ADT7470_REG_PWM_CFG(0), pwm_cfg[0]);
+	if (err < 0)
+		return err;
+	err = regmap_write(data->regmap, ADT7470_REG_PWM_CFG(2), pwm_cfg[1]);
 	if (err < 0)
 		return err;
 
@@ -509,7 +491,7 @@ static ssize_t auto_update_interval_store(struct device *dev,
 	if (kstrtol(buf, 10, &temp))
 		return -EINVAL;
 
-	temp = clamp_val(temp, 500, 60000);
+	temp = clamp_val(temp, 0, 60000);
 
 	mutex_lock(&data->lock);
 	data->auto_update_interval = temp;
@@ -551,92 +533,63 @@ static ssize_t num_temp_sensors_store(struct device *dev,
 	return count;
 }
 
-static ssize_t temp_min_show(struct device *dev,
-			     struct device_attribute *devattr, char *buf)
+static int adt7470_temp_read(struct device *dev, u32 attr, int channel, long *val)
 {
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct adt7470_data *data = adt7470_update_device(dev);
 
 	if (IS_ERR(data))
 		return PTR_ERR(data);
 
-	return sprintf(buf, "%d\n", 1000 * data->temp_min[attr->index]);
+	switch (attr) {
+	case hwmon_temp_input:
+		*val = 1000 * data->temp[channel];
+		break;
+	case hwmon_temp_min:
+		*val = 1000 * data->temp_min[channel];
+		break;
+	case hwmon_temp_max:
+		*val = 1000 * data->temp_max[channel];
+		break;
+	case hwmon_temp_alarm:
+		*val = !!(data->alarm & channel);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
 }
 
-static ssize_t temp_min_store(struct device *dev,
-			      struct device_attribute *devattr,
-			      const char *buf, size_t count)
+static int adt7470_temp_write(struct device *dev, u32 attr, int channel, long val)
 {
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct adt7470_data *data = dev_get_drvdata(dev);
-	long temp;
 	int err;
 
-	if (kstrtol(buf, 10, &temp))
-		return -EINVAL;
+	val = clamp_val(val, -128000, 127000);
+	val = DIV_ROUND_CLOSEST(val, 1000);
 
-	temp = clamp_val(temp, -128000, 127000);
-	temp = DIV_ROUND_CLOSEST(temp, 1000);
+	switch (attr) {
+	case hwmon_temp_min:
+		mutex_lock(&data->lock);
+		data->temp_min[channel] = val;
+		err = regmap_write(data->regmap, ADT7470_TEMP_MIN_REG(channel), val);
+		mutex_unlock(&data->lock);
+		break;
+	case hwmon_temp_max:
+		mutex_lock(&data->lock);
+		data->temp_max[channel] = val;
+		err = regmap_write(data->regmap, ADT7470_TEMP_MAX_REG(channel), val);
+		mutex_unlock(&data->lock);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
 
-	mutex_lock(&data->lock);
-	data->temp_min[attr->index] = temp;
-	err = regmap_write(data->regmap, ADT7470_TEMP_MIN_REG(attr->index),
-				  temp);
-	mutex_unlock(&data->lock);
-
-	return err < 0 ? err : count;
-}
-
-static ssize_t temp_max_show(struct device *dev,
-			     struct device_attribute *devattr, char *buf)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = adt7470_update_device(dev);
-
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	return sprintf(buf, "%d\n", 1000 * data->temp_max[attr->index]);
-}
-
-static ssize_t temp_max_store(struct device *dev,
-			      struct device_attribute *devattr,
-			      const char *buf, size_t count)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = dev_get_drvdata(dev);
-	long temp;
-	int err;
-
-	if (kstrtol(buf, 10, &temp))
-		return -EINVAL;
-
-	temp = clamp_val(temp, -128000, 127000);
-	temp = DIV_ROUND_CLOSEST(temp, 1000);
-
-	mutex_lock(&data->lock);
-	data->temp_max[attr->index] = temp;
-	err = regmap_write(data->regmap, ADT7470_TEMP_MAX_REG(attr->index), temp);
-	mutex_unlock(&data->lock);
-
-	return err < 0 ? err : count;
-}
-
-static ssize_t temp_show(struct device *dev, struct device_attribute *devattr,
-			 char *buf)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = adt7470_update_device(dev);
-
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	return sprintf(buf, "%d\n", 1000 * data->temp[attr->index]);
+	return err;
 }
 
 static ssize_t alarm_mask_show(struct device *dev,
-			   struct device_attribute *devattr,
-			   char *buf)
+			       struct device_attribute *devattr, char *buf)
 {
 	struct adt7470_data *data = adt7470_update_device(dev);
 
@@ -668,98 +621,71 @@ static ssize_t alarm_mask_store(struct device *dev,
 	return err < 0 ? err : count;
 }
 
-static ssize_t fan_max_show(struct device *dev,
-			    struct device_attribute *devattr, char *buf)
+static int adt7470_fan_read(struct device *dev, u32 attr, int channel, long *val)
 {
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct adt7470_data *data = adt7470_update_device(dev);
 
 	if (IS_ERR(data))
 		return PTR_ERR(data);
 
-	if (FAN_DATA_VALID(data->fan_max[attr->index]))
-		return sprintf(buf, "%d\n",
-			       FAN_PERIOD_TO_RPM(data->fan_max[attr->index]));
-	else
-		return sprintf(buf, "0\n");
+	switch (attr) {
+	case hwmon_fan_input:
+		if (FAN_DATA_VALID(data->fan[channel]))
+			*val = FAN_PERIOD_TO_RPM(data->fan[channel]);
+		else
+			*val = 0;
+		break;
+	case hwmon_fan_min:
+		if (FAN_DATA_VALID(data->fan_min[channel]))
+			*val = FAN_PERIOD_TO_RPM(data->fan_min[channel]);
+		else
+			*val = 0;
+		break;
+	case hwmon_fan_max:
+		if (FAN_DATA_VALID(data->fan_max[channel]))
+			*val = FAN_PERIOD_TO_RPM(data->fan_max[channel]);
+		else
+			*val = 0;
+		break;
+	case hwmon_fan_alarm:
+		*val = !!(data->alarm & (1 << (12 + channel)));
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
 }
 
-static ssize_t fan_max_store(struct device *dev,
-			     struct device_attribute *devattr,
-			     const char *buf, size_t count)
+static int adt7470_fan_write(struct device *dev, u32 attr, int channel, long val)
 {
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct adt7470_data *data = dev_get_drvdata(dev);
-	long temp;
 	int err;
 
-	if (kstrtol(buf, 10, &temp) || !temp)
+	if (val <= 0)
 		return -EINVAL;
 
-	temp = FAN_RPM_TO_PERIOD(temp);
-	temp = clamp_val(temp, 1, 65534);
+	val = FAN_RPM_TO_PERIOD(val);
+	val = clamp_val(val, 1, 65534);
 
-	mutex_lock(&data->lock);
-	data->fan_max[attr->index] = temp;
-	err = adt7470_write_word_data(data, ADT7470_REG_FAN_MAX(attr->index), temp);
-	mutex_unlock(&data->lock);
+	switch (attr) {
+	case hwmon_fan_min:
+		mutex_lock(&data->lock);
+		data->fan_min[channel] = val;
+		err = adt7470_write_word_data(data, ADT7470_REG_FAN_MIN(channel), val);
+		mutex_unlock(&data->lock);
+		break;
+	case hwmon_fan_max:
+		mutex_lock(&data->lock);
+		data->fan_max[channel] = val;
+		err = adt7470_write_word_data(data, ADT7470_REG_FAN_MAX(channel), val);
+		mutex_unlock(&data->lock);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
 
-	return err < 0 ? err : count;
-}
-
-static ssize_t fan_min_show(struct device *dev,
-			    struct device_attribute *devattr, char *buf)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = adt7470_update_device(dev);
-
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	if (FAN_DATA_VALID(data->fan_min[attr->index]))
-		return sprintf(buf, "%d\n",
-			       FAN_PERIOD_TO_RPM(data->fan_min[attr->index]));
-	else
-		return sprintf(buf, "0\n");
-}
-
-static ssize_t fan_min_store(struct device *dev,
-			     struct device_attribute *devattr,
-			     const char *buf, size_t count)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = dev_get_drvdata(dev);
-	long temp;
-	int err;
-
-	if (kstrtol(buf, 10, &temp) || !temp)
-		return -EINVAL;
-
-	temp = FAN_RPM_TO_PERIOD(temp);
-	temp = clamp_val(temp, 1, 65534);
-
-	mutex_lock(&data->lock);
-	data->fan_min[attr->index] = temp;
-	err = adt7470_write_word_data(data, ADT7470_REG_FAN_MIN(attr->index), temp);
-	mutex_unlock(&data->lock);
-
-	return err < 0 ? err : count;
-}
-
-static ssize_t fan_show(struct device *dev, struct device_attribute *devattr,
-			char *buf)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = adt7470_update_device(dev);
-
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	if (FAN_DATA_VALID(data->fan[attr->index]))
-		return sprintf(buf, "%d\n",
-			       FAN_PERIOD_TO_RPM(data->fan[attr->index]));
-	else
-		return sprintf(buf, "0\n");
+	return err;
 }
 
 static ssize_t force_pwm_max_show(struct device *dev,
@@ -794,89 +720,62 @@ static ssize_t force_pwm_max_store(struct device *dev,
 	return err < 0 ? err : count;
 }
 
-static ssize_t pwm_show(struct device *dev, struct device_attribute *devattr,
-			char *buf)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = adt7470_update_device(dev);
-
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	return sprintf(buf, "%d\n", data->pwm[attr->index]);
-}
-
-static ssize_t pwm_store(struct device *dev, struct device_attribute *devattr,
-			 const char *buf, size_t count)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = dev_get_drvdata(dev);
-	long temp;
-	int err;
-
-	if (kstrtol(buf, 10, &temp))
-		return -EINVAL;
-
-	temp = clamp_val(temp, 0, 255);
-
-	mutex_lock(&data->lock);
-	data->pwm[attr->index] = temp;
-	err = regmap_write(data->regmap, ADT7470_REG_PWM(attr->index), temp);
-	mutex_unlock(&data->lock);
-
-	return err < 0 ? err : count;
-}
-
 /* These are the valid PWM frequencies to the nearest Hz */
 static const int adt7470_freq_map[] = {
 	11, 15, 22, 29, 35, 44, 59, 88, 1400, 22500
 };
 
-static ssize_t pwm1_freq_show(struct device *dev,
-			      struct device_attribute *devattr, char *buf)
+static int pwm1_freq_get(struct device *dev)
 {
-	struct adt7470_data *data = adt7470_update_device(dev);
-	unsigned int cfg_reg_1, cfg_reg_2;
+	struct adt7470_data *data = dev_get_drvdata(dev);
+	unsigned int regs[2] = {ADT7470_REG_CFG, ADT7470_REG_CFG_2};
+	u8 cfg_reg[2];
 	int index;
 	int err;
 
-	if (IS_ERR(data))
-		return PTR_ERR(data);
+	err = regmap_multi_reg_read(data->regmap, regs, cfg_reg, 2);
+	if (err)
+		return err;
 
-	mutex_lock(&data->lock);
-	err = regmap_read(data->regmap, ADT7470_REG_CFG, &cfg_reg_1);
-	if (err < 0)
-		goto out;
-	err = regmap_read(data->regmap, ADT7470_REG_CFG_2, &cfg_reg_2);
-	if (err < 0)
-		goto out;
-	mutex_unlock(&data->lock);
-
-	index = (cfg_reg_2 & ADT7470_FREQ_MASK) >> ADT7470_FREQ_SHIFT;
-	if (!(cfg_reg_1 & ADT7470_CFG_LF))
+	index = (cfg_reg[1] & ADT7470_FREQ_MASK) >> ADT7470_FREQ_SHIFT;
+	if (!(cfg_reg[0] & ADT7470_CFG_LF))
 		index += 8;
 	if (index >= ARRAY_SIZE(adt7470_freq_map))
 		index = ARRAY_SIZE(adt7470_freq_map) - 1;
 
-	return scnprintf(buf, PAGE_SIZE, "%d\n", adt7470_freq_map[index]);
-
-out:
-	mutex_unlock(&data->lock);
-	return err;
+	return adt7470_freq_map[index];
 }
 
-static ssize_t pwm1_freq_store(struct device *dev,
-			       struct device_attribute *devattr,
-			       const char *buf, size_t count)
+static int adt7470_pwm_read(struct device *dev, u32 attr, int channel, long *val)
+{
+	struct adt7470_data *data = adt7470_update_device(dev);
+
+	if (IS_ERR(data))
+		return PTR_ERR(data);
+
+	switch (attr) {
+	case hwmon_pwm_input:
+		*val = data->pwm[channel];
+		break;
+	case hwmon_pwm_enable:
+		*val = 1 + data->pwm_automatic[channel];
+		break;
+	case hwmon_pwm_freq:
+		*val = pwm1_freq_get(dev);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int pwm1_freq_set(struct device *dev, long freq)
 {
 	struct adt7470_data *data = dev_get_drvdata(dev);
-	long freq;
+	unsigned int low_freq = ADT7470_CFG_LF;
 	int index;
-	int low_freq = ADT7470_CFG_LF;
 	int err;
-
-	if (kstrtol(buf, 10, &freq))
-		return -EINVAL;
 
 	/* Round the user value given to the closest available frequency */
 	index = find_closest(freq, adt7470_freq_map,
@@ -901,7 +800,49 @@ static ssize_t pwm1_freq_store(struct device *dev,
 out:
 	mutex_unlock(&data->lock);
 
-	return err < 0 ? err : count;
+	return err;
+}
+
+static int adt7470_pwm_write(struct device *dev, u32 attr, int channel, long val)
+{
+	struct adt7470_data *data = dev_get_drvdata(dev);
+	unsigned int pwm_auto_reg_mask;
+	int err;
+
+	switch (attr) {
+	case hwmon_pwm_input:
+		val = clamp_val(val, 0, 255);
+		mutex_lock(&data->lock);
+		data->pwm[channel] = val;
+		err = regmap_write(data->regmap, ADT7470_REG_PWM(channel),
+				   data->pwm[channel]);
+		mutex_unlock(&data->lock);
+		break;
+	case hwmon_pwm_enable:
+		if (channel % 2)
+			pwm_auto_reg_mask = ADT7470_PWM2_AUTO_MASK;
+		else
+			pwm_auto_reg_mask = ADT7470_PWM1_AUTO_MASK;
+
+		if (val != 2 && val != 1)
+			return -EINVAL;
+		val--;
+
+		mutex_lock(&data->lock);
+		data->pwm_automatic[channel] = val;
+		err = regmap_update_bits(data->regmap, ADT7470_REG_PWM_CFG(channel),
+					 pwm_auto_reg_mask,
+					 val ? pwm_auto_reg_mask : 0);
+		mutex_unlock(&data->lock);
+		break;
+	case hwmon_pwm_freq:
+		err = pwm1_freq_set(dev, val);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return err;
 }
 
 static ssize_t pwm_max_show(struct device *dev,
@@ -1023,50 +964,6 @@ static ssize_t pwm_tmin_store(struct device *dev,
 	return err < 0 ? err : count;
 }
 
-static ssize_t pwm_auto_show(struct device *dev,
-			     struct device_attribute *devattr, char *buf)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = adt7470_update_device(dev);
-
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	return sprintf(buf, "%d\n", 1 + data->pwm_automatic[attr->index]);
-}
-
-static ssize_t pwm_auto_store(struct device *dev,
-			      struct device_attribute *devattr,
-			      const char *buf, size_t count)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = dev_get_drvdata(dev);
-	int pwm_auto_reg_mask;
-	long temp;
-	int err;
-
-	if (kstrtol(buf, 10, &temp))
-		return -EINVAL;
-
-	if (attr->index % 2)
-		pwm_auto_reg_mask = ADT7470_PWM2_AUTO_MASK;
-	else
-		pwm_auto_reg_mask = ADT7470_PWM1_AUTO_MASK;
-
-	if (temp != 2 && temp != 1)
-		return -EINVAL;
-	temp--;
-
-	mutex_lock(&data->lock);
-	data->pwm_automatic[attr->index] = temp;
-	err = regmap_update_bits(data->regmap, ADT7470_REG_PWM_CFG(attr->index),
-				 pwm_auto_reg_mask,
-				 temp ? pwm_auto_reg_mask : 0);
-	mutex_unlock(&data->lock);
-
-	return err < 0 ? err : count;
-}
-
 static ssize_t pwm_auto_temp_show(struct device *dev,
 				  struct device_attribute *devattr, char *buf)
 {
@@ -1111,10 +1008,8 @@ static ssize_t pwm_auto_temp_store(struct device *dev,
 	if (temp < 0)
 		return temp;
 
-	if (temp > 0xF)
-		return -EINVAL;
-
 	mutex_lock(&data->lock);
+	data->pwm_automatic[attr->index] = temp;
 
 	if (!(attr->index % 2)) {
 		mask = 0xF0;
@@ -1125,105 +1020,16 @@ static ssize_t pwm_auto_temp_store(struct device *dev,
 	}
 
 	err = regmap_update_bits(data->regmap, pwm_auto_reg, mask, val);
-	if (!err)
-		data->pwm_auto_temp[attr->index] = temp;
-
 	mutex_unlock(&data->lock);
 
 	return err < 0 ? err : count;
-}
-
-static ssize_t alarm_show(struct device *dev,
-			  struct device_attribute *devattr, char *buf)
-{
-	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
-	struct adt7470_data *data = adt7470_update_device(dev);
-
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	if (data->alarm & attr->index)
-		return sprintf(buf, "1\n");
-	else
-		return sprintf(buf, "0\n");
 }
 
 static DEVICE_ATTR_RW(alarm_mask);
 static DEVICE_ATTR_RW(num_temp_sensors);
 static DEVICE_ATTR_RW(auto_update_interval);
 
-static SENSOR_DEVICE_ATTR_RW(temp1_max, temp_max, 0);
-static SENSOR_DEVICE_ATTR_RW(temp2_max, temp_max, 1);
-static SENSOR_DEVICE_ATTR_RW(temp3_max, temp_max, 2);
-static SENSOR_DEVICE_ATTR_RW(temp4_max, temp_max, 3);
-static SENSOR_DEVICE_ATTR_RW(temp5_max, temp_max, 4);
-static SENSOR_DEVICE_ATTR_RW(temp6_max, temp_max, 5);
-static SENSOR_DEVICE_ATTR_RW(temp7_max, temp_max, 6);
-static SENSOR_DEVICE_ATTR_RW(temp8_max, temp_max, 7);
-static SENSOR_DEVICE_ATTR_RW(temp9_max, temp_max, 8);
-static SENSOR_DEVICE_ATTR_RW(temp10_max, temp_max, 9);
-
-static SENSOR_DEVICE_ATTR_RW(temp1_min, temp_min, 0);
-static SENSOR_DEVICE_ATTR_RW(temp2_min, temp_min, 1);
-static SENSOR_DEVICE_ATTR_RW(temp3_min, temp_min, 2);
-static SENSOR_DEVICE_ATTR_RW(temp4_min, temp_min, 3);
-static SENSOR_DEVICE_ATTR_RW(temp5_min, temp_min, 4);
-static SENSOR_DEVICE_ATTR_RW(temp6_min, temp_min, 5);
-static SENSOR_DEVICE_ATTR_RW(temp7_min, temp_min, 6);
-static SENSOR_DEVICE_ATTR_RW(temp8_min, temp_min, 7);
-static SENSOR_DEVICE_ATTR_RW(temp9_min, temp_min, 8);
-static SENSOR_DEVICE_ATTR_RW(temp10_min, temp_min, 9);
-
-static SENSOR_DEVICE_ATTR_RO(temp1_input, temp, 0);
-static SENSOR_DEVICE_ATTR_RO(temp2_input, temp, 1);
-static SENSOR_DEVICE_ATTR_RO(temp3_input, temp, 2);
-static SENSOR_DEVICE_ATTR_RO(temp4_input, temp, 3);
-static SENSOR_DEVICE_ATTR_RO(temp5_input, temp, 4);
-static SENSOR_DEVICE_ATTR_RO(temp6_input, temp, 5);
-static SENSOR_DEVICE_ATTR_RO(temp7_input, temp, 6);
-static SENSOR_DEVICE_ATTR_RO(temp8_input, temp, 7);
-static SENSOR_DEVICE_ATTR_RO(temp9_input, temp, 8);
-static SENSOR_DEVICE_ATTR_RO(temp10_input, temp, 9);
-
-static SENSOR_DEVICE_ATTR_RO(temp1_alarm, alarm, ADT7470_R1T_ALARM);
-static SENSOR_DEVICE_ATTR_RO(temp2_alarm, alarm, ADT7470_R2T_ALARM);
-static SENSOR_DEVICE_ATTR_RO(temp3_alarm, alarm, ADT7470_R3T_ALARM);
-static SENSOR_DEVICE_ATTR_RO(temp4_alarm, alarm, ADT7470_R4T_ALARM);
-static SENSOR_DEVICE_ATTR_RO(temp5_alarm, alarm, ADT7470_R5T_ALARM);
-static SENSOR_DEVICE_ATTR_RO(temp6_alarm, alarm, ADT7470_R6T_ALARM);
-static SENSOR_DEVICE_ATTR_RO(temp7_alarm, alarm, ADT7470_R7T_ALARM);
-static SENSOR_DEVICE_ATTR_RO(temp8_alarm, alarm, ALARM2(ADT7470_R8T_ALARM));
-static SENSOR_DEVICE_ATTR_RO(temp9_alarm, alarm, ALARM2(ADT7470_R9T_ALARM));
-static SENSOR_DEVICE_ATTR_RO(temp10_alarm, alarm, ALARM2(ADT7470_R10T_ALARM));
-
-static SENSOR_DEVICE_ATTR_RW(fan1_max, fan_max, 0);
-static SENSOR_DEVICE_ATTR_RW(fan2_max, fan_max, 1);
-static SENSOR_DEVICE_ATTR_RW(fan3_max, fan_max, 2);
-static SENSOR_DEVICE_ATTR_RW(fan4_max, fan_max, 3);
-
-static SENSOR_DEVICE_ATTR_RW(fan1_min, fan_min, 0);
-static SENSOR_DEVICE_ATTR_RW(fan2_min, fan_min, 1);
-static SENSOR_DEVICE_ATTR_RW(fan3_min, fan_min, 2);
-static SENSOR_DEVICE_ATTR_RW(fan4_min, fan_min, 3);
-
-static SENSOR_DEVICE_ATTR_RO(fan1_input, fan, 0);
-static SENSOR_DEVICE_ATTR_RO(fan2_input, fan, 1);
-static SENSOR_DEVICE_ATTR_RO(fan3_input, fan, 2);
-static SENSOR_DEVICE_ATTR_RO(fan4_input, fan, 3);
-
-static SENSOR_DEVICE_ATTR_RO(fan1_alarm, alarm, ALARM2(ADT7470_FAN1_ALARM));
-static SENSOR_DEVICE_ATTR_RO(fan2_alarm, alarm, ALARM2(ADT7470_FAN2_ALARM));
-static SENSOR_DEVICE_ATTR_RO(fan3_alarm, alarm, ALARM2(ADT7470_FAN3_ALARM));
-static SENSOR_DEVICE_ATTR_RO(fan4_alarm, alarm, ALARM2(ADT7470_FAN4_ALARM));
-
 static SENSOR_DEVICE_ATTR_RW(force_pwm_max, force_pwm_max, 0);
-
-static SENSOR_DEVICE_ATTR_RW(pwm1, pwm, 0);
-static SENSOR_DEVICE_ATTR_RW(pwm2, pwm, 1);
-static SENSOR_DEVICE_ATTR_RW(pwm3, pwm, 2);
-static SENSOR_DEVICE_ATTR_RW(pwm4, pwm, 3);
-
-static DEVICE_ATTR_RW(pwm1_freq);
 
 static SENSOR_DEVICE_ATTR_RW(pwm1_auto_point1_pwm, pwm_min, 0);
 static SENSOR_DEVICE_ATTR_RW(pwm2_auto_point1_pwm, pwm_min, 1);
@@ -1245,11 +1051,6 @@ static SENSOR_DEVICE_ATTR_RO(pwm2_auto_point2_temp, pwm_tmax, 1);
 static SENSOR_DEVICE_ATTR_RO(pwm3_auto_point2_temp, pwm_tmax, 2);
 static SENSOR_DEVICE_ATTR_RO(pwm4_auto_point2_temp, pwm_tmax, 3);
 
-static SENSOR_DEVICE_ATTR_RW(pwm1_enable, pwm_auto, 0);
-static SENSOR_DEVICE_ATTR_RW(pwm2_enable, pwm_auto, 1);
-static SENSOR_DEVICE_ATTR_RW(pwm3_enable, pwm_auto, 2);
-static SENSOR_DEVICE_ATTR_RW(pwm4_enable, pwm_auto, 3);
-
 static SENSOR_DEVICE_ATTR_RW(pwm1_auto_channels_temp, pwm_auto_temp, 0);
 static SENSOR_DEVICE_ATTR_RW(pwm2_auto_channels_temp, pwm_auto_temp, 1);
 static SENSOR_DEVICE_ATTR_RW(pwm3_auto_channels_temp, pwm_auto_temp, 2);
@@ -1259,68 +1060,7 @@ static struct attribute *adt7470_attrs[] = {
 	&dev_attr_alarm_mask.attr,
 	&dev_attr_num_temp_sensors.attr,
 	&dev_attr_auto_update_interval.attr,
-	&sensor_dev_attr_temp1_max.dev_attr.attr,
-	&sensor_dev_attr_temp2_max.dev_attr.attr,
-	&sensor_dev_attr_temp3_max.dev_attr.attr,
-	&sensor_dev_attr_temp4_max.dev_attr.attr,
-	&sensor_dev_attr_temp5_max.dev_attr.attr,
-	&sensor_dev_attr_temp6_max.dev_attr.attr,
-	&sensor_dev_attr_temp7_max.dev_attr.attr,
-	&sensor_dev_attr_temp8_max.dev_attr.attr,
-	&sensor_dev_attr_temp9_max.dev_attr.attr,
-	&sensor_dev_attr_temp10_max.dev_attr.attr,
-	&sensor_dev_attr_temp1_min.dev_attr.attr,
-	&sensor_dev_attr_temp2_min.dev_attr.attr,
-	&sensor_dev_attr_temp3_min.dev_attr.attr,
-	&sensor_dev_attr_temp4_min.dev_attr.attr,
-	&sensor_dev_attr_temp5_min.dev_attr.attr,
-	&sensor_dev_attr_temp6_min.dev_attr.attr,
-	&sensor_dev_attr_temp7_min.dev_attr.attr,
-	&sensor_dev_attr_temp8_min.dev_attr.attr,
-	&sensor_dev_attr_temp9_min.dev_attr.attr,
-	&sensor_dev_attr_temp10_min.dev_attr.attr,
-	&sensor_dev_attr_temp1_input.dev_attr.attr,
-	&sensor_dev_attr_temp2_input.dev_attr.attr,
-	&sensor_dev_attr_temp3_input.dev_attr.attr,
-	&sensor_dev_attr_temp4_input.dev_attr.attr,
-	&sensor_dev_attr_temp5_input.dev_attr.attr,
-	&sensor_dev_attr_temp6_input.dev_attr.attr,
-	&sensor_dev_attr_temp7_input.dev_attr.attr,
-	&sensor_dev_attr_temp8_input.dev_attr.attr,
-	&sensor_dev_attr_temp9_input.dev_attr.attr,
-	&sensor_dev_attr_temp10_input.dev_attr.attr,
-	&sensor_dev_attr_temp1_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp2_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp3_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp4_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp5_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp6_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp7_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp8_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp9_alarm.dev_attr.attr,
-	&sensor_dev_attr_temp10_alarm.dev_attr.attr,
-	&sensor_dev_attr_fan1_max.dev_attr.attr,
-	&sensor_dev_attr_fan2_max.dev_attr.attr,
-	&sensor_dev_attr_fan3_max.dev_attr.attr,
-	&sensor_dev_attr_fan4_max.dev_attr.attr,
-	&sensor_dev_attr_fan1_min.dev_attr.attr,
-	&sensor_dev_attr_fan2_min.dev_attr.attr,
-	&sensor_dev_attr_fan3_min.dev_attr.attr,
-	&sensor_dev_attr_fan4_min.dev_attr.attr,
-	&sensor_dev_attr_fan1_input.dev_attr.attr,
-	&sensor_dev_attr_fan2_input.dev_attr.attr,
-	&sensor_dev_attr_fan3_input.dev_attr.attr,
-	&sensor_dev_attr_fan4_input.dev_attr.attr,
-	&sensor_dev_attr_fan1_alarm.dev_attr.attr,
-	&sensor_dev_attr_fan2_alarm.dev_attr.attr,
-	&sensor_dev_attr_fan3_alarm.dev_attr.attr,
-	&sensor_dev_attr_fan4_alarm.dev_attr.attr,
 	&sensor_dev_attr_force_pwm_max.dev_attr.attr,
-	&sensor_dev_attr_pwm1.dev_attr.attr,
-	&dev_attr_pwm1_freq.attr,
-	&sensor_dev_attr_pwm2.dev_attr.attr,
-	&sensor_dev_attr_pwm3.dev_attr.attr,
-	&sensor_dev_attr_pwm4.dev_attr.attr,
 	&sensor_dev_attr_pwm1_auto_point1_pwm.dev_attr.attr,
 	&sensor_dev_attr_pwm2_auto_point1_pwm.dev_attr.attr,
 	&sensor_dev_attr_pwm3_auto_point1_pwm.dev_attr.attr,
@@ -1337,10 +1077,6 @@ static struct attribute *adt7470_attrs[] = {
 	&sensor_dev_attr_pwm2_auto_point2_temp.dev_attr.attr,
 	&sensor_dev_attr_pwm3_auto_point2_temp.dev_attr.attr,
 	&sensor_dev_attr_pwm4_auto_point2_temp.dev_attr.attr,
-	&sensor_dev_attr_pwm1_enable.dev_attr.attr,
-	&sensor_dev_attr_pwm2_enable.dev_attr.attr,
-	&sensor_dev_attr_pwm3_enable.dev_attr.attr,
-	&sensor_dev_attr_pwm4_enable.dev_attr.attr,
 	&sensor_dev_attr_pwm1_auto_channels_temp.dev_attr.attr,
 	&sensor_dev_attr_pwm2_auto_channels_temp.dev_attr.attr,
 	&sensor_dev_attr_pwm3_auto_channels_temp.dev_attr.attr,
@@ -1349,6 +1085,129 @@ static struct attribute *adt7470_attrs[] = {
 };
 
 ATTRIBUTE_GROUPS(adt7470);
+
+static int adt7470_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+			int channel, long *val)
+{
+	switch (type) {
+	case hwmon_temp:
+		return adt7470_temp_read(dev, attr, channel, val);
+	case hwmon_fan:
+		return adt7470_fan_read(dev, attr, channel, val);
+	case hwmon_pwm:
+		return adt7470_pwm_read(dev, attr, channel, val);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int adt7470_write(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+			 int channel, long val)
+{
+	switch (type) {
+	case hwmon_temp:
+		return adt7470_temp_write(dev, attr, channel, val);
+	case hwmon_fan:
+		return adt7470_fan_write(dev, attr, channel, val);
+	case hwmon_pwm:
+		return adt7470_pwm_write(dev, attr, channel, val);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static umode_t adt7470_is_visible(const void *_data, enum hwmon_sensor_types type,
+				  u32 attr, int channel)
+{
+	umode_t mode = 0;
+
+	switch (type) {
+	case hwmon_temp:
+		switch (attr) {
+		case hwmon_temp:
+		case hwmon_temp_alarm:
+			mode = 0444;
+			break;
+		case hwmon_temp_min:
+		case hwmon_temp_max:
+			mode = 0644;
+			break;
+		default:
+			break;
+		}
+		break;
+	case hwmon_fan:
+		switch (attr) {
+		case hwmon_fan_input:
+		case hwmon_fan_alarm:
+			mode = 0444;
+			break;
+		case hwmon_fan_min:
+		case hwmon_fan_max:
+			mode = 0644;
+			break;
+		default:
+			break;
+		}
+		break;
+	case hwmon_pwm:
+		switch (attr) {
+		case hwmon_pwm_input:
+		case hwmon_pwm_enable:
+			mode = 0644;
+			break;
+		case hwmon_pwm_freq:
+			if (channel == 0)
+				mode = 0644;
+			else
+				mode = 0;
+			break;
+		default:
+			break;
+		}
+		break;
+	default:
+		break;
+	}
+
+	return mode;
+}
+
+static const struct hwmon_ops adt7470_hwmon_ops = {
+	.is_visible = adt7470_is_visible,
+	.read = adt7470_read,
+	.write = adt7470_write,
+};
+
+static const struct hwmon_channel_info * const adt7470_info[] = {
+	HWMON_CHANNEL_INFO(temp,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM,
+			   HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_ALARM),
+	HWMON_CHANNEL_INFO(fan,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_MAX | HWMON_F_DIV | HWMON_F_ALARM,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_MAX | HWMON_F_DIV | HWMON_F_ALARM,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_MAX | HWMON_F_DIV | HWMON_F_ALARM,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_MAX | HWMON_F_DIV | HWMON_F_ALARM),
+	HWMON_CHANNEL_INFO(pwm,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE | HWMON_PWM_FREQ,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+	NULL
+};
+
+static const struct hwmon_chip_info adt7470_chip_info = {
+	.ops = &adt7470_hwmon_ops,
+	.info = adt7470_info,
+};
 
 /* Return 0 if detection is successful, -ENODEV otherwise */
 static int adt7470_detect(struct i2c_client *client,
@@ -1414,9 +1273,9 @@ static int adt7470_probe(struct i2c_client *client)
 		return err;
 
 	/* Register sysfs hooks */
-	hwmon_dev = devm_hwmon_device_register_with_groups(dev, client->name,
-							   data,
-							   adt7470_groups);
+	hwmon_dev = devm_hwmon_device_register_with_info(dev, client->name, data,
+							 &adt7470_chip_info,
+							 adt7470_groups);
 
 	if (IS_ERR(hwmon_dev))
 		return PTR_ERR(hwmon_dev);
@@ -1429,16 +1288,15 @@ static int adt7470_probe(struct i2c_client *client)
 	return 0;
 }
 
-static int adt7470_remove(struct i2c_client *client)
+static void adt7470_remove(struct i2c_client *client)
 {
 	struct adt7470_data *data = i2c_get_clientdata(client);
 
 	kthread_stop(data->auto_update);
-	return 0;
 }
 
 static const struct i2c_device_id adt7470_id[] = {
-	{ "adt7470", 0 },
+	{ "adt7470" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, adt7470_id);
@@ -1448,7 +1306,7 @@ static struct i2c_driver adt7470_driver = {
 	.driver = {
 		.name	= "adt7470",
 	},
-	.probe_new	= adt7470_probe,
+	.probe		= adt7470_probe,
 	.remove		= adt7470_remove,
 	.id_table	= adt7470_id,
 	.detect		= adt7470_detect,

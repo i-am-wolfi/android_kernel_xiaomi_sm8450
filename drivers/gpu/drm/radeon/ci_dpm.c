@@ -27,11 +27,13 @@
 
 #include "atom.h"
 #include "ci_dpm.h"
+#include "cik.h"
 #include "cikd.h"
 #include "r600_dpm.h"
 #include "radeon.h"
 #include "radeon_asic.h"
 #include "radeon_ucode.h"
+#include "si_dpm.h"
 
 #define MC_CG_ARB_FREQ_F0           0x0a
 #define MC_CG_ARB_FREQ_F1           0x0b
@@ -44,36 +46,31 @@
 #define VOLTAGE_VID_OFFSET_SCALE1    625
 #define VOLTAGE_VID_OFFSET_SCALE2    100
 
-static const struct ci_pt_defaults defaults_hawaii_xt =
-{
+static const struct ci_pt_defaults defaults_hawaii_xt = {
 	1, 0xF, 0xFD, 0x19, 5, 0x14, 0, 0xB0000,
 	{ 0x2E,  0x00,  0x00,  0x88,  0x00,  0x00,  0x72,  0x60,  0x51,  0xA7,  0x79,  0x6B,  0x90,  0xBD,  0x79  },
 	{ 0x217, 0x217, 0x217, 0x242, 0x242, 0x242, 0x269, 0x269, 0x269, 0x2A1, 0x2A1, 0x2A1, 0x2C9, 0x2C9, 0x2C9 }
 };
 
-static const struct ci_pt_defaults defaults_hawaii_pro =
-{
+static const struct ci_pt_defaults defaults_hawaii_pro = {
 	1, 0xF, 0xFD, 0x19, 5, 0x14, 0, 0x65062,
 	{ 0x2E,  0x00,  0x00,  0x88,  0x00,  0x00,  0x72,  0x60,  0x51,  0xA7,  0x79,  0x6B,  0x90,  0xBD,  0x79  },
 	{ 0x217, 0x217, 0x217, 0x242, 0x242, 0x242, 0x269, 0x269, 0x269, 0x2A1, 0x2A1, 0x2A1, 0x2C9, 0x2C9, 0x2C9 }
 };
 
-static const struct ci_pt_defaults defaults_bonaire_xt =
-{
+static const struct ci_pt_defaults defaults_bonaire_xt = {
 	1, 0xF, 0xFD, 0x19, 5, 45, 0, 0xB0000,
 	{ 0x79,  0x253, 0x25D, 0xAE,  0x72,  0x80,  0x83,  0x86,  0x6F,  0xC8,  0xC9,  0xC9,  0x2F,  0x4D,  0x61  },
 	{ 0x17C, 0x172, 0x180, 0x1BC, 0x1B3, 0x1BD, 0x206, 0x200, 0x203, 0x25D, 0x25A, 0x255, 0x2C3, 0x2C5, 0x2B4 }
 };
 
-static const struct ci_pt_defaults defaults_saturn_xt =
-{
+static const struct ci_pt_defaults defaults_saturn_xt = {
 	1, 0xF, 0xFD, 0x19, 5, 55, 0, 0x70000,
 	{ 0x8C,  0x247, 0x249, 0xA6,  0x80,  0x81,  0x8B,  0x89,  0x86,  0xC9,  0xCA,  0xC9,  0x4D,  0x4D,  0x4D  },
 	{ 0x187, 0x187, 0x187, 0x1C7, 0x1C7, 0x1C7, 0x210, 0x210, 0x210, 0x266, 0x266, 0x266, 0x2C9, 0x2C9, 0x2C9 }
 };
 
-static const struct ci_pt_config_reg didt_config_ci[] =
-{
+static const struct ci_pt_config_reg didt_config_ci[] = {
 	{ 0x10, 0x000000ff, 0, 0x0, CISLANDS_CONFIGREG_DIDT_IND },
 	{ 0x10, 0x0000ff00, 8, 0x0, CISLANDS_CONFIGREG_DIDT_IND },
 	{ 0x10, 0x00ff0000, 16, 0x0, CISLANDS_CONFIGREG_DIDT_IND },
@@ -152,17 +149,6 @@ static const struct ci_pt_config_reg didt_config_ci[] =
 extern u8 rv770_get_memory_module_index(struct radeon_device *rdev);
 extern int ni_copy_and_switch_arb_sets(struct radeon_device *rdev,
 				       u32 arb_freq_src, u32 arb_freq_dest);
-extern u8 si_get_ddr3_mclk_frequency_ratio(u32 memory_clock);
-extern u8 si_get_mclk_frequency_ratio(u32 memory_clock, bool strobe_mode);
-extern void si_trim_voltage_table_to_fit_state_table(struct radeon_device *rdev,
-						     u32 max_voltage_steps,
-						     struct atom_voltage_table *voltage_table);
-extern void cik_enter_rlc_safe_mode(struct radeon_device *rdev);
-extern void cik_exit_rlc_safe_mode(struct radeon_device *rdev);
-extern int ci_mc_load_microcode(struct radeon_device *rdev);
-extern void cik_update_cg(struct radeon_device *rdev,
-			  u32 block, bool enable);
-
 static int ci_get_std_voltage_value_sidd(struct radeon_device *rdev,
 					 struct atom_voltage_table_entry *voltage_table,
 					 u16 *std_voltage_hi_sidd, u16 *std_voltage_lo_sidd);
@@ -399,8 +385,7 @@ static int ci_min_max_v_gnbl_pm_lid_from_bapm_vddc(struct radeon_device *rdev)
 static int ci_populate_bapm_vddc_base_leakage_sidd(struct radeon_device *rdev)
 {
 	struct ci_power_info *pi = ci_get_pi(rdev);
-	u16 hi_sidd = pi->smc_powertune_table.BapmVddCBaseLeakageHiSidd;
-	u16 lo_sidd = pi->smc_powertune_table.BapmVddCBaseLeakageLoSidd;
+	u16 hi_sidd, lo_sidd;
 	struct radeon_cac_tdp_table *cac_tdp_table =
 		rdev->pm.dpm.dyn_state.cac_tdp_table;
 
@@ -1226,7 +1211,7 @@ static void ci_thermal_initialize(struct radeon_device *rdev)
 
 	if (rdev->pm.fan_pulses_per_revolution) {
 		tmp = RREG32_SMC(CG_TACH_CTRL) & ~EDGE_PER_REV_MASK;
-		tmp |= EDGE_PER_REV(rdev->pm.fan_pulses_per_revolution -1);
+		tmp |= EDGE_PER_REV(rdev->pm.fan_pulses_per_revolution - 1);
 		WREG32_SMC(CG_TACH_CTRL, tmp);
 	}
 
@@ -1366,7 +1351,6 @@ static void ci_set_dpm_event_sources(struct radeon_device *rdev, u32 sources)
 {
 	struct ci_power_info *pi = ci_get_pi(rdev);
 	bool want_thermal_protection;
-	enum radeon_dpm_event_src dpm_event_src;
 	u32 tmp;
 
 	switch (sources) {
@@ -1376,28 +1360,17 @@ static void ci_set_dpm_event_sources(struct radeon_device *rdev, u32 sources)
 		break;
 	case (1 << RADEON_DPM_AUTO_THROTTLE_SRC_THERMAL):
 		want_thermal_protection = true;
-		dpm_event_src = RADEON_DPM_EVENT_SRC_DIGITAL;
 		break;
 	case (1 << RADEON_DPM_AUTO_THROTTLE_SRC_EXTERNAL):
 		want_thermal_protection = true;
-		dpm_event_src = RADEON_DPM_EVENT_SRC_EXTERNAL;
 		break;
 	case ((1 << RADEON_DPM_AUTO_THROTTLE_SRC_EXTERNAL) |
 	      (1 << RADEON_DPM_AUTO_THROTTLE_SRC_THERMAL)):
 		want_thermal_protection = true;
-		dpm_event_src = RADEON_DPM_EVENT_SRC_DIGIAL_OR_EXTERNAL;
 		break;
 	}
 
 	if (want_thermal_protection) {
-#if 0
-		/* XXX: need to figure out how to handle this properly */
-		tmp = RREG32_SMC(CG_THERMAL_CTRL);
-		tmp &= DPM_EVENT_SRC_MASK;
-		tmp |= DPM_EVENT_SRC(dpm_event_src);
-		WREG32_SMC(CG_THERMAL_CTRL, tmp);
-#endif
-
 		tmp = RREG32_SMC(GENERAL_PWRMGT);
 		if (pi->thermal_protection)
 			tmp &= ~THERMAL_PROTECTION_DIS;
@@ -2078,7 +2051,7 @@ static void ci_clear_vc(struct radeon_device *rdev)
 static int ci_upload_firmware(struct radeon_device *rdev)
 {
 	struct ci_power_info *pi = ci_get_pi(rdev);
-	int i, ret;
+	int i;
 
 	for (i = 0; i < rdev->usec_timeout; i++) {
 		if (RREG32_SMC(RCU_UC_EVENTS) & BOOT_SEQ_DONE)
@@ -2089,9 +2062,7 @@ static int ci_upload_firmware(struct radeon_device *rdev)
 	ci_stop_smc_clock(rdev);
 	ci_reset_smc(rdev);
 
-	ret = ci_load_smc_ucode(rdev, pi->sram_end);
-
-	return ret;
+	return ci_load_smc_ucode(rdev, pi->sram_end);
 
 }
 
@@ -2490,8 +2461,7 @@ static void ci_register_patching_mc_arb(struct radeon_device *rdev,
 
 	if (patch &&
 	    ((rdev->pdev->device == 0x67B0) ||
-	     (rdev->pdev->device == 0x67B1)) &&
-	    (rdev->pdev->revision == 0)) {
+	     (rdev->pdev->device == 0x67B1))) {
 		if ((memory_clock > 100000) && (memory_clock <= 125000)) {
 			tmp2 = (((0x31 * engine_clock) / 125000) - 1) & 0xff;
 			*dram_timimg2 &= ~0x00ff0000;
@@ -3332,8 +3302,7 @@ static int ci_populate_all_memory_levels(struct radeon_device *rdev)
 	pi->smc_state_table.MemoryLevel[0].EnabledForActivity = 1;
 
 	if ((dpm_table->mclk_table.count >= 2) &&
-	    ((rdev->pdev->device == 0x67B0) || (rdev->pdev->device == 0x67B1)) &&
-	    (rdev->pdev->revision == 0)) {
+	    ((rdev->pdev->device == 0x67B0) || (rdev->pdev->device == 0x67B1))) {
 		pi->smc_state_table.MemoryLevel[1].MinVddc =
 			pi->smc_state_table.MemoryLevel[0].MinVddc;
 		pi->smc_state_table.MemoryLevel[1].MinVddcPhases =
@@ -3359,7 +3328,7 @@ static int ci_populate_all_memory_levels(struct radeon_device *rdev)
 }
 
 static void ci_reset_single_dpm_table(struct radeon_device *rdev,
-				      struct ci_single_dpm_table* dpm_table,
+				      struct ci_single_dpm_table *dpm_table,
 				      u32 count)
 {
 	u32 i;
@@ -3369,7 +3338,7 @@ static void ci_reset_single_dpm_table(struct radeon_device *rdev,
 		dpm_table->dpm_levels[i].enabled = false;
 }
 
-static void ci_setup_pcie_table_entry(struct ci_single_dpm_table* dpm_table,
+static void ci_setup_pcie_table_entry(struct ci_single_dpm_table *dpm_table,
 				      u32 index, u32 pcie_gen, u32 pcie_lanes)
 {
 	dpm_table->dpm_levels[index].value = pcie_gen;
@@ -3529,7 +3498,7 @@ static int ci_find_boot_level(struct ci_single_dpm_table *table,
 	u32 i;
 	int ret = -EINVAL;
 
-	for(i = 0; i < table->count; i++) {
+	for (i = 0; i < table->count; i++) {
 		if (value == table->dpm_levels[i].value) {
 			*boot_level = i;
 			ret = 0;
@@ -4330,7 +4299,7 @@ static int ci_set_mc_special_registers(struct radeon_device *rdev,
 	for (i = 0, j = table->last; i < table->last; i++) {
 		if (j >= SMU7_DISCRETE_MC_REGISTER_ARRAY_SIZE)
 			return -EINVAL;
-		switch(table->mc_reg_address[i].s1 << 2) {
+		switch (table->mc_reg_address[i].s1 << 2) {
 		case MC_SEQ_MISC1:
 			temp_reg = RREG32(MC_PMG_CMD_EMRS);
 			table->mc_reg_address[j].s1 = MC_PMG_CMD_EMRS >> 2;
@@ -4395,7 +4364,7 @@ static bool ci_check_s0_mc_reg_index(u16 in_reg, u16 *out_reg)
 {
 	bool result = true;
 
-	switch(in_reg) {
+	switch (in_reg) {
 	case MC_SEQ_RAS_TIMING >> 2:
 		*out_reg = MC_SEQ_RAS_TIMING_LP >> 2;
 		break;
@@ -4530,12 +4499,11 @@ static int ci_register_patching_mc_seq(struct radeon_device *rdev,
 
 	if (patch &&
 	    ((rdev->pdev->device == 0x67B0) ||
-	     (rdev->pdev->device == 0x67B1)) &&
-	    (rdev->pdev->revision == 0)) {
+	     (rdev->pdev->device == 0x67B1))) {
 		for (i = 0; i < table->last; i++) {
 			if (table->last >= SMU7_DISCRETE_MC_REGISTER_ARRAY_SIZE)
 				return -EINVAL;
-			switch(table->mc_reg_address[i].s1 >> 2) {
+			switch (table->mc_reg_address[i].s1 >> 2) {
 			case MC_SEQ_MISC1:
 				for (k = 0; k < table->num_entries; k++) {
 					if ((table->mc_reg_table_entry[k].mclk_max == 125000) ||
@@ -4710,7 +4678,7 @@ static void ci_convert_mc_reg_table_entry_to_smc(struct radeon_device *rdev,
 	struct ci_power_info *pi = ci_get_pi(rdev);
 	u32 i = 0;
 
-	for(i = 0; i < pi->mc_reg_table.num_entries; i++) {
+	for (i = 0; i < pi->mc_reg_table.num_entries; i++) {
 		if (memory_clock <= pi->mc_reg_table.mc_reg_table_entry[i].mclk_max)
 			break;
 	}
@@ -4863,8 +4831,8 @@ static void ci_request_link_speed_change_before_state_change(struct radeon_devic
 		case RADEON_PCIE_GEN2:
 			if (radeon_acpi_pcie_performance_request(rdev, PCIE_PERF_REQ_PECI_GEN2, false) == 0)
 				break;
+			fallthrough;
 #endif
-			/* fall through */
 		default:
 			pi->force_pcie_gen = ci_get_current_pcie_speed(rdev);
 			break;

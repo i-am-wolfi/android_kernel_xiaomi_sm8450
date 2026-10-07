@@ -15,8 +15,7 @@
 *******************************************************************************/
 
 #include <linux/crc32.h>
-#include <net/dsa.h>
-#include <asm/io.h>
+#include <linux/io.h>
 #include "stmmac.h"
 #include "dwmac100.h"
 
@@ -28,13 +27,6 @@ static void dwmac100_core_init(struct mac_device_info *hw,
 
 	value |= MAC_CORE_INIT;
 
-	/* Clear ASTP bit because Ethernet switch tagging formats such as
-	 * Broadcom tags can look like invalid LLC/SNAP packets and cause the
-	 * hardware to truncate packets on reception.
-	 */
-	if (netdev_uses_dsa(dev))
-		value &= ~MAC_CONTROL_ASTP;
-
 	writel(value, ioaddr + MAC_CONTROL);
 
 #ifdef STMMAC_VLAN_TAG_USED
@@ -42,7 +34,8 @@ static void dwmac100_core_init(struct mac_device_info *hw,
 #endif
 }
 
-static void dwmac100_dump_mac_regs(struct mac_device_info *hw, u32 *reg_space)
+static void dwmac100_dump_mac_regs(struct stmmac_priv *priv, struct mac_device_info *hw,
+				   u32 *reg_space)
 {
 	void __iomem *ioaddr = hw->pcsr;
 
@@ -68,7 +61,7 @@ static int dwmac100_irq_status(struct mac_device_info *hw,
 }
 
 static void dwmac100_set_umac_addr(struct mac_device_info *hw,
-				   unsigned char *addr,
+				   const unsigned char *addr,
 				   unsigned int reg_n)
 {
 	void __iomem *ioaddr = hw->pcsr;
@@ -183,6 +176,8 @@ int dwmac100_setup(struct stmmac_priv *priv)
 	dev_info(priv->device, "\tDWMAC100\n");
 
 	mac->pcsr = priv->ioaddr;
+	mac->link.caps = MAC_ASYM_PAUSE | MAC_SYM_PAUSE |
+			 MAC_10 | MAC_100;
 	mac->link.duplex = MAC_CONTROL_F;
 	mac->link.speed10 = 0;
 	mac->link.speed100 = 0;

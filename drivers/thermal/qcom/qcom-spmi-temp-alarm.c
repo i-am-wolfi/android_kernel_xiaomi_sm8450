@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2011-2015, 2017, 2020-2021, The Linux Foundation.
- * All rights reserved.
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2011-2015, 2017, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
+#include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
-#include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/suspend.h>
 #include <linux/thermal.h>
 
-#include "../thermal_core.h"
+#include "drivers/thermal/thermal_core.h"
+#include "drivers/thermal/thermal_hwmon.h"
 
 #define QPNP_TM_REG_DIG_MINOR		0x00
 #define QPNP_TM_REG_DIG_MAJOR		0x01
@@ -62,17 +61,17 @@
 
 /* Over-temperature trip point values in mC */
 static const long temp_map_gen1[THRESH_COUNT][STAGE_COUNT] = {
-	{105000, 125000, 145000},
-	{110000, 130000, 150000},
-	{115000, 135000, 155000},
-	{120000, 140000, 160000},
+	{ 105000, 125000, 145000 },
+	{ 110000, 130000, 150000 },
+	{ 115000, 135000, 155000 },
+	{ 120000, 140000, 160000 },
 };
 
 static const long temp_map_gen2_v1[THRESH_COUNT][STAGE_COUNT] = {
-	{ 90000, 110000, 140000},
-	{ 95000, 115000, 145000},
-	{100000, 120000, 150000},
-	{105000, 125000, 155000},
+	{  90000, 110000, 140000 },
+	{  95000, 115000, 145000 },
+	{ 100000, 120000, 150000 },
+	{ 105000, 125000, 155000 },
 };
 
 #define TEMP_THRESH_STEP		5000 /* Threshold step: 5 C */
@@ -126,8 +125,8 @@ struct qpnp_tm_chip {
 	long				temp;
 	unsigned int			thresh;
 	unsigned int			stage;
-	unsigned int			prev_stage;
 	unsigned int			base;
+	unsigned int			ntrips;
 	int				irq;
 	/* protects .thresh, .stage and chip registers */
 	struct mutex			lock;
@@ -178,8 +177,8 @@ static long qpnp_tm_decode_temp(struct qpnp_tm_chip *chip, unsigned int stage)
 		return chip->temp_dac_map[stage - 1];
 	}
 
-	if (!chip->temp_map || chip->thresh >= THRESH_COUNT || stage == 0
-	    || stage > STAGE_COUNT)
+	if (!chip->temp_map || chip->thresh >= THRESH_COUNT || stage == 0 ||
+	    stage > STAGE_COUNT)
 		return 0;
 
 	return (*chip->temp_map)[chip->thresh][stage - 1];
@@ -255,10 +254,10 @@ static int qpnp_tm_update_temp_no_adc(struct qpnp_tm_chip *chip)
 	return 0;
 }
 
-static int qpnp_tm_get_temp(void *data, int *temp)
+static int qpnp_tm_get_temp(struct thermal_zone_device *tz, int *temp)
 {
-	struct qpnp_tm_chip *chip = data;
-	int ret, mili_celsius, stage, stage_temp_min;
+	struct qpnp_tm_chip *chip = thermal_zone_device_priv(tz);
+	int ret, mili_celsius;
 
 	if (!temp)
 		return -EINVAL;
@@ -275,26 +274,9 @@ static int qpnp_tm_get_temp(void *data, int *temp)
 		if (ret < 0)
 			return ret;
 	} else {
-		mutex_lock(&chip->lock);
-		stage = qpnp_tm_get_temp_stage(chip);
-		if (stage < 0) {
-			mutex_unlock(&chip->lock);
-			return stage;
-		}
-		if (chip->subtype != QPNP_TM_SUBTYPE_GEN1)
-			stage = alarm_state_map[stage];
-		stage_temp_min = qpnp_tm_decode_temp(chip, stage);
-		mutex_unlock(&chip->lock);
-
 		ret = iio_read_channel_processed(chip->adc, &mili_celsius);
 		if (ret < 0)
 			return ret;
-
-		if (stage_temp_min > mili_celsius && stage_temp_min > 0) {
-			dev_dbg(chip->dev, "replacing ADC temp=%d with min stage[%d] temp=%d\n",
-				mili_celsius, stage, stage_temp_min);
-			mili_celsius = stage_temp_min;
-		}
 
 		chip->temp = mili_celsius;
 	}
@@ -309,6 +291,8 @@ static int qpnp_tm_set_temp_dac_thresh(struct qpnp_tm_chip *chip, int trip,
 {
 	int ret, temp_cfg;
 	u8 reg;
+
+	WARN_ON(!mutex_is_locked(&chip->lock));
 
 	if (trip < 0 || trip >= STAGE_COUNT) {
 		dev_err(chip->dev, "invalid TEMP_DAC trip = %d\n", trip);
@@ -339,6 +323,8 @@ static int qpnp_tm_set_temp_lite_thresh(struct qpnp_tm_chip *chip, int trip,
 	const long *temp_map;
 	u16 addr;
 	u8 reg, thresh;
+
+	WARN_ON(!mutex_is_locked(&chip->lock));
 
 	if (trip < 0 || trip >= STAGE_COUNT) {
 		dev_err(chip->dev, "invalid TEMP_LITE trip = %d\n", trip);
@@ -439,7 +425,8 @@ static int qpnp_tm_update_critical_trip_temp(struct qpnp_tm_chip *chip,
 			disable_s2_shutdown = true;
 		else
 			dev_warn(chip->dev,
-				 "No ADC is configured and critical temperature is above the maximum stage 2 threshold of 140 C! Configuring stage 2 shutdown at 140 C.\n");
+				 "No ADC is configured and critical temperature %d mC is above the maximum stage 2 threshold of %ld mC! Configuring stage 2 shutdown at %ld mC.\n",
+				 temp, stage2_threshold_max, stage2_threshold_max);
 	}
 
 	if (chip->subtype == QPNP_TM_SUBTYPE_GEN2) {
@@ -466,17 +453,13 @@ skip:
 	return qpnp_tm_write(chip, QPNP_TM_REG_SHUTDOWN_CTRL1, reg);
 }
 
-static int qpnp_tm_set_trip_temp(void *data, int trip, int temp)
+static int qpnp_tm_set_trip_temp(struct thermal_zone_device *tz,
+				 const struct thermal_trip *trip, int temp)
 {
-	struct qpnp_tm_chip *chip = data;
-	const struct thermal_trip *trip_points;
+	struct qpnp_tm_chip *chip = thermal_zone_device_priv(tz);
 	int ret;
 
-	trip_points = of_thermal_get_trip_points(chip->tz_dev);
-	if (!trip_points)
-		return -EINVAL;
-
-	if (trip_points[trip].type != THERMAL_TRIP_CRITICAL)
+	if (trip->type != THERMAL_TRIP_CRITICAL)
 		return 0;
 
 	mutex_lock(&chip->lock);
@@ -486,41 +469,45 @@ static int qpnp_tm_set_trip_temp(void *data, int trip, int temp)
 	return ret;
 }
 
-static const struct thermal_zone_of_device_ops qpnp_tm_sensor_ops = {
+static const struct thermal_zone_device_ops qpnp_tm_sensor_ops = {
 	.get_temp = qpnp_tm_get_temp,
 	.set_trip_temp = qpnp_tm_set_trip_temp,
 };
 
-static int qpnp_tm_set_temp_dac_trip_temp(void *data, int trip, int temp)
+static int qpnp_tm_set_temp_dac_trip_temp(struct thermal_zone_device *tz,
+					  const struct thermal_trip *trip, int temp)
 {
-	struct qpnp_tm_chip *chip = data;
+	unsigned int trip_index = THERMAL_TRIP_PRIV_TO_INT(trip->priv);
+	struct qpnp_tm_chip *chip = thermal_zone_device_priv(tz);
 	int ret;
 
 	mutex_lock(&chip->lock);
-	ret = qpnp_tm_set_temp_dac_thresh(chip, trip, temp);
+	ret = qpnp_tm_set_temp_dac_thresh(chip, trip_index, temp);
 	mutex_unlock(&chip->lock);
 
 	return ret;
 }
 
-static const struct thermal_zone_of_device_ops qpnp_tm_sensor_temp_dac_ops = {
+static const struct thermal_zone_device_ops qpnp_tm_sensor_temp_dac_ops = {
 	.get_temp = qpnp_tm_get_temp,
 	.set_trip_temp = qpnp_tm_set_temp_dac_trip_temp,
 };
 
-static int qpnp_tm_set_temp_lite_trip_temp(void *data, int trip, int temp)
+static int qpnp_tm_set_temp_lite_trip_temp(struct thermal_zone_device *tz,
+					   const struct thermal_trip *trip, int temp)
 {
-	struct qpnp_tm_chip *chip = data;
+	unsigned int trip_index = THERMAL_TRIP_PRIV_TO_INT(trip->priv);
+	struct qpnp_tm_chip *chip = thermal_zone_device_priv(tz);
 	int ret;
 
 	mutex_lock(&chip->lock);
-	ret = qpnp_tm_set_temp_lite_thresh(chip, trip, temp);
+	ret = qpnp_tm_set_temp_lite_thresh(chip, trip_index, temp);
 	mutex_unlock(&chip->lock);
 
 	return ret;
 }
 
-static const struct thermal_zone_of_device_ops qpnp_tm_sensor_temp_lite_ops = {
+static const struct thermal_zone_device_ops qpnp_tm_sensor_temp_lite_ops = {
 	.get_temp = qpnp_tm_get_temp,
 	.set_trip_temp = qpnp_tm_set_temp_lite_trip_temp,
 };
@@ -534,52 +521,29 @@ static irqreturn_t qpnp_tm_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int qpnp_tm_get_critical_trip_temp(struct qpnp_tm_chip *chip)
+/* Configure TEMP_DAC registers based on DT thermal_zone trips */
+static int qpnp_tm_temp_dac_configure_trip_temp(struct thermal_trip *trip, void *data)
 {
-	int ntrips;
-	const struct thermal_trip *trips;
-	int i;
+	struct qpnp_tm_chip *chip = data;
+	int ret;
 
-	ntrips = of_thermal_get_ntrips(chip->tz_dev);
-	if (ntrips <= 0)
-		return THERMAL_TEMP_INVALID;
+	mutex_lock(&chip->lock);
+	trip->priv = THERMAL_INT_TO_TRIP_PRIV(chip->ntrips);
+	ret = qpnp_tm_set_temp_dac_thresh(chip, chip->ntrips, trip->temperature);
+	chip->ntrips++;
+	mutex_unlock(&chip->lock);
 
-	trips = of_thermal_get_trip_points(chip->tz_dev);
-	if (!trips)
-		return THERMAL_TEMP_INVALID;
-
-	for (i = 0; i < ntrips; i++) {
-		if (of_thermal_is_trip_valid(chip->tz_dev, i) &&
-		    trips[i].type == THERMAL_TRIP_CRITICAL)
-			return trips[i].temperature;
-	}
-
-	return THERMAL_TEMP_INVALID;
+	return ret;
 }
 
-/* Configure TEMP_DAC registers based on DT thermal_zone trips */
 static int qpnp_tm_temp_dac_update_trip_temps(struct qpnp_tm_chip *chip)
 {
-	const struct thermal_trip *trips;
-	int ret, ntrips, i;
+	int ret, i;
 
-	ntrips = of_thermal_get_ntrips(chip->tz_dev);
-	/* Keep hardware defaults if no DT trips are defined. */
-	if (ntrips <= 0)
-		return 0;
-
-	trips = of_thermal_get_trip_points(chip->tz_dev);
-	if (!trips)
-		return -EINVAL;
-
-	for (i = 0; i < ntrips; i++) {
-		if (of_thermal_is_trip_valid(chip->tz_dev, i)) {
-			ret = qpnp_tm_set_temp_dac_thresh(chip, i,
-							  trips[i].temperature);
-			if (ret < 0)
-				return ret;
-		}
-	}
+	ret = thermal_zone_for_each_trip(chip->tz_dev,
+		qpnp_tm_temp_dac_configure_trip_temp, chip);
+	if (ret < 0)
+		return ret;
 
 	/* Verify that trips are strictly increasing. */
 	for (i = 1; i < STAGE_COUNT; i++) {
@@ -612,28 +576,28 @@ static int qpnp_tm_temp_dac_init(struct qpnp_tm_chip *chip)
 }
 
 /* Configure TEMP_LITE registers based on DT thermal_zone trips */
+static int qpnp_tm_temp_lite_configure_trip_temp(struct thermal_trip *trip, void *data)
+{
+	struct qpnp_tm_chip *chip = data;
+	int ret;
+
+	mutex_lock(&chip->lock);
+	trip->priv = THERMAL_INT_TO_TRIP_PRIV(chip->ntrips);
+	ret = qpnp_tm_set_temp_lite_thresh(chip, chip->ntrips, trip->temperature);
+	chip->ntrips++;
+	mutex_unlock(&chip->lock);
+
+	return ret;
+}
+
 static int qpnp_tm_temp_lite_update_trip_temps(struct qpnp_tm_chip *chip)
 {
-	const struct thermal_trip *trips;
-	int ret, ntrips, i;
+	int ret;
 
-	ntrips = of_thermal_get_ntrips(chip->tz_dev);
-	/* Keep hardware defaults if no DT trips are defined. */
-	if (ntrips <= 0)
-		return 0;
-
-	trips = of_thermal_get_trip_points(chip->tz_dev);
-	if (!trips)
-		return -EINVAL;
-
-	for (i = 0; i < ntrips; i++) {
-		if (of_thermal_is_trip_valid(chip->tz_dev, i)) {
-			ret = qpnp_tm_set_temp_lite_thresh(chip, i,
-							  trips[i].temperature);
-			if (ret < 0)
-				return ret;
-		}
-	}
+	ret = thermal_zone_for_each_trip(chip->tz_dev,
+		qpnp_tm_temp_lite_configure_trip_temp, chip);
+	if (ret < 0)
+		return ret;
 
 	/* Verify that trips are strictly increasing. */
 	if (chip->temp_dac_map[2] <= chip->temp_dac_map[0]) {
@@ -710,15 +674,28 @@ static int qpnp_tm_init(struct qpnp_tm_chip *chip)
 		chip->temp = qpnp_tm_decode_temp(chip, stage);
 
 	if (chip->subtype == QPNP_TM_SUBTYPE_LITE) {
+		chip->ntrips = 0;
+		mutex_unlock(&chip->lock);
 		ret = qpnp_tm_temp_lite_update_trip_temps(chip);
 		if (ret < 0)
-			goto out;
+			return ret;
+		mutex_lock(&chip->lock);
 	} else if (chip->has_temp_dac) {
+		chip->ntrips = 0;
+		mutex_unlock(&chip->lock);
 		ret = qpnp_tm_temp_dac_update_trip_temps(chip);
 		if (ret < 0)
-			goto out;
+			return ret;
+		mutex_lock(&chip->lock);
 	} else {
-		crit_temp = qpnp_tm_get_critical_trip_temp(chip);
+		mutex_unlock(&chip->lock);
+
+		ret = thermal_zone_get_crit_temp(chip->tz_dev, &crit_temp);
+		if (ret)
+			crit_temp = THERMAL_TEMP_INVALID;
+
+		mutex_lock(&chip->lock);
+
 		ret = qpnp_tm_update_critical_trip_temp(chip, crit_temp);
 		if (ret < 0)
 			goto out;
@@ -739,7 +716,7 @@ static int qpnp_tm_probe(struct platform_device *pdev)
 {
 	struct qpnp_tm_chip *chip;
 	struct device_node *node;
-	const struct thermal_zone_of_device_ops *ops;
+	const struct thermal_zone_device_ops *ops;
 	u8 type, subtype, dig_major, dig_minor;
 	u32 res;
 	int ret;
@@ -779,22 +756,19 @@ static int qpnp_tm_probe(struct platform_device *pdev)
 	chip->base = res;
 
 	ret = qpnp_tm_read(chip, QPNP_TM_REG_TYPE, &type);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "could not read type\n");
-		return ret;
-	}
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret,
+				     "could not read type\n");
 
 	ret = qpnp_tm_read(chip, QPNP_TM_REG_SUBTYPE, &subtype);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "could not read subtype\n");
-		return ret;
-	}
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret,
+				     "could not read subtype\n");
 
 	ret = qpnp_tm_read(chip, QPNP_TM_REG_DIG_MAJOR, &dig_major);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "could not read dig_major\n");
-		return ret;
-	}
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret,
+				     "could not read dig_major\n");
 
 	ret = qpnp_tm_read(chip, QPNP_TM_REG_DIG_MINOR, &dig_minor);
 	if (ret < 0) {
@@ -818,6 +792,8 @@ static int qpnp_tm_probe(struct platform_device *pdev)
 		chip->has_temp_dac = true;
 	else if (subtype == QPNP_TM_SUBTYPE_GEN2 && dig_major >= 1)
 		chip->temp_map = &temp_map_gen2_v1;
+	else if (subtype == QPNP_TM_SUBTYPE_GEN2 && dig_major == 0)
+		chip->temp_map = &temp_map_gen1;
 	else if (subtype == QPNP_TM_SUBTYPE_GEN1)
 		chip->temp_map = &temp_map_gen1;
 
@@ -840,18 +816,16 @@ static int qpnp_tm_probe(struct platform_device *pdev)
 	 * read the trip points. get_temp() returns the default temperature
 	 * before the hardware initialization is completed.
 	 */
-	chip->tz_dev = devm_thermal_zone_of_sensor_register(
-		&pdev->dev, 0, chip, ops);
-	if (IS_ERR(chip->tz_dev)) {
-		dev_err(&pdev->dev, "failed to register sensor\n");
-		return PTR_ERR(chip->tz_dev);
-	}
+	chip->tz_dev = devm_thermal_of_zone_register(&pdev->dev, 0, chip, ops);
+	if (IS_ERR(chip->tz_dev))
+		return dev_err_probe(&pdev->dev, PTR_ERR(chip->tz_dev),
+				     "failed to register sensor\n");
 
 	ret = qpnp_tm_init(chip);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "init failed\n");
-		return ret;
-	}
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret, "init failed\n");
+
+	devm_thermal_add_hwmon_sysfs(&pdev->dev, chip->tz_dev);
 
 	ret = devm_request_threaded_irq(&pdev->dev, chip->irq, NULL,
 					qpnp_tm_isr, IRQF_ONESHOT,
@@ -890,14 +864,6 @@ static int qpnp_tm_restore(struct device *dev)
 	return ret;
 }
 
-static void qpnp_tm_shutdown(struct platform_device *pdev)
-{
-	struct qpnp_tm_chip *chip = platform_get_drvdata(pdev);
-
-	if (chip->irq > 0)
-		devm_free_irq(chip->dev, chip->irq, chip);
-}
-
 static int qpnp_tm_freeze(struct device *dev)
 {
 	struct qpnp_tm_chip *chip = dev_get_drvdata(dev);
@@ -910,20 +876,16 @@ static int qpnp_tm_freeze(struct device *dev)
 
 static int qpnp_tm_suspend(struct device *dev)
 {
-#ifdef CONFIG_DEEPSLEEP
-	if (mem_sleep_current == PM_SUSPEND_MEM)
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
 		return qpnp_tm_freeze(dev);
-#endif
 
 	return 0;
 }
 
 static int qpnp_tm_resume(struct device *dev)
 {
-#ifdef CONFIG_DEEPSLEEP
-	if (mem_sleep_current == PM_SUSPEND_MEM)
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
 		return qpnp_tm_restore(dev);
-#endif
 
 	return 0;
 }
@@ -948,7 +910,6 @@ static struct platform_driver qpnp_tm_driver = {
 		.pm = &qpnp_tm_pm_ops,
 	},
 	.probe  = qpnp_tm_probe,
-	.shutdown = qpnp_tm_shutdown,
 };
 module_platform_driver(qpnp_tm_driver);
 

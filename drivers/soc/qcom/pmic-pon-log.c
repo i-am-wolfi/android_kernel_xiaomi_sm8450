@@ -2,6 +2,7 @@
 /* Copyright (c) 2020-2021, The Linux Foundation. All rights reserved. */
 /* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. */
 
+#include <linux/bitfield.h>
 #include <linux/err.h>
 #include <linux/ipc_logging.h>
 #include <linux/kernel.h>
@@ -65,6 +66,13 @@ static const char * const pmic_pon_state_label[] = {
 	[PMIC_PON_STATE_WARM_RESET]	= "WARM_RESET",
 };
 
+#define PMIC_PON_EVENT_PMIC_FAULT(bus_id, sid)	\
+				(0xf + 32 * bus_id + sid)
+#define BUS_ID_IN_FAULT_EVENT(event)	\
+	((event - PMIC_PON_EVENT_PMIC_FAULT_MIN + 1) / 32)
+#define SID_IN_FAULT_EVENT(event)	\
+	((event - PMIC_PON_EVENT_PMIC_FAULT_MIN + 1) % 32)
+
 enum pmic_pon_event {
 	PMIC_PON_EVENT_PON_TRIGGER_RECEIVED	= 0x01,
 	PMIC_PON_EVENT_OTP_COPY_COMPLETE	= 0x02,
@@ -75,26 +83,14 @@ enum pmic_pon_event {
 	PMIC_PON_EVENT_RESET_TYPE		= 0x07,
 	PMIC_PON_EVENT_WARM_RESET_COUNT		= 0x08,
 	PMIC_PON_EVENT_FAULT_REASON_1_2		= 0x09,
-	PMIC_PON_EVENT_FAULT_REASON_3		= 0x0A,
+	PMIC_PON_EVENT_FAULT_REASON_3_4		= 0x0A,
 	PMIC_PON_EVENT_PBS_PC_DURING_FAULT	= 0x0B,
 	PMIC_PON_EVENT_FUNDAMENTAL_RESET	= 0x0C,
 	PMIC_PON_EVENT_PON_SEQ_START		= 0x0D,
 	PMIC_PON_EVENT_PON_SUCCESS		= 0x0E,
 	PMIC_PON_EVENT_WAITING_ON_PSHOLD	= 0x0F,
-	PMIC_PON_EVENT_PMIC_SID1_FAULT		= 0x10,
-	PMIC_PON_EVENT_PMIC_SID2_FAULT		= 0x11,
-	PMIC_PON_EVENT_PMIC_SID3_FAULT		= 0x12,
-	PMIC_PON_EVENT_PMIC_SID4_FAULT		= 0x13,
-	PMIC_PON_EVENT_PMIC_SID5_FAULT		= 0x14,
-	PMIC_PON_EVENT_PMIC_SID6_FAULT		= 0x15,
-	PMIC_PON_EVENT_PMIC_SID7_FAULT		= 0x16,
-	PMIC_PON_EVENT_PMIC_SID8_FAULT		= 0x17,
-	PMIC_PON_EVENT_PMIC_SID9_FAULT		= 0x18,
-	PMIC_PON_EVENT_PMIC_SID10_FAULT		= 0x19,
-	PMIC_PON_EVENT_PMIC_SID11_FAULT		= 0x1A,
-	PMIC_PON_EVENT_PMIC_SID12_FAULT		= 0x1B,
-	PMIC_PON_EVENT_PMIC_SID13_FAULT		= 0x1C,
-	PMIC_PON_EVENT_PMIC_VREG_READY_CHECK	= 0x20,
+	PMIC_PON_EVENT_PMIC_FAULT_MIN		= PMIC_PON_EVENT_PMIC_FAULT(0, 1),
+	PMIC_PON_EVENT_PMIC_FAULT_MAX		= PMIC_PON_EVENT_PMIC_FAULT(3, 31),
 };
 
 enum pmic_pon_reset_type {
@@ -123,7 +119,7 @@ static const char * const pmic_pon_fault_reason1[8] = {
 static const char * const pmic_pon_fault_reason2[8] = {
 	[0] = "UNKNOWN(0)",
 	[1] = "UNKNOWN(1)",
-	[2] = "UNKNOWN(2)",
+	[2] = "PMIC_RB",
 	[3] = "FAULT_N",
 	[4] = "FAULT_WATCHDOG",
 	[5] = "PBS_NACK",
@@ -140,6 +136,17 @@ static const char * const pmic_pon_fault_reason3[8] = {
 	[5] = "GP_FAULT9",
 	[6] = "GP_FAULT10",
 	[7] = "GP_FAULT11",
+};
+
+static const char *const pmic_pon_fault_reason4[8] = {
+	[0] = "V1P2_SYS_OK",
+	[1] = "PVDD_OK",
+	[2] = "CBOOST_OK",
+	[3] = "RAW_UVLO_LV_RB",
+	[4] = "RAW_UVLO_RB",
+	[5] = "RAW_OVLO_RB",
+	[6] = "RAW_OVLO_LV_RB",
+	[7] = "UNKNOWN(7)",
 };
 
 static const char * const pmic_pon_s3_reset_reason[8] = {
@@ -181,6 +188,8 @@ static const struct pmic_pon_trigger_mapping pmic_pon_pon_trigger_map[] = {
 	/* PMX75 USB PON trigger */
 	{0x18A0, "USB_CHARGER"},
 	{0x18C0, "PMIC_SID1_GPIO5"},
+	{0x18F0, "PON_PBS_CBLPWR1_RSN"},
+	{0x1910, "PON_PBS_CBLPWR2_RSN"},
 	/* PMI632 USB PON trigger */
 	{0x2763, "USB_CHARGER"},
 	/* PM8350B USB PON trigger */
@@ -189,6 +198,7 @@ static const struct pmic_pon_trigger_mapping pmic_pon_pon_trigger_map[] = {
 	/* PM7550BA USB PON trigger */
 	{0x71C2, "USB_CHARGER"},
 	/* PM7250B USB PON trigger */
+	{0x81C2, "PON_PBS_SYS_OK_RSN_PORT2"},
 	{0x8732, "USB_CHARGER"},
 };
 
@@ -201,6 +211,7 @@ static const struct pmic_pon_trigger_mapping pmic_pon_reset_trigger_map[] = {
 	{0x0085, "SW_RESET"},
 	{0x0086, "RESIN_N_DEBOUNCE"},
 	{0x0087, "KPDPWR_N_DEBOUNCE"},
+	{0x01A4, "PON_PBS_LANDO_OCP_RSN"},
 	{0x21E3, "PMIC_SID2_BCL_ALARM"},
 	{0x31F5, "PMIC_SID3_BCL_ALARM"},
 	{0x11D0, "PMIC_SID1_OCP"},
@@ -214,27 +225,22 @@ static const enum pmic_pon_event pmic_pon_important_events[] = {
 	PMIC_PON_EVENT_RESET_TRIGGER_RECEIVED,
 	PMIC_PON_EVENT_RESET_TYPE,
 	PMIC_PON_EVENT_FAULT_REASON_1_2,
-	PMIC_PON_EVENT_FAULT_REASON_3,
+	PMIC_PON_EVENT_FAULT_REASON_3_4,
 	PMIC_PON_EVENT_FUNDAMENTAL_RESET,
-	PMIC_PON_EVENT_PMIC_SID1_FAULT,
-	PMIC_PON_EVENT_PMIC_SID2_FAULT,
-	PMIC_PON_EVENT_PMIC_SID3_FAULT,
-	PMIC_PON_EVENT_PMIC_SID4_FAULT,
-	PMIC_PON_EVENT_PMIC_SID5_FAULT,
-	PMIC_PON_EVENT_PMIC_SID6_FAULT,
-	PMIC_PON_EVENT_PMIC_SID7_FAULT,
-	PMIC_PON_EVENT_PMIC_SID8_FAULT,
-	PMIC_PON_EVENT_PMIC_SID9_FAULT,
-	PMIC_PON_EVENT_PMIC_SID10_FAULT,
-	PMIC_PON_EVENT_PMIC_SID11_FAULT,
-	PMIC_PON_EVENT_PMIC_SID12_FAULT,
-	PMIC_PON_EVENT_PMIC_SID13_FAULT,
-	PMIC_PON_EVENT_PMIC_VREG_READY_CHECK,
 };
+
+static bool pmic_pon_event_is_secondary_fault(u8 event)
+{
+	return event >= PMIC_PON_EVENT_PMIC_FAULT_MIN &&
+			event <= PMIC_PON_EVENT_PMIC_FAULT_MAX;
+}
 
 static bool pmic_pon_entry_is_important(const struct pmic_pon_log_entry *entry)
 {
 	int i;
+
+	if (pmic_pon_event_is_secondary_fault(entry->event))
+		return true;
 
 	for (i = 0; i < ARRAY_SIZE(pmic_pon_important_events); i++)
 		if (entry->event == pmic_pon_important_events[i])
@@ -299,12 +305,18 @@ static int pmic_pon_log_print_reason(char *buf, int buf_size, u8 data,
 
 #define BUF_SIZE 128
 
+#define IRQ_FIELD		GENMASK(2, 0)
+#define SID_MSB_FIELD		BIT(3)		/* SID bit[4] */
+#define PID_FIELD		GENMASK(11, 4)
+#define SID_LSB_FIELD		GENMASK(15, 12) /* SID bit[3:0] */
+
 static int pmic_pon_log_parse_entry(const struct pmic_pon_log_entry *entry,
 		void *ipc_log)
 {
 	char buf[BUF_SIZE];
 	const char *label = NULL;
 	bool is_important;
+	u8 sid, pid, irq;
 	int pos = 0;
 	int i;
 	u16 data;
@@ -327,10 +339,13 @@ static int pmic_pon_log_parse_entry(const struct pmic_pon_log_entry *entry,
 			pos += scnprintf(buf + pos, BUF_SIZE - pos, "%s",
 					 label);
 		} else {
+			irq = FIELD_GET(IRQ_FIELD, data);
+			pid = FIELD_GET(PID_FIELD, data);
+			sid = FIELD_GET(SID_MSB_FIELD, data) << 4 |
+				FIELD_GET(SID_LSB_FIELD, data);
 			pos += scnprintf(buf + pos, BUF_SIZE - pos,
 					 "SID=0x%X, PID=0x%02X, IRQ=0x%X",
-					 entry->data1 >> 4, (data >> 4) & 0xFF,
-					 entry->data0 & 0x7);
+					 sid, pid, irq);
 		}
 		break;
 	case PMIC_PON_EVENT_OTP_COPY_COMPLETE:
@@ -362,10 +377,13 @@ static int pmic_pon_log_parse_entry(const struct pmic_pon_log_entry *entry,
 			pos += scnprintf(buf + pos, BUF_SIZE - pos, "%s",
 					 label);
 		} else {
+			irq = FIELD_GET(IRQ_FIELD, data);
+			pid = FIELD_GET(PID_FIELD, data);
+			sid = FIELD_GET(SID_MSB_FIELD, data) << 4 |
+				FIELD_GET(SID_LSB_FIELD, data);
 			pos += scnprintf(buf + pos, BUF_SIZE - pos,
 					 "SID=0x%X, PID=0x%02X, IRQ=0x%X",
-					 entry->data1 >> 4, (data >> 4) & 0xFF,
-					 entry->data0 & 0x7);
+					 sid, pid, irq);
 		}
 		break;
 	case PMIC_PON_EVENT_RESET_TYPE:
@@ -400,12 +418,23 @@ static int pmic_pon_log_parse_entry(const struct pmic_pon_log_entry *entry,
 					pmic_pon_fault_reason2);
 		}
 		break;
-	case PMIC_PON_EVENT_FAULT_REASON_3:
-		if (!entry->data0)
+	case PMIC_PON_EVENT_FAULT_REASON_3_4:
+		if (!entry->data0 && !entry->data1)
 			is_important = false;
 		pos += scnprintf(buf + pos, BUF_SIZE - pos, "FAULT_REASON3=");
 		pos += pmic_pon_log_print_reason(buf + pos, BUF_SIZE - pos,
 					entry->data0, pmic_pon_fault_reason3);
+		/*
+		 * Byte-1 stores Fault_Reason4 in PMH0101. If the register value is 0,
+		 * it means there is no fault. If the register value is non-zero,
+		 * any bit with a value of 0 indicates a fault, so we invert the bits
+		 * with ~ before passing to pmic_pon_log_print_reason().
+		 */
+		if (!entry->data1)
+			break;
+		pos += scnprintf(buf + pos, BUF_SIZE - pos, "; FAULT_REASON4=");
+		pos += pmic_pon_log_print_reason(buf + pos, BUF_SIZE - pos,
+					~entry->data1 & 0x7f, pmic_pon_fault_reason4);
 		break;
 	case PMIC_PON_EVENT_PBS_PC_DURING_FAULT:
 		scnprintf(buf, BUF_SIZE, "PBS PC at Fault: 0x%04X", data);
@@ -442,11 +471,12 @@ static int pmic_pon_log_parse_entry(const struct pmic_pon_log_entry *entry,
 	case PMIC_PON_EVENT_WAITING_ON_PSHOLD:
 		scnprintf(buf, BUF_SIZE, "Waiting on PS_HOLD");
 		break;
-	case PMIC_PON_EVENT_PMIC_SID1_FAULT ... PMIC_PON_EVENT_PMIC_SID13_FAULT:
+	case PMIC_PON_EVENT_PMIC_FAULT_MIN ... PMIC_PON_EVENT_PMIC_FAULT_MAX:
 		if (!entry->data0 && !entry->data1)
 			is_important = false;
-		pos += scnprintf(buf + pos, BUF_SIZE - pos, "PMIC SID%u ",
-			entry->event - PMIC_PON_EVENT_PMIC_SID1_FAULT + 1);
+		pos += scnprintf(buf + pos, BUF_SIZE - pos, "PMIC bus%u SID%u ",
+					BUS_ID_IN_FAULT_EVENT(entry->event),
+					SID_IN_FAULT_EVENT(entry->event));
 		if (entry->data0 || !is_important) {
 			pos += scnprintf(buf + pos, BUF_SIZE - pos,
 					"FAULT_REASON1=");
@@ -463,12 +493,6 @@ static int pmic_pon_log_parse_entry(const struct pmic_pon_log_entry *entry,
 					BUF_SIZE - pos, entry->data1,
 					pmic_pon_fault_reason2);
 		}
-		break;
-	case PMIC_PON_EVENT_PMIC_VREG_READY_CHECK:
-		if (!data)
-			is_important = false;
-		scnprintf(buf, BUF_SIZE, "VREG Check: %sVREG_FAULT detected",
-			data ? "" : "No ");
 		break;
 	default:
 		scnprintf(buf, BUF_SIZE, "Unknown Event (0x%02X): data=0x%04X",
@@ -614,30 +638,35 @@ static void pmic_pon_log_fault_panic(struct pmic_pon_log_dev *pon_dev)
 				panic("PMIC SID0 FAULT; FAULT_REASON2=%s", buf);
 			}
 			break;
-		case PMIC_PON_EVENT_FAULT_REASON_3:
+		case PMIC_PON_EVENT_FAULT_REASON_3_4:
 			if (pon_dev->log[i].data0) {
 				pmic_pon_log_print_reason(buf, BUF_SIZE,
 							pon_dev->log[i].data0,
 							pmic_pon_fault_reason3);
 				panic("PMIC SID0 FAULT; FAULT_REASON3=%s", buf);
+			} else if (pon_dev->log[i].data1) {
+				pmic_pon_log_print_reason(buf, BUF_SIZE,
+							~pon_dev->log[i].data1 & 0x7f,
+							pmic_pon_fault_reason4);
+				panic("PMIC SID0 FAULT; FAULT_REASON4=%s", buf);
 			}
 			break;
-		case PMIC_PON_EVENT_PMIC_SID1_FAULT ... PMIC_PON_EVENT_PMIC_SID13_FAULT:
+		case PMIC_PON_EVENT_PMIC_FAULT_MIN ... PMIC_PON_EVENT_PMIC_FAULT_MAX:
 			if (pon_dev->log[i].data0) {
 				pmic_pon_log_print_reason(buf, BUF_SIZE,
 							pon_dev->log[i].data0,
 							pmic_pon_fault_reason1);
-				panic("PMIC SID%u FAULT; FAULT_REASON1=%s",
-					pon_dev->log[i].event -
-					    PMIC_PON_EVENT_PMIC_SID1_FAULT + 1,
+				panic("PMIC bus%u SID%u FAULT; FAULT_REASON1=%s",
+					BUS_ID_IN_FAULT_EVENT(pon_dev->log[i].event),
+					SID_IN_FAULT_EVENT(pon_dev->log[i].event),
 					buf);
 			} else if (pon_dev->log[i].data1 & mask) {
 				pmic_pon_log_print_reason(buf, BUF_SIZE,
 							pon_dev->log[i].data1,
 							pmic_pon_fault_reason2);
-				panic("PMIC SID%u FAULT; FAULT_REASON2=%s",
-					pon_dev->log[i].event -
-					    PMIC_PON_EVENT_PMIC_SID1_FAULT + 1,
+				panic("PMIC bus%u SID%u FAULT; FAULT_REASON2=%s",
+					BUS_ID_IN_FAULT_EVENT(pon_dev->log[i].event),
+					SID_IN_FAULT_EVENT(pon_dev->log[i].event),
 					buf);
 			}
 			break;
@@ -725,13 +754,11 @@ static int pmic_pon_log_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int pmic_pon_log_remove(struct platform_device *pdev)
+static void pmic_pon_log_remove(struct platform_device *pdev)
 {
 	struct pmic_pon_log_dev *pon_dev = platform_get_drvdata(pdev);
 
 	ipc_log_context_destroy(pon_dev->ipc_log);
-
-	return 0;
 }
 
 static const struct of_device_id pmic_pon_log_of_match[] = {
@@ -751,4 +778,4 @@ static struct platform_driver pmic_pon_log_driver = {
 module_platform_driver(pmic_pon_log_driver);
 
 MODULE_DESCRIPTION("QTI PMIC PON log driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

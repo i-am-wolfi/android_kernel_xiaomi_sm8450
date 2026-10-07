@@ -89,13 +89,14 @@ static int cm3323_init(struct iio_dev *indio_dev)
 
 	/* enable sensor and set auto force mode */
 	ret &= ~(CM3323_CONF_SD_BIT | CM3323_CONF_AF_BIT);
-	data->reg_conf = ret;
 
-	ret = i2c_smbus_write_word_data(data->client, CM3323_CMD_CONF, data->reg_conf);
+	ret = i2c_smbus_write_word_data(data->client, CM3323_CMD_CONF, ret);
 	if (ret < 0) {
 		dev_err(&data->client->dev, "Error writing reg_conf\n");
 		return ret;
 	}
+
+	data->reg_conf = ret;
 
 	return 0;
 }
@@ -213,8 +214,7 @@ static const struct iio_info cm3323_info = {
 	.attrs		= &cm3323_attribute_group,
 };
 
-static int cm3323_probe(struct i2c_client *client,
-			const struct i2c_device_id *id)
+static int cm3323_probe(struct i2c_client *client)
 {
 	struct cm3323_data *data;
 	struct iio_dev *indio_dev;
@@ -250,14 +250,21 @@ static int cm3323_probe(struct i2c_client *client,
 }
 
 static const struct i2c_device_id cm3323_id[] = {
-	{"cm3323", 0},
+	{ "cm3323" },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, cm3323_id);
 
+static const struct of_device_id cm3323_of_match[] = {
+	{ .compatible = "capella,cm3323", },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, cm3323_of_match);
+
 static struct i2c_driver cm3323_driver = {
 	.driver = {
 		.name = CM3323_DRV_NAME,
+		.of_match_table = cm3323_of_match,
 	},
 	.probe		= cm3323_probe,
 	.id_table	= cm3323_id,

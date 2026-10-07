@@ -193,8 +193,7 @@ int nfc_llcp_parse_gb_tlv(struct nfc_llcp_local *local,
 			  const u8 *tlv_array, u16 tlv_array_len)
 {
 	const u8 *tlv = tlv_array;
-	u8 type, length;
-	u16 offset = 0;
+	u8 type, length, offset = 0;
 
 	pr_debug("TLV array length %d\n", tlv_array_len);
 
@@ -202,14 +201,8 @@ int nfc_llcp_parse_gb_tlv(struct nfc_llcp_local *local,
 		return -ENODEV;
 
 	while (offset < tlv_array_len) {
-		if (offset + 2 > tlv_array_len)
-			return -EINVAL;
-
 		type = tlv[0];
 		length = tlv[1];
-
-		if (offset + 2 + length > tlv_array_len)
-			return -EINVAL;
 
 		pr_debug("type 0x%x length %d\n", type, length);
 
@@ -250,8 +243,7 @@ int nfc_llcp_parse_connection_tlv(struct nfc_llcp_sock *sock,
 				  const u8 *tlv_array, u16 tlv_array_len)
 {
 	const u8 *tlv = tlv_array;
-	u8 type, length;
-	u16 offset = 0;
+	u8 type, length, offset = 0;
 
 	pr_debug("TLV array length %d\n", tlv_array_len);
 
@@ -259,14 +251,8 @@ int nfc_llcp_parse_connection_tlv(struct nfc_llcp_sock *sock,
 		return -ENOTCONN;
 
 	while (offset < tlv_array_len) {
-		if (offset + 2 > tlv_array_len)
-			return -EINVAL;
-
 		type = tlv[0];
 		length = tlv[1];
-
-		if (offset + 2 + length > tlv_array_len)
-			return -EINVAL;
 
 		pr_debug("type 0x%x length %d\n", type, length);
 
@@ -351,8 +337,6 @@ int nfc_llcp_send_disconnect(struct nfc_llcp_sock *sock)
 	struct nfc_dev *dev;
 	struct nfc_llcp_local *local;
 
-	pr_debug("Sending DISC\n");
-
 	local = sock->local;
 	if (local == NULL)
 		return -ENODEV;
@@ -376,8 +360,6 @@ int nfc_llcp_send_symm(struct nfc_dev *dev)
 	struct nfc_llcp_local *local;
 	u16 size = 0;
 	int err;
-
-	pr_debug("Sending SYMM\n");
 
 	local = nfc_llcp_find_local(dev);
 	if (local == NULL)
@@ -419,8 +401,6 @@ int nfc_llcp_send_connect(struct nfc_llcp_sock *sock)
 	int err;
 	u16 size = 0;
 	__be16 miux;
-
-	pr_debug("Sending CONNECT\n");
 
 	local = sock->local;
 	if (local == NULL)
@@ -495,8 +475,6 @@ int nfc_llcp_send_cc(struct nfc_llcp_sock *sock)
 	int err;
 	u16 size = 0;
 	__be16 miux;
-
-	pr_debug("Sending CC\n");
 
 	local = sock->local;
 	if (local == NULL)

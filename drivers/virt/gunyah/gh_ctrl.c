@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "gunyah: " fmt
@@ -11,13 +12,16 @@
 #include <linux/kobject.h>
 #include <linux/of.h>
 #include <linux/printk.h>
+#include <linux/sched_clock.h>
 #include <linux/slab.h>
+#include <linux/gunyah.h>
 #include <linux/gunyah/gh_errno.h>
+#include <linux/gunyah/gh_ctrl.h>
 #include "hcall_ctrl.h"
 
 #define QC_HYP_SMCCC_CALL_UID                                                  \
 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, ARM_SMCCC_SMC_32,              \
-			   ARM_SMCCC_OWNER_VENDOR_HYP, 0xff01)
+			   ARM_SMCCC_OWNER_VENDOR_HYP, 0x3f01)
 #define QC_HYP_SMCCC_REVISION                                                  \
 	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, ARM_SMCCC_SMC_32,              \
 			   ARM_SMCCC_OWNER_VENDOR_HYP, 0xff03)
@@ -26,6 +30,17 @@
 #define QC_HYP_UID1 0x0b37571b
 #define QC_HYP_UID2 0x946f609b
 #define QC_HYP_UID3 0x54539de6
+
+#define QC_HYP1_UID0 0xbd54bd19
+#define QC_HYP1_UID1 0x1b57370b
+#define QC_HYP1_UID2 0x9b606f94
+#define QC_HYP1_UID3 0xe69d5354
+
+/* Use */
+#undef GH_API_INFO_API_VERSION
+#undef GH_API_INFO_BIG_ENDIAN
+#undef GH_API_INFO_IS_64BIT
+#undef GH_API_INFO_VARIANT
 
 #define GH_API_INFO_API_VERSION(x)	(((x) >> 0) & 0x3fff)
 #define GH_API_INFO_BIG_ENDIAN(x)	(((x) >> 14) & 1)
@@ -77,11 +92,42 @@ static const struct attribute_group version_group = {
 	.attrs = version_attrs,
 };
 
+void gh_get_virt_time_offset(struct gh_virt_time_offset *virt_time_offset)
+{
+	struct clock_read_data *rd;
+	unsigned int seq = 0;
+	u64 ns;
+
+	do {
+		rd = sched_clock_read_begin(&seq);
+		ns = mul_u64_u32_shr(rd->epoch_cyc, rd->mult, rd->shift);
+		virt_time_offset->offset = ns - rd->epoch_ns;
+		virt_time_offset->ns = rd->epoch_ns;
+	} while (sched_clock_read_retry(seq));
+}
+EXPORT_SYMBOL_GPL(gh_get_virt_time_offset);
+
+static ssize_t virt_time_offset_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buffer)
+{
+	struct gh_virt_time_offset virt_time_offset;
+
+	gh_get_virt_time_offset(&virt_time_offset);
+
+	return scnprintf(buffer, PAGE_SIZE, "%llu\n", virt_time_offset.offset);
+}
+static struct kobj_attribute virt_time_offset_attr =
+	__ATTR_RO(virt_time_offset);
+
 static int __init gh_sysfs_register(void)
 {
 	int ret;
 
 	ret = sysfs_create_file(hypervisor_kobj, &type_attr.attr);
+	if (ret)
+		return ret;
+
+	ret = sysfs_create_file(hypervisor_kobj, &virt_time_offset_attr.attr);
 	if (ret)
 		return ret;
 
@@ -217,16 +263,7 @@ static inline int gh_dbgfs_unregister(void) { return 0; }
 static int __init gh_ctrl_init(void)
 {
 	int ret;
-	struct device_node *hyp;
 	struct arm_smccc_res res;
-
-	hyp = of_find_node_by_path("/hypervisor");
-
-	if (!hyp || (!of_device_is_compatible(hyp, "qcom,gunyah-hypervisor") &&
-		     !of_device_is_compatible(hyp, "qcom,haven-hypervisor"))) {
-		pr_err("gunyah-hypervisor or haven-hypervisor node not present\n");
-		return 0;
-	}
 
 	(void)gh_hcall_hyp_identify(&gunyah_api);
 
@@ -239,6 +276,9 @@ static int __init gh_ctrl_init(void)
 	arm_smccc_1_1_smc(QC_HYP_SMCCC_CALL_UID, &res);
 	if ((res.a0 == QC_HYP_UID0) && (res.a1 == QC_HYP_UID1) &&
 	    (res.a2 == QC_HYP_UID2) && (res.a3 == QC_HYP_UID3))
+		qc_hyp_calls = true;
+	else if ((res.a0 == QC_HYP1_UID0) && (res.a1 == QC_HYP1_UID1) &&
+	    (res.a2 == QC_HYP1_UID2) && (res.a3 == QC_HYP1_UID3))
 		qc_hyp_calls = true;
 
 	if (qc_hyp_calls) {
@@ -264,5 +304,5 @@ static void __exit gh_ctrl_exit(void)
 }
 module_exit(gh_ctrl_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. Gunyah Hypervisor Control Driver");

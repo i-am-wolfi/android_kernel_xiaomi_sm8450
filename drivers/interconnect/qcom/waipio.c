@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  */
 
@@ -1770,6 +1771,8 @@ static struct qcom_icc_node qns_mem_noc_hf = {
 	.id = SLAVE_MNOC_HF_MEM_NOC,
 	.channels = 2,
 	.buswidth = 32,
+	.init_peak = INT_MAX,
+	.init_avg  = INT_MAX,
 	.noc_ops = &qcom_qnoc4_ops,
 	.num_links = 1,
 	.links = { MASTER_MNOC_HF_MEM_NOC },
@@ -1818,6 +1821,8 @@ static struct qcom_icc_node qns_pcie_mem_noc = {
 	.id = SLAVE_ANOC_PCIE_GEM_NOC,
 	.channels = 1,
 	.buswidth = 16,
+	.init_peak = INT_MAX,
+	.init_avg  = INT_MAX,
 	.noc_ops = &qcom_qnoc4_ops,
 	.num_links = 1,
 	.links = { MASTER_ANOC_PCIE_GEM_NOC },
@@ -1971,7 +1976,6 @@ static struct qcom_icc_bcm bcm_mc0 = {
 static struct qcom_icc_bcm bcm_mm0 = {
 	.name = "MM0",
 	.voter_idx = 0,
-	.keepalive_early = true,
 	.num_nodes = 1,
 	.nodes = { &qns_mem_noc_hf },
 };
@@ -2531,6 +2535,8 @@ static int qnoc_probe(struct platform_device *pdev)
 	ret = qcom_icc_rpmh_probe(pdev);
 	if (ret)
 		dev_err(&pdev->dev, "failed to register ICC provider\n");
+	else
+		dev_info(&pdev->dev, "Registered WAIPIO ICC\n");
 
 	return ret;
 }
@@ -2568,7 +2574,7 @@ static struct platform_driver qnoc_driver = {
 	.driver = {
 		.name = "qnoc-waipio",
 		.of_match_table = qnoc_of_match,
-		.sync_state = qcom_icc_rpmh_sync_state,
+		.sync_state = icc_sync_state,
 	},
 };
 
@@ -2579,4 +2585,4 @@ static int __init qnoc_driver_init(void)
 core_initcall(qnoc_driver_init);
 
 MODULE_DESCRIPTION("Waipio NoC driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

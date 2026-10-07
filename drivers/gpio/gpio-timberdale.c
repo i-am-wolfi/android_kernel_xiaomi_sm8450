@@ -228,7 +228,7 @@ static int timbgpio_probe(struct platform_device *pdev)
 
 	tgpio = devm_kzalloc(dev, sizeof(*tgpio), GFP_KERNEL);
 	if (!tgpio)
-		return -ENOMEM;
+		return -EINVAL;
 
 	tgpio->irq_base = pdata->irq_base;
 
@@ -256,8 +256,6 @@ static int timbgpio_probe(struct platform_device *pdev)
 	err = devm_gpiochip_add_data(&pdev->dev, gc, tgpio);
 	if (err)
 		return err;
-
-	platform_set_drvdata(pdev, tgpio);
 
 	/* make sure to disable interrupts */
 	iowrite32(0x0, tgpio->membase + TGPIO_IER);

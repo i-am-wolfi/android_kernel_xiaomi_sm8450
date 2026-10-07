@@ -1,20 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * NXP Wireless LAN device driver: AP event handling
  *
  * Copyright 2011-2020 NXP
- *
- * This software file (the "File") is distributed by NXP
- * under the terms of the GNU General Public License Version 2, June 1991
- * (the "License").  You may use, redistribute and/or modify this File in
- * accordance with the terms and conditions of the License, a copy of which
- * is available by writing to the Free Software Foundation, Inc.,
- * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA or on the
- * worldwide web at http://www.gnu.org/licenses/old-licenses/gpl-2.0.txt.
- *
- * THE FILE IS DISTRIBUTED AS-IS, WITHOUT WARRANTY OF ANY KIND, AND THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE
- * ARE EXPRESSLY DISCLAIMED.  The License provides additional details about
- * this warranty disclaimer.
  */
 
 #include "decl.h"
@@ -135,31 +123,11 @@ int mwifiex_process_uap_event(struct mwifiex_private *priv)
 				len = ETH_ALEN;
 
 			if (len != -1) {
-				u16 evt_len = le16_to_cpu(event->len);
-
 				sinfo->assoc_req_ies = &event->data[len];
 				len = (u8 *)sinfo->assoc_req_ies -
 				      (u8 *)&event->frame_control;
-
-				/*
-				 * event->len is reported by the device firmware
-				 * and is not otherwise validated.  Reject a
-				 * length that underflows the header, or that
-				 * would place the association request IEs
-				 * outside the fixed-size event_body[] buffer the
-				 * event was copied into; otherwise the IE walk
-				 * in mwifiex_set_sta_ht_cap() reads past
-				 * event_body and out of the adapter slab object.
-				 */
-				if (evt_len < len ||
-				    (u8 *)&event->frame_control + evt_len >
-				    adapter->event_body + MAX_EVENT_SIZE) {
-					mwifiex_dbg(adapter, ERROR,
-						    "invalid STA assoc event length\n");
-					kfree(sinfo);
-					return -1;
-				}
-				sinfo->assoc_req_ies_len = evt_len - (u16)len;
+				sinfo->assoc_req_ies_len =
+					le16_to_cpu(event->len) - (u16)len;
 			}
 		}
 		cfg80211_new_sta(priv->netdev, event->sta_addr, sinfo,
@@ -217,8 +185,7 @@ int mwifiex_process_uap_event(struct mwifiex_private *priv)
 		mwifiex_dbg(adapter, EVENT,
 			    "AP EVENT: event id: %#x\n", eventcause);
 		priv->port_open = false;
-		memcpy(priv->netdev->dev_addr, adapter->event_body + 2,
-		       ETH_ALEN);
+		eth_hw_addr_set(priv->netdev, adapter->event_body + 2);
 		if (priv->hist_data)
 			mwifiex_hist_data_reset(priv);
 		mwifiex_check_uap_capabilities(priv, adapter->event_skb);

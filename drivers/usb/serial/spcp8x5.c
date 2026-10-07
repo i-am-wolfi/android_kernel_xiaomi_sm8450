@@ -49,16 +49,6 @@ static const struct usb_device_id id_table[] = {
 };
 MODULE_DEVICE_TABLE(usb, id_table);
 
-struct spcp8x5_usb_ctrl_arg {
-	u8	type;
-	u8	cmd;
-	u8	cmd_type;
-	u16	value;
-	u16	index;
-	u16	length;
-};
-
-
 /* spcp8x5 spec register define */
 #define MCR_CONTROL_LINE_RTS		0x02
 #define MCR_CONTROL_LINE_DTR		0x01
@@ -169,14 +159,12 @@ static int spcp8x5_port_probe(struct usb_serial_port *port)
 	return 0;
 }
 
-static int spcp8x5_port_remove(struct usb_serial_port *port)
+static void spcp8x5_port_remove(struct usb_serial_port *port)
 {
 	struct spcp8x5_private *priv;
 
 	priv = usb_get_serial_port_data(port);
 	kfree(priv);
-
-	return 0;
 }
 
 static int spcp8x5_set_ctrl_line(struct usb_serial_port *port, u8 mcr)
@@ -249,6 +237,18 @@ static void spcp8x5_set_work_mode(struct usb_serial_port *port, u16 value,
 		dev_err(&port->dev, "failed to set work mode: %d\n", ret);
 }
 
+static int spcp8x5_carrier_raised(struct usb_serial_port *port)
+{
+	u8 msr;
+	int ret;
+
+	ret = spcp8x5_get_msr(port, &msr);
+	if (ret || msr & MSR_STATUS_LINE_DCD)
+		return 1;
+
+	return 0;
+}
+
 static void spcp8x5_dtr_rts(struct usb_serial_port *port, int on)
 {
 	struct spcp8x5_private *priv = usb_get_serial_port_data(port);
@@ -273,7 +273,8 @@ static void spcp8x5_init_termios(struct tty_struct *tty)
 }
 
 static void spcp8x5_set_termios(struct tty_struct *tty,
-		struct usb_serial_port *port, struct ktermios *old_termios)
+				struct usb_serial_port *port,
+				const struct ktermios *old_termios)
 {
 	struct usb_serial *serial = port->serial;
 	struct spcp8x5_private *priv = usb_get_serial_port_data(port);
@@ -451,7 +452,6 @@ static int spcp8x5_tiocmget(struct tty_struct *tty)
 
 static struct usb_serial_driver spcp8x5_device = {
 	.driver = {
-		.owner =	THIS_MODULE,
 		.name =		"SPCP8x5",
 	},
 	.id_table		= id_table,
@@ -460,6 +460,7 @@ static struct usb_serial_driver spcp8x5_device = {
 	.num_bulk_out		= 1,
 	.open			= spcp8x5_open,
 	.dtr_rts		= spcp8x5_dtr_rts,
+	.carrier_raised		= spcp8x5_carrier_raised,
 	.set_termios		= spcp8x5_set_termios,
 	.init_termios		= spcp8x5_init_termios,
 	.tiocmget		= spcp8x5_tiocmget,

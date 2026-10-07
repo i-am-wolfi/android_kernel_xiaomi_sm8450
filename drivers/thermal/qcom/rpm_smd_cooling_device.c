@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #define pr_fmt(fmt) "%s:%s " fmt, KBUILD_MODNAME, __func__
@@ -95,7 +96,7 @@ static int rpm_smd_set_cur_state(struct thermal_cooling_device *cdev,
 	int ret = 0;
 
 	if (state > (RPM_SMD_TEMP_MAX_NR - 1))
-		state = RPM_SMD_TEMP_MAX_NR - 1;
+		return -EINVAL;
 
 	ret = rpm_smd_send_request_to_rpm(rpm_smd_dev, (unsigned int)state);
 	if (ret)
@@ -120,7 +121,7 @@ static struct thermal_cooling_device_ops rpm_smd_device_ops = {
 	.set_cur_state = rpm_smd_set_cur_state,
 };
 
-static int rpm_smd_cdev_remove(struct platform_device *pdev)
+static void rpm_smd_cdev_remove(struct platform_device *pdev)
 {
 	struct rpm_smd_cdev *rpm_smd_dev =
 		(struct rpm_smd_cdev *)dev_get_drvdata(&pdev->dev);
@@ -133,8 +134,6 @@ static int rpm_smd_cdev_remove(struct platform_device *pdev)
 		rpm_smd_send_request_to_rpm(rpm_smd_dev, RPM_SMD_NORMAL);
 		msm_rpm_free_request(rpm_smd_dev->rpm_handle);
 	}
-
-	return 0;
 }
 
 static int rpm_smd_cdev_probe(struct platform_device *pdev)
@@ -162,7 +161,7 @@ static int rpm_smd_cdev_probe(struct platform_device *pdev)
 		return -ENXIO;
 	}
 
-	strlcpy(rpm_smd_dev->dev_name, np->name, THERMAL_NAME_LENGTH);
+	strscpy(rpm_smd_dev->dev_name, np->name, THERMAL_NAME_LENGTH);
 
 	/* Be pro-active and mitigate till we get first vote from TF */
 	rpm_smd_send_request_to_rpm(rpm_smd_dev, RPM_SMD_COLD);
@@ -196,5 +195,6 @@ static struct platform_driver rpm_smd_cdev_driver = {
 	.remove = rpm_smd_cdev_remove,
 };
 
-builtin_platform_driver(rpm_smd_cdev_driver);
-MODULE_LICENSE("GPL v2");
+module_platform_driver(rpm_smd_cdev_driver);
+MODULE_DESCRIPTION("RPM shared memory cooling device");
+MODULE_LICENSE("GPL");

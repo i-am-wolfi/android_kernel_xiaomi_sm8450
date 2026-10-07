@@ -711,15 +711,11 @@ static int start_streaming(struct vb2_queue *vq, unsigned int count)
 	struct pwc_device *pdev = vb2_get_drv_priv(vq);
 	int r;
 
-	if (!pdev->udev) {
-		pwc_cleanup_queued_bufs(pdev, VB2_BUF_STATE_QUEUED);
+	if (!pdev->udev)
 		return -ENODEV;
-	}
 
-	if (mutex_lock_interruptible(&pdev->v4l2_lock)) {
-		pwc_cleanup_queued_bufs(pdev, VB2_BUF_STATE_QUEUED);
+	if (mutex_lock_interruptible(&pdev->v4l2_lock))
 		return -ERESTARTSYS;
-	}
 	/* Turn on camera and set LEDS on */
 	pwc_camera_power(pdev, 1);
 	pwc_set_leds(pdev, leds[0], leds[1]);
@@ -731,11 +727,6 @@ static int start_streaming(struct vb2_queue *vq, unsigned int count)
 		pwc_camera_power(pdev, 0);
 		/* And cleanup any queued bufs!! */
 		pwc_cleanup_queued_bufs(pdev, VB2_BUF_STATE_QUEUED);
-		if (pdev->fill_buf) {
-			vb2_buffer_done(&pdev->fill_buf->vb.vb2_buf,
-					VB2_BUF_STATE_QUEUED);
-			pdev->fill_buf = NULL;
-		}
 	}
 	mutex_unlock(&pdev->v4l2_lock);
 
@@ -870,7 +861,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 	}
 	else if (vendor_id == 0x069A) {
@@ -882,7 +872,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 	}
 	else if (vendor_id == 0x046d) {
@@ -941,7 +930,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 	}
 	else if (vendor_id == 0x055d) {
@@ -967,7 +955,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 	}
 	else if (vendor_id == 0x041e) {
@@ -986,7 +973,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 	}
 	else if (vendor_id == 0x04cc) {
@@ -998,7 +984,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 	}
 	else if (vendor_id == 0x06be) {
@@ -1011,7 +996,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 
 	}
@@ -1029,7 +1013,6 @@ static int usb_pwc_probe(struct usb_interface *intf, const struct usb_device_id 
 			break;
 		default:
 			return -ENODEV;
-			break;
 		}
 	}
 	else

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/io.h>
@@ -21,6 +21,7 @@
 #include <linux/ipc_logging.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/qcom_aoss.h>
+#include <linux/suspend.h>
 
 #define QMP_MAGIC	0x4d41494c	/* MAIL */
 #define QMP_VERSION	0x1
@@ -37,16 +38,13 @@
 #define MSG_RAM_ALIGN_BYTES 3
 
 #define QMP_IPC_LOG_PAGE_CNT 2
-#define QMP_INFO(ctxt, x, ...)						    \
-	ipc_log_string(ctxt, "[%d]: %s: "x, task_pid_nr(current),	    \
-		       __func__, ##__VA_ARGS__)
+#define QMP_INFO(ctxt, x, ...)						  \
+	ipc_log_string(ctxt, "[%s]: "x, __func__, ##__VA_ARGS__)
 
 #define QMP_ERR(ctxt, x, ...)						    \
 do {									    \
-	printk_ratelimited("%s[%d]: %s: "x, KERN_ERR, task_pid_nr(current), \
-			   __func__, ##__VA_ARGS__);			    \
-	ipc_log_string(ctxt, "%s[%d]: %s: "x, "", task_pid_nr(current),     \
-		       __func__, ##__VA_ARGS__);			    \
+	printk_ratelimited("%s[%s]: "x, KERN_ERR, __func__, ##__VA_ARGS__); \
+	ipc_log_string(ctxt, "%s[%s]: "x, "", __func__, ##__VA_ARGS__);	    \
 } while (0)
 
 #ifdef CONFIG_QMP_DEBUGFS_CLIENT
@@ -138,7 +136,6 @@ struct qmp_core_version {
  * @mcore_mbox_offset:	Offset of mcore mbox from the msgram start
  * @mcore_mbox_size:	Size of the mcore mbox
  * @rx_pkt:		buffer to pass to client, holds copied data from mailbox
- * @tx_pkt:		Each mbox channel gets a pending tx entry
  * @version:		Version and features received during link negotiation
  * @local_state:	Current state of the mailbox protocol
  * @state_lock:		Serialize mailbox state changes
@@ -162,7 +159,7 @@ struct qmp_mbox {
 	u32 mcore_mbox_offset;
 	u32 mcore_mbox_size;
 	struct qmp_pkt rx_pkt;
-	struct qmp_pkt *tx_pkt;
+	struct qmp_pkt tx_pkt;
 	struct work_struct tx_work;
 
 	struct qmp_core_version version;
@@ -191,6 +188,8 @@ struct qmp_mbox {
  * @tx_irq_count:	Number of tx interrupts triggered
  * @rx_irq_count:	Number of rx interrupts received
  * @ilc:		IPC logging context
+ * @early_boot:		Early boot entry flag
+ * @suspend_entry:	Flag indicating the system is in a suspended state
  */
 struct qmp_device {
 	struct device *dev;
@@ -213,7 +212,7 @@ struct qmp_device {
 
 	void *ilc;
 	bool early_boot;
-	bool hibernate_entry;
+	bool suspend_entry;
 };
 
 /**
@@ -394,7 +393,7 @@ static int qmp_send_data(struct mbox_chan *chan, void *data)
 
 	mdev = mbox->mdev;
 
-	if (mdev->hibernate_entry)
+	if (mdev->suspend_entry)
 		return -ENXIO;
 
 	spin_lock_irqsave(&mbox->tx_lock, flags);
@@ -533,14 +532,15 @@ static irqreturn_t qmp_irq_handler(int irq, void *priv)
 {
 	struct qmp_device *mdev = (struct qmp_device *)priv;
 
-	/* QMP comes very early in cold boot, so there is
+	/*
+	 * QMP comes very early in cold boot, so there is
 	 * a chance to miss the interrupt from remote qmp.
 	 * In case of hibernate, early interrupt corrupts the
 	 * QMP state machine and endup with invalid values.
 	 * By ignore the first interrupt after hibernate exit
 	 * this can be avoided.
 	 */
-	if (mdev->hibernate_entry && mdev->early_boot)
+	if (mdev->suspend_entry && mdev->early_boot)
 		return IRQ_NONE;
 
 	if (mdev->rx_reset_reg)
@@ -805,87 +805,38 @@ static void qmp_shim_shutdown(struct mbox_chan *chan) { }
 static void qmp_shim_worker(struct work_struct *work)
 {
 	struct qmp_mbox *mbox = container_of(work, struct qmp_mbox, tx_work);
-	struct qmp_device *mdev = mbox->mdev;
-	unsigned long flags;
-	bool send;
+	struct qmp_pkt *pkt = &mbox->tx_pkt;
 	int rc;
-	int i;
 
-	for (i = 0; i < mbox->ctrl.num_chans; i++) {
-		struct qmp_pkt *pkt = &mbox->tx_pkt[i];
-
-		spin_lock_irqsave(&mbox->tx_lock, flags);
-		send = pkt->size;
-		spin_unlock_irqrestore(&mbox->tx_lock, flags);
-
-		if (!send)
-			continue;
-
-		QMP_INFO(mdev->ilc, "Calling qmp_send msg:%s\n", pkt->data);
-		rc = qmp_send(mbox->mdev->qmp, pkt->data, pkt->size);
-
-		spin_lock_irqsave(&mbox->tx_lock, flags);
-		pkt->size = 0;
-		spin_unlock_irqrestore(&mbox->tx_lock, flags);
-
-		QMP_INFO(mdev->ilc, "Calling txdone rc:%d\n", rc);
-		mbox_chan_txdone(&mbox->ctrl.chans[i], rc);
-		QMP_INFO(mdev->ilc, "Exiting txdone\n");
-	}
+	rc = qmp_send(mbox->mdev->qmp, pkt->data, pkt->size);
+	mbox_chan_txdone(&mbox->ctrl.chans[mbox->idx_in_flight], rc);
 }
 
 static int qmp_shim_send_data(struct mbox_chan *chan, void *data)
 {
-	struct qmp_mbox *mbox;
-	struct qmp_device *mdev;
+	struct qmp_mbox *mbox = chan->con_priv;
 	struct qmp_pkt *pkt = (struct qmp_pkt *)data;
-	struct qmp_pkt *defer_pkt;
-	unsigned long flags;
-	int idx = -1;
 	int i;
 
-	if (!chan || !data)
+	if (!mbox || !mbox->mdev || !data)
 		return -EINVAL;
 
-	mbox = chan->con_priv;
-
-	if (!mbox || !mbox->mdev)
-		return -EINVAL;
-
-	mdev = mbox->mdev;
-
-	if (mdev->hibernate_entry)
+	if (mbox->mdev->suspend_entry)
 		return -ENXIO;
 
 	if (pkt->size > SZ_4K)
 		return -EINVAL;
 
-	spin_lock_irqsave(&mbox->tx_lock, flags);
 	for (i = 0; i < mbox->ctrl.num_chans; i++) {
 		if (chan == &mbox->ctrl.chans[i]) {
-			idx = i;
+			mbox->idx_in_flight = i;
 			break;
 		}
 	}
-	if (idx < 0 || idx >= mbox->ctrl.num_chans) {
-		spin_unlock_irqrestore(&mbox->tx_lock, flags);
-		return -EINVAL;
-	}
 
-	defer_pkt = &mbox->tx_pkt[idx];
-
-	/* Mailbox framework should only have one packet in flight per client */
-	if (defer_pkt->size) {
-		QMP_ERR(mdev->ilc, "dropping msg:%s\n", pkt->data);
-		spin_unlock_irqrestore(&mbox->tx_lock, flags);
-		return -EINVAL;
-	}
-
-	defer_pkt->size = pkt->size;
-	memcpy(defer_pkt->data, pkt->data, pkt->size);
-	QMP_INFO(mdev->ilc, "scheduling worker to send msg:%s\n", pkt->data);
-	queue_work(system_highpri_wq, &mbox->tx_work);
-	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	mbox->tx_pkt.size = pkt->size;
+	memcpy(mbox->tx_pkt.data, pkt->data, pkt->size);
+	schedule_work(&mbox->tx_work);
 	return 0;
 }
 
@@ -971,7 +922,7 @@ static int qmp_mbox_init(struct device_node *n, struct qmp_device *mdev)
 	INIT_DELAYED_WORK(&mbox->dwork, qmp_notify_timeout);
 	mbox->suspend_flag = false;
 
-	mdev->hibernate_entry = false;
+	mdev->suspend_entry = false;
 	mdev_add_mbox(mdev, mbox);
 	return 0;
 }
@@ -1029,26 +980,18 @@ static int qmp_shim_init(struct platform_device *pdev, struct qmp_device *mdev)
 	if (!mbox)
 		return -ENOMEM;
 
+	mbox->tx_pkt.data = devm_kzalloc(mdev->dev, SZ_4K, GFP_KERNEL);
+	if (!mbox->tx_pkt.data)
+		return -ENOMEM;
+
 	num_chans = get_mbox_num_chans(pdev->dev.of_node);
 	mbox->rx_disabled = (num_chans > 1) ? true : false;
 	chans = devm_kzalloc(mdev->dev, sizeof(*chans) * num_chans, GFP_KERNEL);
 	if (!chans)
 		return -ENOMEM;
 
-	mbox->tx_pkt = devm_kzalloc(mdev->dev,
-				    sizeof(struct qmp_pkt) * num_chans,
-				    GFP_KERNEL);
-	if (!mbox->tx_pkt)
-		return -ENOMEM;
-
-	for (i = 0; i < num_chans; i++) {
-		struct qmp_pkt *pkt = &mbox->tx_pkt[i];
-
+	for (i = 0; i < num_chans; i++)
 		chans[i].con_priv = mbox;
-		pkt->data = devm_kzalloc(mdev->dev, SZ_4K, GFP_KERNEL);
-		if (!pkt->data)
-			return -ENOMEM;
-	}
 
 	mbox->ctrl.dev = mdev->dev;
 	mbox->ctrl.ops = &qmp_mbox_shim_ops;
@@ -1058,7 +1001,6 @@ static int qmp_shim_init(struct platform_device *pdev, struct qmp_device *mdev)
 	mbox->ctrl.txdone_poll = false;
 	mbox->ctrl.of_xlate = qmp_mbox_of_xlate;
 
-	spin_lock_init(&mbox->tx_lock);
 	mutex_init(&mbox->state_lock);
 	mbox->num_assigned = 0;
 	mbox->mdev = mdev;
@@ -1072,7 +1014,8 @@ static int qmp_shim_init(struct platform_device *pdev, struct qmp_device *mdev)
 	mdev_add_mbox(mdev, mbox);
 	mdev->ilc = ipc_log_context_create(QMP_IPC_LOG_PAGE_CNT, mdev->name, 0);
 
-	mdev->hibernate_entry = false;
+	mdev->suspend_entry = false;
+
 	return 0;
 }
 
@@ -1156,7 +1099,7 @@ static int qmp_edge_init(struct platform_device *pdev)
 	return 0;
 }
 
-static int qmp_mbox_remove(struct platform_device *pdev)
+static void qmp_mbox_remove(struct platform_device *pdev)
 {
 	struct qmp_device *mdev = platform_get_drvdata(pdev);
 	struct qmp_mbox *mbox = NULL;
@@ -1167,7 +1110,6 @@ static int qmp_mbox_remove(struct platform_device *pdev)
 		mbox_controller_unregister(&mbox->ctrl);
 		kfree(mbox->rx_pkt.data);
 	}
-	return 0;
 }
 
 static int qmp_mbox_probe(struct platform_device *pdev)
@@ -1227,7 +1169,7 @@ static int qmp_mbox_freeze(struct device *dev)
 {
 	struct qmp_device *mdev = dev_get_drvdata(dev);
 
-	mdev->hibernate_entry = true;
+	mdev->suspend_entry = true;
 	dev_info(dev, "QMP: Hibernate entry\n");
 	return 0;
 }
@@ -1260,17 +1202,45 @@ static int qmp_mbox_restore(struct device *dev)
 	}
 
 end:
-	if (mdev->hibernate_entry)
-		mdev->hibernate_entry = false;
+	if (mdev->suspend_entry)
+		mdev->suspend_entry = false;
 
 	dev_info(dev, "QMP: Hibernate exit\n");
+
 	return 0;
+}
+
+static int qmp_mbox_suspend_noirq(struct device *dev)
+{
+	struct qmp_device *mdev = dev_get_drvdata(dev);
+
+	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
+		mdev->suspend_entry = true;
+		dev_info(dev, "QMP: Deep sleep entry\n");
+	}
+
+	return 0;
+}
+
+static int qmp_mbox_resume_early(struct device *dev)
+{
+	int ret = 0;
+
+	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
+		ret = qmp_mbox_restore(dev);
+		dev_dbg(dev, "QMP: Deep sleep exit\n");
+	}
+
+	return ret;
 }
 
 static const struct dev_pm_ops qmp_mbox_pm_ops = {
 	.freeze_late = qmp_mbox_freeze,
 	.restore_early = qmp_mbox_restore,
+	.suspend_noirq = qmp_mbox_suspend_noirq,
+	.resume_early = qmp_mbox_resume_early,
 };
+
 static const struct of_device_id qmp_mbox_dt_match[] = {
 	{ .compatible = "qcom,qmp-mbox" },
 	{},
@@ -1288,4 +1258,4 @@ static struct platform_driver qmp_mbox_driver = {
 module_platform_driver(qmp_mbox_driver);
 
 MODULE_DESCRIPTION("MSM QTI Mailbox Protocol");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

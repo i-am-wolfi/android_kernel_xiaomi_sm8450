@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR MIT) */
 /*
  * Copyright (c) 2018 Synopsys, Inc. and/or its affiliates.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * stmmac XGMAC definitions.
  */
 
@@ -17,6 +18,7 @@
 #define XGMAC_CONFIG_SS_OFF		29
 #define XGMAC_CONFIG_SS_MASK		GENMASK(31, 29)
 #define XGMAC_CONFIG_SS_10000		(0x0 << XGMAC_CONFIG_SS_OFF)
+#define XGMAC_CONFIG_SS_25000		(0x1 << XGMAC_CONFIG_SS_OFF)
 #define XGMAC_CONFIG_SS_2500_GMII	(0x2 << XGMAC_CONFIG_SS_OFF)
 #define XGMAC_CONFIG_SS_1000_GMII	(0x3 << XGMAC_CONFIG_SS_OFF)
 #define XGMAC_CONFIG_SS_100_MII		(0x4 << XGMAC_CONFIG_SS_OFF)
@@ -58,6 +60,13 @@
 #define XGMAC_HASH_TABLE(x)		(0x00000010 + (x) * 4)
 #define XGMAC_MAX_HASH_TABLE		8
 #define XGMAC_VLAN_TAG			0x00000050
+/* MAC VLAN Tag Control */
+#define VLAN_TAG_CTRL_EVLS_MASK		GENMASK(22, 21)
+#define VLAN_TAG_CTRL_EVLRXS		BIT(24)
+#define VLAN_TAG_STRIP_NONE		FIELD_PREP(VLAN_TAG_CTRL_EVLS_MASK, 0x0)
+#define VLAN_TAG_STRIP_PASS		FIELD_PREP(VLAN_TAG_CTRL_EVLS_MASK, 0x1)
+#define VLAN_TAG_STRIP_FAIL		FIELD_PREP(VLAN_TAG_CTRL_EVLS_MASK, 0x2)
+#define VLAN_TAG_STRIP_ALL		FIELD_PREP(VLAN_TAG_CTRL_EVLS_MASK, 0x3)
 #define XGMAC_VLAN_EDVLP		BIT(26)
 #define XGMAC_VLAN_VTHM			BIT(25)
 #define XGMAC_VLAN_DOVLTC		BIT(20)
@@ -74,8 +83,20 @@
 #define XGMAC_RXQEN(x)			GENMASK((x) * 2 + 1, (x) * 2)
 #define XGMAC_RXQEN_SHIFT(x)		((x) * 2)
 #define XGMAC_RXQ_CTRL1			0x000000a4
+#define XGMAC_AVCPQ			GENMASK(31, 28)
+#define XGMAC_AVCPQ_SHIFT		28
+#define XGMAC_PTPQ			GENMASK(27, 24)
+#define XGMAC_PTPQ_SHIFT		24
+#define XGMAC_TACPQE			BIT(23)
+#define XGMAC_DCBCPQ			GENMASK(19, 16)
+#define XGMAC_DCBCPQ_SHIFT		16
+#define XGMAC_MCBCQEN			BIT(15)
+#define XGMAC_MCBCQ			GENMASK(11, 8)
+#define XGMAC_MCBCQ_SHIFT		8
 #define XGMAC_RQ			GENMASK(7, 4)
 #define XGMAC_RQ_SHIFT			4
+#define XGMAC_UPQ			GENMASK(3, 0)
+#define XGMAC_UPQ_SHIFT			0
 #define XGMAC_RXQ_CTRL2			0x000000a8
 #define XGMAC_RXQ_CTRL3			0x000000ac
 #define XGMAC_PSRQ(x)			GENMASK((x) * 8 + 7, (x) * 8)
@@ -110,7 +131,12 @@
 #define XGMAC_TLPIEN			BIT(0)
 #define XGMAC_LPI_TIMER_CTRL		0x000000d4
 #define XGMAC_HW_FEATURE0		0x0000011c
+#define XGMAC_HWFEAT_EDMA		BIT(31)
+#define XGMAC_HWFEAT_EDIFFC		BIT(30)
+#define XGMAC_HWFEAT_VXN		BIT(29)
 #define XGMAC_HWFEAT_SAVLANINS		BIT(27)
+#define XGMAC_HWFEAT_TSSTSSEL		GENMASK(26, 25)
+#define XGMAC_HWFEAT_ADDMACADRSEL	GENMASK(22, 18)
 #define XGMAC_HWFEAT_RXCOESEL		BIT(16)
 #define XGMAC_HWFEAT_TXCOESEL		BIT(14)
 #define XGMAC_HWFEAT_EEESEL		BIT(13)
@@ -121,34 +147,54 @@
 #define XGMAC_HWFEAT_MMCSEL		BIT(8)
 #define XGMAC_HWFEAT_MGKSEL		BIT(7)
 #define XGMAC_HWFEAT_RWKSEL		BIT(6)
+#define XGMAC_HWFEAT_SMASEL		BIT(5)
 #define XGMAC_HWFEAT_VLHASH		BIT(4)
+#define XGMAC_HWFEAT_HDSEL		BIT(3)
 #define XGMAC_HWFEAT_GMIISEL		BIT(1)
 #define XGMAC_HW_FEATURE1		0x00000120
 #define XGMAC_HWFEAT_L3L4FNUM		GENMASK(30, 27)
 #define XGMAC_HWFEAT_HASHTBLSZ		GENMASK(25, 24)
+#define XGMAC_HWFEAT_NUMTC		GENMASK(23, 21)
 #define XGMAC_HWFEAT_RSSEN		BIT(20)
+#define XGMAC_HWFEAT_DBGMEMA		BIT(19)
 #define XGMAC_HWFEAT_TSOEN		BIT(18)
 #define XGMAC_HWFEAT_SPHEN		BIT(17)
+#define XGMAC_HWFEAT_DCBEN		BIT(16)
 #define XGMAC_HWFEAT_ADDR64		GENMASK(15, 14)
+#define XGMAC_HWFEAT_ADVTHWORD		BIT(13)
+#define XGMAC_HWFEAT_PTOEN		BIT(12)
+#define XGMAC_HWFEAT_OSTEN		BIT(11)
 #define XGMAC_HWFEAT_TXFIFOSIZE		GENMASK(10, 6)
+#define XGMAC_HWFEAT_PFCEN		BIT(5)
 #define XGMAC_HWFEAT_RXFIFOSIZE		GENMASK(4, 0)
 #define XGMAC_HW_FEATURE2		0x00000124
+#define XGMAC_HWFEAT_AUXSNAPNUM		GENMASK(30, 28)
 #define XGMAC_HWFEAT_PPSOUTNUM		GENMASK(26, 24)
 #define XGMAC_HWFEAT_TXCHCNT		GENMASK(21, 18)
 #define XGMAC_HWFEAT_RXCHCNT		GENMASK(15, 12)
 #define XGMAC_HWFEAT_TXQCNT		GENMASK(9, 6)
 #define XGMAC_HWFEAT_RXQCNT		GENMASK(3, 0)
 #define XGMAC_HW_FEATURE3		0x00000128
+#define XGMAC_HWFEAT_TBSCH		GENMASK(31, 28)
 #define XGMAC_HWFEAT_TBSSEL		BIT(27)
 #define XGMAC_HWFEAT_FPESEL		BIT(26)
+#define XGMAC_HWFEAT_SGFSEL		BIT(25)
 #define XGMAC_HWFEAT_ESTWID		GENMASK(24, 23)
 #define XGMAC_HWFEAT_ESTDEP		GENMASK(22, 20)
 #define XGMAC_HWFEAT_ESTSEL		BIT(19)
+#define XGMAC_HWFEAT_TTSFD		GENMASK(18, 16)
 #define XGMAC_HWFEAT_ASP		GENMASK(15, 14)
 #define XGMAC_HWFEAT_DVLAN		BIT(13)
 #define XGMAC_HWFEAT_FRPES		GENMASK(12, 11)
 #define XGMAC_HWFEAT_FRPPB		GENMASK(10, 9)
+#define XGMAC_HWFEAT_POUOST		BIT(8)
+#define XGMAC_HWFEAT_FRPPIPE		GENMASK(7, 5)
+#define XGMAC_HWFEAT_CBTISEL		BIT(4)
 #define XGMAC_HWFEAT_FRPSEL		BIT(3)
+#define XGMAC_HWFEAT_NRVF		GENMASK(2, 0)
+#define XGMAC_HW_FEATURE4		0x0000012c
+#define XGMAC_HWFEAT_EASP		BIT(4)
+#define XGMAC_HWFEAT_PCSEL		GENMASK(1, 0)
 #define XGMAC_MAC_DPP_FSM_INT_STATUS	0x00000150
 #define XGMAC_MAC_FSM_CONTROL		0x00000158
 #define XGMAC_PRTYEN			BIT(1)
@@ -165,7 +211,7 @@
 #define XGMAC_DCS_SHIFT			16
 #define XGMAC_ADDRx_LOW(x)		(0x00000304 + (x) * 0x8)
 #define XGMAC_L3L4_ADDR_CTRL		0x00000c00
-#define XGMAC_IDDR			GENMASK(15, 8)
+#define XGMAC_IDDR			GENMASK(16, 8)
 #define XGMAC_IDDR_SHIFT		8
 #define XGMAC_IDDR_FNUM			4
 #define XGMAC_TT			BIT(1)
@@ -204,12 +250,52 @@
 #define XGMAC_CT			BIT(1)
 #define XGMAC_OB			BIT(0)
 #define XGMAC_RSS_DATA			0x00000c8c
-#define XGMAC_TIMESTAMP_STATUS		0x00000d20
+#define XGMAC_TIMESTAMP_BASE_ADDR	0x00000d00
+#define XGMAC_PPS_BASE_ADDR		0x00000d80
+
+/* MAC extended config 0 (MAC_Extended_Configuration, offset 0x140) */
+#define XGMAC_EXT_CFG0			0x140
+#define XGMAC_EXT_CFG0_VPRE		BIT(8)
+
+/* MAC extended config 1 */
+#define XGMAC_EXT_CFG1			0x144
+#define XGMAC_CONFIG1_SAVE_EN		BIT(24)
+#define XGMAC_CONFIG1_SPLM(v)		FIELD_PREP(GENMASK(9, 8), v)
+#define XGMAC_SPLM_L2			0x1
+
+static inline u32 xgmac_timestamp_base_addr(const struct dwxgmac_addrs *addrs)
+{
+	u32 addr;
+
+	if (addrs)
+		addr = addrs->timestamp_base;
+	else
+		addr = XGMAC_TIMESTAMP_BASE_ADDR;
+
+	return addr;
+}
+
+static inline u32 xgmac_pps_base_addr(const struct dwxgmac_addrs *addrs,
+				      const u32 x)
+{
+	u32 addr;
+
+	if (addrs)
+		addr = addrs->pps_base +  x * addrs->pps_offset;
+	else
+		addr = XGMAC_PPS_BASE_ADDR + x * 0x10;
+
+	return addr;
+}
+
+#define XGMAC_TIMESTAMP_STATUS(addrs)	(xgmac_timestamp_base_addr(addrs) + 0x20)
 #define XGMAC_TXTSC			BIT(15)
-#define XGMAC_TXTIMESTAMP_NSEC		0x00000d30
+#define XGMAC_TXTIMESTAMP_NSEC(addrs)		(xgmac_timestamp_base_addr(addrs) + 0x30)
 #define XGMAC_TXTSSTSLO			GENMASK(30, 0)
-#define XGMAC_TXTIMESTAMP_SEC		0x00000d34
-#define XGMAC_PPS_CONTROL		0x00000d70
+#define XGMAC_TXTIMESTAMP_SEC(addrs)		(xgmac_timestamp_base_addr(addrs) + 0x34)
+#define XGMAC_TXTIMESTAMP_STATUS_PKTID(addrs) (xgmac_timestamp_base_addr(addrs) + 0x38)
+
+#define XGMAC_PPS_CONTROL(addrs)		(xgmac_timestamp_base_addr(addrs) + 0x70)
 #define XGMAC_PPS_MAXIDX(x)		((((x) + 1) * 8) - 1)
 #define XGMAC_PPS_MINIDX(x)		((x) * 8)
 #define XGMAC_PPSx_MASK(x)		\
@@ -223,13 +309,15 @@
 #define XGMAC_PPSCMD_START		0x2
 #define XGMAC_PPSCMD_STOP		0x5
 #define XGMAC_PPSENx(x)			BIT(4 + (x) * 8)
-#define XGMAC_PPSx_TARGET_TIME_SEC(x)	(0x00000d80 + (x) * 0x10)
-#define XGMAC_PPSx_TARGET_TIME_NSEC(x)	(0x00000d84 + (x) * 0x10)
+#define XGMAC_PPSx_TARGET_TIME_SEC(addrs, x)			xgmac_pps_base_addr(addrs, x)
+#define XGMAC_PPSx_TARGET_TIME_NSEC(addrs, x)	(xgmac_pps_base_addr(addrs, x) + 0x04)
 #define XGMAC_TRGTBUSY0			BIT(31)
-#define XGMAC_PPSx_INTERVAL(x)		(0x00000d88 + (x) * 0x10)
-#define XGMAC_PPSx_WIDTH(x)		(0x00000d8c + (x) * 0x10)
+#define XGMAC_PPSx_INTERVAL(addrs, x)		(xgmac_pps_base_addr(addrs, x) + 0x08)
+#define XGMAC_PPSx_WIDTH(addrs, x)		(xgmac_pps_base_addr(addrs, x) + 0x0c)
 
 /* MTL Registers */
+#define XGMAC_MTL_CHAN_BASE_ADDR	0x00001100
+#define XGMAC_MTL_CHAN_OFFSET		0x80
 #define XGMAC_MTL_OPMODE		0x00001000
 #define XGMAC_FRPE			BIT(15)
 #define XGMAC_ETSALG			GENMASK(6, 5)
@@ -240,6 +328,7 @@
 #define XGMAC_MTL_INT_STATUS		0x00001020
 #define XGMAC_MTL_RXQ_DMA_MAP0		0x00001030
 #define XGMAC_MTL_RXQ_DMA_MAP1		0x00001034
+#define XGMAC_MTL_RXQ_DMA_MAP2		0x00001038
 #define XGMAC_QxMDMACH(x)		GENMASK((x) * 8 + 7, (x) * 8)
 #define XGMAC_QxMDMACH_SHIFT(x)		((x) * 8)
 #define XGMAC_QDDMACH			BIT(7)
@@ -247,22 +336,6 @@
 #define XGMAC_TC_PRTY_MAP1		0x00001044
 #define XGMAC_PSTC(x)			GENMASK((x) * 8 + 7, (x) * 8)
 #define XGMAC_PSTC_SHIFT(x)		((x) * 8)
-#define XGMAC_MTL_EST_CONTROL		0x00001050
-#define XGMAC_PTOV			GENMASK(31, 23)
-#define XGMAC_PTOV_SHIFT		23
-#define XGMAC_SSWL			BIT(1)
-#define XGMAC_EEST			BIT(0)
-#define XGMAC_MTL_EST_GCL_CONTROL	0x00001080
-#define XGMAC_BTR_LOW			0x0
-#define XGMAC_BTR_HIGH			0x1
-#define XGMAC_CTR_LOW			0x2
-#define XGMAC_CTR_HIGH			0x3
-#define XGMAC_TER			0x4
-#define XGMAC_LLR			0x5
-#define XGMAC_ADDR_SHIFT		8
-#define XGMAC_GCRR			BIT(2)
-#define XGMAC_SRWO			BIT(0)
-#define XGMAC_MTL_EST_GCL_DATA		0x00001084
 #define XGMAC_MTL_RXP_CONTROL_STATUS	0x000010a0
 #define XGMAC_RXPI			BIT(31)
 #define XGMAC_NPE			GENMASK(23, 16)
@@ -284,7 +357,21 @@
 #define XGMAC_MTL_ECC_INT_STATUS	0x000010cc
 #define XGMAC_MTL_DPP_CONTROL		0x000010e0
 #define XGMAC_DPP_DISABLE		BIT(0)
-#define XGMAC_MTL_TXQ_OPMODE(x)		(0x00001100 + (0x80 * (x)))
+
+static inline u32 xgmac_mtl_chanx_base_addr(const struct dwxgmac_addrs *addrs,
+					    const u32 x)
+{
+	u32 addr;
+
+	if (addrs)
+		addr = addrs->mtl_chan_base + (x * addrs->mtl_chan_offset);
+	else
+		addr = XGMAC_MTL_CHAN_BASE_ADDR + (x * XGMAC_MTL_CHAN_OFFSET);
+
+	return addr;
+}
+
+#define XGMAC_MTL_TXQ_OPMODE(addrs, x)	xgmac_mtl_chanx_base_addr(addrs, x)
 #define XGMAC_TQS			GENMASK(25, 16)
 #define XGMAC_TQS_SHIFT			16
 #define XGMAC_Q2TCMAP			GENMASK(10, 8)
@@ -294,39 +381,46 @@
 #define XGMAC_TXQEN			GENMASK(3, 2)
 #define XGMAC_TXQEN_SHIFT		2
 #define XGMAC_TSF			BIT(1)
-#define XGMAC_MTL_TCx_ETS_CONTROL(x)	(0x00001110 + (0x80 * (x)))
-#define XGMAC_MTL_TCx_QUANTUM_WEIGHT(x)	(0x00001118 + (0x80 * (x)))
-#define XGMAC_MTL_TCx_SENDSLOPE(x)	(0x0000111c + (0x80 * (x)))
-#define XGMAC_MTL_TCx_HICREDIT(x)	(0x00001120 + (0x80 * (x)))
-#define XGMAC_MTL_TCx_LOCREDIT(x)	(0x00001124 + (0x80 * (x)))
+#define XGMAC_MTL_TCx_ETS_CONTROL(addrs, x)	(xgmac_mtl_chanx_base_addr(addrs, x) + 0x10)
+#define XGMAC_MTL_TCx_QUANTUM_WEIGHT(addrs, x)	(xgmac_mtl_chanx_base_addr(addrs, x) + 0x18)
+#define XGMAC_MTL_TCx_SENDSLOPE(addrs, x)	(xgmac_mtl_chanx_base_addr(addrs, x) + 0x1c)
+#define XGMAC_MTL_TCx_HICREDIT(addrs, x)	(xgmac_mtl_chanx_base_addr(addrs, x) + 0x20)
+#define XGMAC_MTL_TCx_LOCREDIT(addrs, x)	(xgmac_mtl_chanx_base_addr(addrs, x) + 0x24)
 #define XGMAC_CC			BIT(3)
 #define XGMAC_TSA			GENMASK(1, 0)
 #define XGMAC_SP			(0x0 << 0)
 #define XGMAC_CBS			(0x1 << 0)
 #define XGMAC_ETS			(0x2 << 0)
-#define XGMAC_MTL_RXQ_OPMODE(x)		(0x00001140 + (0x80 * (x)))
+#define XGMAC_MTL_RXQ_OPMODE(addrs, x)		(xgmac_mtl_chanx_base_addr(addrs, x) + 0x40)
 #define XGMAC_RQS			GENMASK(25, 16)
 #define XGMAC_RQS_SHIFT			16
 #define XGMAC_EHFC			BIT(7)
 #define XGMAC_RSF			BIT(5)
 #define XGMAC_RTC			GENMASK(1, 0)
 #define XGMAC_RTC_SHIFT			0
-#define XGMAC_MTL_RXQ_FLOW_CONTROL(x)	(0x00001150 + (0x80 * (x)))
+#define XGMAC_MTL_RXQ_FLOW_CONTROL(addrs, x)	(xgmac_mtl_chanx_base_addr(addrs, x) + 0x50)
 #define XGMAC_RFD			GENMASK(31, 17)
 #define XGMAC_RFD_SHIFT			17
 #define XGMAC_RFA			GENMASK(15, 1)
 #define XGMAC_RFA_SHIFT			1
-#define XGMAC_MTL_QINTEN(x)		(0x00001170 + (0x80 * (x)))
+#define XGMAC_MTL_QINTEN(addrs, x)		(xgmac_mtl_chanx_base_addr(addrs, x) + 0x70)
 #define XGMAC_RXOIE			BIT(16)
-#define XGMAC_MTL_QINT_STATUS(x)	(0x00001174 + (0x80 * (x)))
+#define XGMAC_MTL_QINT_STATUS(addrs, x)	(xgmac_mtl_chanx_base_addr(addrs, x) + 0x74)
 #define XGMAC_RXOVFIS			BIT(16)
 #define XGMAC_ABPSIS			BIT(1)
 #define XGMAC_TXUNFIS			BIT(0)
-#define XGMAC_MAC_REGSIZE		(XGMAC_MTL_QINT_STATUS(15) / 4)
+#define XGMAC_MAC_REGSIZE(addrs)		(XGMAC_MTL_QINT_STATUS(addrs, 15) / 4)
 
 /* DMA Registers */
+#define XGMAC_DMA_CHAN_BASE_ADDR		0x00003100
+#define XGMAC_DMA_CHAN_OFFSET		0x80
 #define XGMAC_DMA_MODE			0x00003000
 #define XGMAC_SWR			BIT(0)
+#define XGMAC_DSCB		BIT(16)
+#define XGMAC_HMIC		BIT(17)
+#define XGMAC_DMA_MODE_INTM_MASK	GENMASK(13, 12)
+#define XGMAC_DMA_MODE_INTM_SHIFT	12
+#define XGMAC_DMA_MODE_INTM_MODE1	0x1
 #define XGMAC_DMA_SYSBUS_MODE		0x00003004
 #define XGMAC_WR_OSR_LMT		GENMASK(29, 24)
 #define XGMAC_WR_OSR_LMT_SHIFT		24
@@ -334,6 +428,7 @@
 #define XGMAC_RD_OSR_LMT_SHIFT		16
 #define XGMAC_EN_LPI			BIT(15)
 #define XGMAC_LPI_XIT_PKT		BIT(14)
+#define XGMAC_ONEKBBE		BIT(13)
 #define XGMAC_AAL			BIT(12)
 #define XGMAC_EAME			BIT(11)
 #define XGMAC_BLEN			GENMASK(7, 1)
@@ -367,44 +462,62 @@
 #define XGMAC_TCEIE			BIT(0)
 #define XGMAC_DMA_ECC_INT_STATUS	0x0000306c
 #define XGMAC_DMA_DPP_INT_STATUS	0x00003074
-#define XGMAC_DMA_CH_CONTROL(x)		(0x00003100 + (0x80 * (x)))
+#define XGMAC_MAX_TC			8
+
+static inline u32 xgmac_dma_chanx_base_addr(const struct dwxgmac_addrs *addrs,
+					    const u32 x)
+{
+	u32 addr;
+
+	if (addrs && (x % 2))
+		addr = addrs->dma_odd_chan_base + (x * addrs->dma_chan_offset);
+	else if (addrs)
+		addr = addrs->dma_even_chan_base + (x * addrs->dma_chan_offset);
+	else
+		addr = XGMAC_DMA_CHAN_BASE_ADDR + (x * XGMAC_DMA_CHAN_OFFSET);
+
+	return addr;
+}
+
+#define XGMAC_DMA_CH_CONTROL(addr, x)		(xgmac_dma_chanx_base_addr(addr, x))
 #define XGMAC_SPH			BIT(24)
 #define XGMAC_PBLx8			BIT(16)
-#define XGMAC_DMA_CH_TX_CONTROL(x)	(0x00003104 + (0x80 * (x)))
+#define XGMAC_DMA_CH_TX_CONTROL(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x04)
 #define XGMAC_EDSE			BIT(28)
 #define XGMAC_TxPBL			GENMASK(21, 16)
 #define XGMAC_TxPBL_SHIFT		16
 #define XGMAC_TSE			BIT(12)
 #define XGMAC_OSP			BIT(4)
 #define XGMAC_TXST			BIT(0)
-#define XGMAC_DMA_CH_RX_CONTROL(x)	(0x00003108 + (0x80 * (x)))
+#define XGMAC_DMA_CH_RX_CONTROL(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x08)
 #define XGMAC_RxPBL			GENMASK(21, 16)
 #define XGMAC_RxPBL_SHIFT		16
 #define XGMAC_RBSZ			GENMASK(14, 1)
 #define XGMAC_RBSZ_SHIFT		1
 #define XGMAC_RXST			BIT(0)
-#define XGMAC_DMA_CH_TxDESC_HADDR(x)	(0x00003110 + (0x80 * (x)))
-#define XGMAC_DMA_CH_TxDESC_LADDR(x)	(0x00003114 + (0x80 * (x)))
-#define XGMAC_DMA_CH_RxDESC_HADDR(x)	(0x00003118 + (0x80 * (x)))
-#define XGMAC_DMA_CH_RxDESC_LADDR(x)	(0x0000311c + (0x80 * (x)))
-#define XGMAC_DMA_CH_TxDESC_TAIL_LPTR(x)	(0x00003124 + (0x80 * (x)))
-#define XGMAC_DMA_CH_RxDESC_TAIL_LPTR(x)	(0x0000312c + (0x80 * (x)))
-#define XGMAC_DMA_CH_TxDESC_RING_LEN(x)		(0x00003130 + (0x80 * (x)))
-#define XGMAC_DMA_CH_RxDESC_RING_LEN(x)		(0x00003134 + (0x80 * (x)))
-#define XGMAC_DMA_CH_INT_EN(x)		(0x00003138 + (0x80 * (x)))
+#define XGMAC_DMA_CH_TxDESC_HADDR(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x10)
+#define XGMAC_DMA_CH_TxDESC_LADDR(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x14)
+#define XGMAC_DMA_CH_RxDESC_HADDR(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x18)
+#define XGMAC_DMA_CH_RxDESC_LADDR(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x1c)
+#define XGMAC_DMA_CH_TxDESC_TAIL_LPTR(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x24)
+#define XGMAC_DMA_CH_RxDESC_TAIL_LPTR(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x2c)
+#define XGMAC_DMA_CH_TxDESC_RING_LEN(addr, x)		(xgmac_dma_chanx_base_addr(addr, x) + 0x30)
+#define XGMAC_DMA_CH_RxDESC_RING_LEN(addr, x)		(xgmac_dma_chanx_base_addr(addr, x) + 0x34)
+#define XGMAC_DMA_CH_INT_EN(addr, x)		(xgmac_dma_chanx_base_addr(addr, x) + 0x38)
 #define XGMAC_NIE			BIT(15)
 #define XGMAC_AIE			BIT(14)
+#define XGMAC_FBEE			BIT(12)
 #define XGMAC_RBUE			BIT(7)
 #define XGMAC_RIE			BIT(6)
 #define XGMAC_TBUE			BIT(2)
 #define XGMAC_TIE			BIT(0)
 #define XGMAC_DMA_INT_DEFAULT_EN	(XGMAC_NIE | XGMAC_AIE | XGMAC_RBUE | \
-					XGMAC_RIE | XGMAC_TIE)
+					XGMAC_RIE | XGMAC_TIE | XGMAC_FBEE)
 #define XGMAC_DMA_INT_DEFAULT_RX	(XGMAC_RBUE | XGMAC_RIE)
 #define XGMAC_DMA_INT_DEFAULT_TX	(XGMAC_TIE)
-#define XGMAC_DMA_CH_Rx_WATCHDOG(x)	(0x0000313c + (0x80 * (x)))
+#define XGMAC_DMA_CH_Rx_WATCHDOG(addr, x)	(xgmac_dma_chanx_base_addr(addr, x) + 0x3c)
 #define XGMAC_RWT			GENMASK(7, 0)
-#define XGMAC_DMA_CH_STATUS(x)		(0x00003160 + (0x80 * (x)))
+#define XGMAC_DMA_CH_STATUS(addr, x)		(xgmac_dma_chanx_base_addr(addr, x) + 0x60)
 #define XGMAC_NIS			BIT(15)
 #define XGMAC_AIS			BIT(14)
 #define XGMAC_FBE			BIT(12)
@@ -413,11 +526,19 @@
 #define XGMAC_TBU			BIT(2)
 #define XGMAC_TPS			BIT(1)
 #define XGMAC_TI			BIT(0)
-#define XGMAC_REGSIZE			((0x0000317c + (0x80 * 15)) / 4)
+#define XGMAC_REGSIZE(addr)			((xgmac_dma_chanx_base_addr(addr, 15) + 0x7c) / 4)
+
+#define XGMAC_DMA_STATUS_MSK_COMMON	(XGMAC_NIS | XGMAC_AIS | XGMAC_FBE)
+#define XGMAC_DMA_STATUS_MSK_RX		(XGMAC_RBU | XGMAC_RI | \
+					 XGMAC_DMA_STATUS_MSK_COMMON)
+#define XGMAC_DMA_STATUS_MSK_TX		(XGMAC_TBU | XGMAC_TPS | XGMAC_TI | \
+					 XGMAC_DMA_STATUS_MSK_COMMON)
 
 /* Descriptors */
+#define XGMAC_RDES0_VLAN_TAG_MASK	GENMASK(15, 0)
 #define XGMAC_TDES0_LTV			BIT(31)
 #define XGMAC_TDES0_LT			GENMASK(7, 0)
+#define XGMAC_TDES0_TTSL		GENMASK(9, 0)
 #define XGMAC_TDES1_LT			GENMASK(31, 8)
 #define XGMAC_TDES2_IVT			GENMASK(31, 16)
 #define XGMAC_TDES2_IVT_SHIFT		16
@@ -432,6 +553,8 @@
 #define XGMAC_TDES3_CTXT		BIT(30)
 #define XGMAC_TDES3_FD			BIT(29)
 #define XGMAC_TDES3_LD			BIT(28)
+#define XGMAC_TDES3_OSTC		BIT(27)
+#define XGMAC_TDES3_PIDV		BIT(25)
 #define XGMAC_TDES3_CPC			GENMASK(27, 26)
 #define XGMAC_TDES3_CPC_SHIFT		26
 #define XGMAC_TDES3_TCMSSV		BIT(26)
@@ -451,6 +574,7 @@
 #define XGMAC_TDES3_VT			GENMASK(15, 0)
 #define XGMAC_TDES3_FL			GENMASK(14, 0)
 #define XGMAC_RDES2_HL			GENMASK(9, 0)
+#define XGMAC_RDES2_NONIPHL		GENMASK(9, 2)
 #define XGMAC_RDES3_OWN			BIT(31)
 #define XGMAC_RDES3_CTXT		BIT(30)
 #define XGMAC_RDES3_IOC			BIT(30)
@@ -458,6 +582,16 @@
 #define XGMAC_RDES3_CDA			BIT(27)
 #define XGMAC_RDES3_RSV			BIT(26)
 #define XGMAC_RDES3_L34T		GENMASK(23, 20)
+#define XGMAC_RDES3_L2T			GENMASK(19, 16)
+
+/* Error Type or L2 Type(ET/LT) Field Number */
+#define XGMAC_ET_LT_VLAN_STAG		8
+#define XGMAC_ET_LT_VLAN_CTAG		9
+#define XGMAC_ET_LT_DVLAN_CTAG_CTAG	10
+#define XGMAC_ET_LT_DVLAN_STAG_STAG	11
+#define XGMAC_ET_LT_DVLAN_CTAG_STAG	12
+#define XGMAC_ET_LT_DVLAN_STAG_CTAG	13
+
 #define XGMAC_RDES3_L34T_SHIFT		20
 #define XGMAC_L34T_IP4TCP		0x1
 #define XGMAC_L34T_IP4UDP		0x2

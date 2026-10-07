@@ -55,6 +55,7 @@ int afs_net_id;
 static const struct super_operations afs_super_ops = {
 	.statfs		= afs_statfs,
 	.alloc_inode	= afs_alloc_inode,
+	.write_inode	= netfs_unpin_writeback,
 	.drop_inode	= afs_drop_inode,
 	.destroy_inode	= afs_destroy_inode,
 	.free_inode	= afs_free_inode,
@@ -380,8 +381,7 @@ static int afs_validate_fc(struct fs_context *fc)
 		ctx->key = key;
 
 		if (ctx->volume) {
-			afs_put_volume(ctx->net, ctx->volume,
-				       afs_volume_trace_put_validate_fc);
+			afs_put_volume(ctx->volume, afs_volume_trace_put_validate_fc);
 			ctx->volume = NULL;
 		}
 
@@ -406,8 +406,10 @@ static int afs_validate_fc(struct fs_context *fc)
 			return PTR_ERR(volume);
 
 		ctx->volume = volume;
-		if (volume->type != AFSVL_RWVOL)
+		if (volume->type != AFSVL_RWVOL) {
 			ctx->flock_mode = afs_flock_mode_local;
+			fc->sb_flags |= SB_RDONLY;
+		}
 	}
 
 	return 0;
@@ -526,7 +528,7 @@ static void afs_destroy_sbi(struct afs_super_info *as)
 {
 	if (as) {
 		struct afs_net *net = afs_net(as->net_ns);
-		afs_put_volume(net, as->volume, afs_volume_trace_put_destroy_sbi);
+		afs_put_volume(as->volume, afs_volume_trace_put_destroy_sbi);
 		afs_unuse_cell(net, as->cell, afs_cell_trace_unuse_sbi);
 		put_net(as->net_ns);
 		kfree(as);
@@ -596,8 +598,7 @@ static int afs_get_tree(struct fs_context *fc)
 	}
 
 	fc->root = dget(sb->s_root);
-	if (!ctx->dyn_root)
-		trace_afs_get_tree(as->cell, as->volume);
+	trace_afs_get_tree(as->cell, as->volume);
 	_leave(" = 0 [%p]", sb);
 	return 0;
 
@@ -613,7 +614,7 @@ static void afs_free_fc(struct fs_context *fc)
 	struct afs_fs_context *ctx = fc->fs_private;
 
 	afs_destroy_sbi(fc->s_fs_info);
-	afs_put_volume(ctx->net, ctx->volume, afs_volume_trace_put_free_fc);
+	afs_put_volume(ctx->volume, afs_volume_trace_put_free_fc);
 	afs_unuse_cell(ctx->net, ctx->cell, afs_cell_trace_unuse_fc);
 	key_put(ctx->key);
 	kfree(ctx);
@@ -661,7 +662,7 @@ static void afs_i_init_once(void *_vnode)
 	struct afs_vnode *vnode = _vnode;
 
 	memset(vnode, 0, sizeof(*vnode));
-	inode_init_once(&vnode->vfs_inode);
+	inode_init_once(&vnode->netfs.inode);
 	mutex_init(&vnode->io_lock);
 	init_rwsem(&vnode->validate_lock);
 	spin_lock_init(&vnode->wb_lock);
@@ -670,6 +671,7 @@ static void afs_i_init_once(void *_vnode)
 	INIT_LIST_HEAD(&vnode->pending_locks);
 	INIT_LIST_HEAD(&vnode->granted_locks);
 	INIT_DELAYED_WORK(&vnode->lock_work, afs_lock_work);
+	INIT_LIST_HEAD(&vnode->cb_mmap_link);
 	seqlock_init(&vnode->cb_lock);
 }
 
@@ -680,7 +682,7 @@ static struct inode *afs_alloc_inode(struct super_block *sb)
 {
 	struct afs_vnode *vnode;
 
-	vnode = kmem_cache_alloc(afs_inode_cachep, GFP_KERNEL);
+	vnode = alloc_inode_sb(sb, afs_inode_cachep, GFP_KERNEL);
 	if (!vnode)
 		return NULL;
 
@@ -689,21 +691,20 @@ static struct inode *afs_alloc_inode(struct super_block *sb)
 	/* Reset anything that shouldn't leak from one inode to the next. */
 	memset(&vnode->fid, 0, sizeof(vnode->fid));
 	memset(&vnode->status, 0, sizeof(vnode->status));
+	afs_vnode_set_cache(vnode, NULL);
 
 	vnode->volume		= NULL;
 	vnode->lock_key		= NULL;
 	vnode->permit_cache	= NULL;
-#ifdef CONFIG_AFS_FSCACHE
-	vnode->cache		= NULL;
-#endif
 
 	vnode->flags		= 1 << AFS_VNODE_UNSET;
 	vnode->lock_state	= AFS_VNODE_LOCK_NONE;
 
 	init_rwsem(&vnode->rmdir_lock);
+	INIT_WORK(&vnode->cb_work, afs_invalidate_mmap_work);
 
-	_leave(" = %p", &vnode->vfs_inode);
-	return &vnode->vfs_inode;
+	_leave(" = %p", &vnode->netfs.inode);
+	return &vnode->netfs.inode;
 }
 
 static void afs_free_inode(struct inode *inode)

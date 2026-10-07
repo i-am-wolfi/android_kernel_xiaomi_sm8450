@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
@@ -299,8 +299,7 @@ static const struct attribute_group isl97900_attr_group = {
 };
 
 
-static int isl97900_led_probe(struct i2c_client *client,
-			const struct i2c_device_id *id)
+static int isl97900_led_probe(struct i2c_client *client)
 {
 	struct isl97900_priv *priv;
 	int rc = 0;
@@ -333,19 +332,17 @@ static int isl97900_led_probe(struct i2c_client *client,
 	return 0;
 }
 
-static int isl97900_led_remove(struct i2c_client *client)
+static void isl97900_led_remove(struct i2c_client *client)
 {
 	struct isl97900_priv *priv =
 			(struct isl97900_priv *)i2c_get_clientdata(client);
 
 	if (!priv)
-		return -EINVAL;
+		return;
 
 	dev_set_drvdata(&client->dev, NULL);
 
 	sysfs_remove_group(&client->dev.kobj, &isl97900_attr_group);
-
-	return 0;
 }
 
 int isl97900_led_cali_data_update(struct device_node *node,
@@ -372,7 +369,7 @@ int isl97900_led_cali_data_update(struct device_node *node,
 
 	return 0;
 }
-EXPORT_SYMBOL(isl97900_led_cali_data_update);
+EXPORT_SYMBOL_GPL(isl97900_led_cali_data_update);
 
 
 int isl97900_led_event(struct device_node *node,
@@ -386,7 +383,7 @@ int isl97900_led_event(struct device_node *node,
 
 	return rc;
 }
-EXPORT_SYMBOL(isl97900_led_event);
+EXPORT_SYMBOL_GPL(isl97900_led_event);
 
 
 static const struct of_device_id isl97900_of_match[] = {
@@ -422,4 +419,4 @@ static void __exit isl97900_led_exit(void)
 module_exit(isl97900_led_exit);
 
 MODULE_DESCRIPTION("ISL97900 LED driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

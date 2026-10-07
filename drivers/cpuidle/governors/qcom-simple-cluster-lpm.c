@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
@@ -51,14 +51,14 @@ static void android_vh_allow_domain_state(void *unused,
 }
 #endif
 
-static int simple_lpm_cluster_simple_gov_remove(struct platform_device *pdev)
+static void simple_lpm_cluster_simple_gov_remove(struct platform_device *pdev)
 {
 	int i;
 	struct generic_pm_domain *genpd = pd_to_genpd(pdev->dev.pm_domain);
 	struct simple_lpm_cluster *cluster_simple_gov = to_cluster(genpd);
 
 	if (!cluster_simple_gov)
-		return -ENODEV;
+		return;
 
 	pm_runtime_disable(&pdev->dev);
 	cluster_simple_gov->genpd->flags &= ~GENPD_FLAG_MIN_RESIDENCY;
@@ -73,8 +73,6 @@ static int simple_lpm_cluster_simple_gov_remove(struct platform_device *pdev)
 	}
 
 	list_del(&cluster_simple_gov->list);
-
-	return 0;
 }
 
 static int simple_lpm_cluster_simple_gov_probe(struct platform_device *pdev)

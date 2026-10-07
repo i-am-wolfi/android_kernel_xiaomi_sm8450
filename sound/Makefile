@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: GPL-2.0
-# Makefile for the Linux sound card driver
-#
 
+
+# Subdirectories
+obj-y += usb/
+
+
+# --- marble: objs upstream restaurados ---
 obj-$(CONFIG_SOUND) += soundcore.o
 obj-$(CONFIG_DMASOUND) += oss/dmasound/
-obj-$(CONFIG_SND) += core/ i2c/ drivers/ isa/ pci/ ppc/ arm/ sh/ synth/ usb/ \
-	firewire/ sparc/ spi/ parisc/ pcmcia/ mips/ soc/ atmel/ hda/ x86/ xen/
+obj-$(CONFIG_SND) += spi/ atmel/ soc/ sparc/ ppc/ sh/ core/ hda/ parisc/ mips/ synth/ pci/ xen/ x86/ i2c/ firewire/ pcmcia/ arm/ drivers/ isa/ virtio/
 obj-$(CONFIG_SND_AOA) += aoa/
-
-# This one must be compilable even if sound is configured out
 obj-$(CONFIG_AC97_BUS) += ac97_bus.o
 obj-$(CONFIG_AC97_BUS_NEW) += ac97/
-
 ifeq ($(CONFIG_SND),y)
-  obj-y += last.o
+obj-y += last.o
 endif
-
-soundcore-objs  := sound_core.o
+soundcore-y  := sound_core.o

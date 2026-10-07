@@ -10,7 +10,6 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/rational.h>
-#include <linux/util_macros.h>
 
 #include <linux/dma/hsu.h>
 
@@ -205,9 +204,8 @@ static void dnv_exit(struct mid8250 *mid)
 
 /*****************************************************************************/
 
-static void mid8250_set_termios(struct uart_port *p,
-				struct ktermios *termios,
-				struct ktermios *old)
+static void mid8250_set_termios(struct uart_port *p, struct ktermios *termios,
+				const struct ktermios *old)
 {
 	unsigned int baud = tty_termios_baud_rate(termios);
 	struct mid8250 *mid = p->private_data;
@@ -319,11 +317,9 @@ static int mid8250_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!uart.port.membase)
 		return -ENOMEM;
 
-	if (mid->board->setup) {
-		ret = mid->board->setup(mid, &uart.port);
-		if (ret)
-			return ret;
-	}
+	ret = mid->board->setup(mid, &uart.port);
+	if (ret)
+		return ret;
 
 	ret = mid8250_dma_setup(mid, &uart);
 	if (ret)
@@ -339,8 +335,7 @@ static int mid8250_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	return 0;
 
 err:
-	if (mid->board->exit)
-		mid->board->exit(mid);
+	mid->board->exit(mid);
 	return ret;
 }
 
@@ -350,8 +345,7 @@ static void mid8250_remove(struct pci_dev *pdev)
 
 	serial8250_unregister_port(mid->line);
 
-	if (mid->board->exit)
-		mid->board->exit(mid);
+	mid->board->exit(mid);
 }
 
 static const struct mid8250_board pnw_board = {
@@ -374,28 +368,18 @@ static const struct mid8250_board dnv_board = {
 	.freq = 133333333,
 	.base_baud = 115200,
 	.bar = 1,
-	/*
-	 * Errata:
-	 * HSUART May Stop Functioning when DMA is Active.
-	 *
-	 * - Denverton document #572409, rev 3.4, DNV60
-	 * - Ice Lake Xeon D document #714070, ICXD65
-	 * - Snowridge document #731931, SNR44
-	 */
-	.setup = PTR_IF(false, dnv_setup),
-	.exit = PTR_IF(false, dnv_exit),
+	.setup = dnv_setup,
+	.exit = dnv_exit,
 };
 
-#define MID_DEVICE(id, board) { PCI_VDEVICE(INTEL, id), (kernel_ulong_t)&board }
-
 static const struct pci_device_id pci_ids[] = {
-	MID_DEVICE(PCI_DEVICE_ID_INTEL_PNW_UART1, pnw_board),
-	MID_DEVICE(PCI_DEVICE_ID_INTEL_PNW_UART2, pnw_board),
-	MID_DEVICE(PCI_DEVICE_ID_INTEL_PNW_UART3, pnw_board),
-	MID_DEVICE(PCI_DEVICE_ID_INTEL_TNG_UART, tng_board),
-	MID_DEVICE(PCI_DEVICE_ID_INTEL_CDF_UART, dnv_board),
-	MID_DEVICE(PCI_DEVICE_ID_INTEL_DNV_UART, dnv_board),
-	{ },
+	{ PCI_DEVICE_DATA(INTEL, PNW_UART1, &pnw_board) },
+	{ PCI_DEVICE_DATA(INTEL, PNW_UART2, &pnw_board) },
+	{ PCI_DEVICE_DATA(INTEL, PNW_UART3, &pnw_board) },
+	{ PCI_DEVICE_DATA(INTEL, TNG_UART, &tng_board) },
+	{ PCI_DEVICE_DATA(INTEL, CDF_UART, &dnv_board) },
+	{ PCI_DEVICE_DATA(INTEL, DNV_UART, &dnv_board) },
+	{ }
 };
 MODULE_DEVICE_TABLE(pci, pci_ids);
 

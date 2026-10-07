@@ -259,7 +259,6 @@ static int safe_prepare_write_buffer(struct usb_serial_port *port,
 static int safe_startup(struct usb_serial *serial)
 {
 	struct usb_interface_descriptor	*desc;
-	int bulk_out_size;
 
 	if (serial->dev->descriptor.bDeviceClass != CDC_DEVICE_CLASS)
 		return -ENODEV;
@@ -280,22 +279,11 @@ static int safe_startup(struct usb_serial *serial)
 	default:
 		return -EINVAL;
 	}
-
-	/*
-	 * The bulk-out buffer needs to be large enough for the two-byte
-	 * trailer in safe mode, but assume anything smaller than eight bytes
-	 * is broken.
-	 */
-	bulk_out_size = serial->port[0]->bulk_out_size;
-	if (bulk_out_size > 0 && bulk_out_size < 8)
-		return -EINVAL;
-
 	return 0;
 }
 
 static struct usb_serial_driver safe_device = {
 	.driver = {
-		.owner =	THIS_MODULE,
 		.name =		"safe_serial",
 	},
 	.id_table =		id_table,

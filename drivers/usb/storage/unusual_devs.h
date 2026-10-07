@@ -395,13 +395,6 @@ UNUSUAL_DEV(  0x04b3, 0x4001, 0x0110, 0x0110,
 		USB_SC_DEVICE, USB_PR_CB, NULL,
 		US_FL_MAX_SECTORS_MIN),
 
-/* Reported by Ai Chao <aichao@kylinos.cn> */
-UNUSUAL_DEV(  0x04b4, 0xb708, 0x0000, 0xffff,
-		"Longmai Technologies",
-		"USB Key",
-		USB_SC_SCSI, USB_PR_BULK, NULL,
-		US_FL_NO_ATA_1X),
-
 /*
  * Reported by Simon Levitt <simon@whattf.com>
  * This entry needs Sub and Proto fields
@@ -1325,6 +1318,17 @@ UNUSUAL_DEV(  0x090c, 0x6000, 0x0100, 0x0100,
 		"SD/SDHC Card Reader",
 		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
 		US_FL_INITIAL_READ10 ),
+
+/*
+ * Patch by Tasos Sahanidis <tasos@tasossah.com>
+ * This flash drive always shows up with write protect enabled
+ * during the first mode sense.
+ */
+UNUSUAL_DEV(0x0951, 0x1697, 0x0100, 0x0100,
+		"Kingston",
+		"DT Ultimate G3",
+		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
+		US_FL_NO_WP_DETECT),
 
 /*
  * This Pentax still camera is not conformant
@@ -2346,11 +2350,10 @@ UNUSUAL_DEV(  0x2027, 0xa001, 0x0000, 0x9999,
 		US_FL_SCM_MULT_TARG ),
 
 /*
- * Reported by DocMAX <mail@vacharakis.de>,
- * Thomas Weißschuh <linux@weissschuh.net>
- * and Daniel Brát <danek.brat@gmail.com>
+ * Reported by DocMAX <mail@vacharakis.de>
+ * and Thomas Weißschuh <linux@weissschuh.net>
  */
-UNUSUAL_DEV( 0x2109, 0x0715, 0x0000, 0x9999,
+UNUSUAL_DEV( 0x2109, 0x0715, 0x9999, 0x9999,
 		"VIA Labs, Inc.",
 		"VL817 SATA Bridge",
 		USB_SC_DEVICE, USB_PR_DEVICE, NULL,

@@ -2,7 +2,6 @@
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
  */
-
 #define pr_fmt(fmt)	"CHARGER_ULOG: %s: " fmt, __func__
 
 #include <linux/debugfs.h>
@@ -14,7 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/rpmsg.h>
 #include <linux/slab.h>
-#include <linux/soc/qcom/pmic_glink.h>
+#include <linux/soc/qcom/qti_pmic_glink.h>
 
 #define MSG_OWNER_CHG_ULOG		32778
 #define MSG_TYPE_REQ_RESP		1
@@ -405,7 +404,7 @@ static int chg_ulog_probe(struct platform_device *pdev)
 	cd->client = pmic_glink_register_client(cd->dev, &client_data);
 	if (IS_ERR(cd->client))
 		return dev_err_probe(cd->dev, PTR_ERR(cd->client),
-				"Error in registering with pmic_glink %d\n");
+				"Error in registering with pmic_glink\n");
 
 	rc = chg_ulog_add_debugfs(cd);
 	if (rc) {
@@ -432,7 +431,7 @@ static int chg_ulog_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int chg_ulog_remove(struct platform_device *pdev)
+static void chg_ulog_remove(struct platform_device *pdev)
 {
 	struct chg_ulog_glink_dev *cd = platform_get_drvdata(pdev);
 	int rc;
@@ -446,8 +445,6 @@ static int chg_ulog_remove(struct platform_device *pdev)
 
 	ipc_log_context_destroy(cd->ipc_log);
 	ipc_log_context_destroy(cd->ipc_init_log);
-
-	return 0;
 }
 
 static const struct of_device_id chg_ulog_match_table[] = {
@@ -466,4 +463,4 @@ static struct platform_driver chg_ulog_driver = {
 module_platform_driver(chg_ulog_driver);
 
 MODULE_DESCRIPTION("QTI charger ulog glink driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

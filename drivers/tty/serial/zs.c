@@ -105,24 +105,18 @@ struct zs_parms {
 
 static struct zs_scc zs_sccs[ZS_NUM_SCCS];
 
-/*
- * Set parameters in WR5, WR12, WR13 such as not to interfere
- * with the initial PROM-based console.  Otherwise any output
- * produced before the console handover would cause the system
- * firmware to hang (TxENAB) or produce rubbish (Tx8, B9600).
- */
 static u8 zs_init_regs[ZS_NUM_REGS] __initdata = {
 	0,				/* write 0 */
 	PAR_SPEC,			/* write 1 */
 	0,				/* write 2 */
 	0,				/* write 3 */
 	X16CLK | SB1,			/* write 4 */
-	Tx8 | TxENAB,			/* write 5 */
+	0,				/* write 5 */
 	0, 0, 0,			/* write 6, 7, 8 */
 	MIE | DLC | NV,			/* write 9 */
 	NRZ,				/* write 10 */
 	TCBR | RCBR,			/* write 11 */
-	0x16, 0x00,			/* BRG time constant, write 12 + 13 */
+	0, 0,				/* BRG time constant, write 12 + 13 */
 	BRSRC | BRENABL,		/* write 14 */
 	0,				/* write 15 */
 };
@@ -545,8 +539,9 @@ static void zs_receive_chars(struct zs_port *zport)
 	struct uart_port *uport = &zport->port;
 	struct zs_scc *scc = zport->scc;
 	struct uart_icount *icount;
-	unsigned int avail, status, ch, flag;
+	unsigned int avail, status;
 	int count;
+	u8 ch, flag;
 
 	for (count = 16; count; count--) {
 		spin_lock(&scc->zlock);
@@ -611,7 +606,8 @@ static void zs_receive_chars(struct zs_port *zport)
 
 static void zs_raw_transmit_chars(struct zs_port *zport)
 {
-	struct circ_buf *xmit = &zport->port.state->xmit;
+	struct tty_port *tport = &zport->port.state->port;
+	unsigned char ch;
 
 	/* XON/XOFF chars.  */
 	if (zport->port.x_char) {
@@ -622,21 +618,20 @@ static void zs_raw_transmit_chars(struct zs_port *zport)
 	}
 
 	/* If nothing to do or stopped or hardware stopped.  */
-	if (uart_circ_empty(xmit) || uart_tx_stopped(&zport->port)) {
+	if (uart_tx_stopped(&zport->port) ||
+			!uart_fifo_get(&zport->port, &ch)) {
 		zs_raw_stop_tx(zport);
 		return;
 	}
 
 	/* Send char.  */
-	write_zsdata(zport, xmit->buf[xmit->tail]);
-	xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-	zport->port.icount.tx++;
+	write_zsdata(zport, ch);
 
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+	if (kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS)
 		uart_write_wakeup(&zport->port);
 
 	/* Are we are done?  */
-	if (uart_circ_empty(xmit))
+	if (kfifo_is_empty(&tport->xmit_fifo))
 		zs_raw_stop_tx(zport);
 }
 
@@ -685,9 +680,9 @@ static void zs_status_handle(struct zs_port *zport, struct zs_port *zport_a)
 			uart_handle_dcd_change(uport,
 					       zport->mctrl & TIOCM_CAR);
 		if (delta & TIOCM_RNG)
-			uport->icount.rng++;
-		if (delta & TIOCM_DSR)
 			uport->icount.dsr++;
+		if (delta & TIOCM_DSR)
+			uport->icount.rng++;
 
 		if (delta)
 			wake_up_interruptible(&uport->state->port.delta_msr_wait);
@@ -831,29 +826,28 @@ static void zs_shutdown(struct uart_port *uport)
 
 static void zs_reset(struct zs_port *zport)
 {
-	struct zs_port *zport_a = &zport->scc->zport[ZS_CHAN_A];
 	struct zs_scc *scc = zport->scc;
 	int irq;
 	unsigned long flags;
 
 	spin_lock_irqsave(&scc->zlock, flags);
 	irq = !irqs_disabled_flags(flags);
-	if (!zport->initialised) {
+	if (!scc->initialised) {
 		/* Reset the pointer first, just in case...  */
 		read_zsreg(zport, R0);
 		/* And let the current transmission finish.  */
 		zs_line_drain(zport, irq);
-		write_zsreg(zport, R9, zport == zport_a ? CHRA : CHRB);
+		write_zsreg(zport, R9, FHWRES);
 		udelay(10);
 		write_zsreg(zport, R9, 0);
-		zport->initialised = 1;
+		scc->initialised = 1;
 	}
 	load_zsregs(zport, zport->regs, irq);
 	spin_unlock_irqrestore(&scc->zlock, flags);
 }
 
 static void zs_set_termios(struct uart_port *uport, struct ktermios *termios,
-			   struct ktermios *old_termios)
+			   const struct ktermios *old_termios)
 {
 	struct zs_port *zport = to_zport(uport);
 	struct zs_scc *scc = zport->scc;
@@ -962,6 +956,23 @@ static void zs_set_termios(struct uart_port *uport, struct ktermios *termios,
 	spin_unlock_irqrestore(&scc->zlock, flags);
 }
 
+/*
+ * Hack alert!
+ * Required solely so that the initial PROM-based console
+ * works undisturbed in parallel with this one.
+ */
+static void zs_pm(struct uart_port *uport, unsigned int state,
+		  unsigned int oldstate)
+{
+	struct zs_port *zport = to_zport(uport);
+
+	if (state < 3)
+		zport->regs[5] |= TxENAB;
+	else
+		zport->regs[5] &= ~TxENAB;
+	write_zsreg(zport, R5, zport->regs[5]);
+}
+
 
 static const char *zs_type(struct uart_port *uport)
 {
@@ -971,7 +982,7 @@ static const char *zs_type(struct uart_port *uport)
 static void zs_release_port(struct uart_port *uport)
 {
 	iounmap(uport->membase);
-	uport->membase = 0;
+	uport->membase = NULL;
 	release_mem_region(uport->mapbase, ZS_CHAN_IO_SIZE);
 }
 
@@ -1044,6 +1055,7 @@ static const struct uart_ops zs_ops = {
 	.startup	= zs_startup,
 	.shutdown	= zs_shutdown,
 	.set_termios	= zs_set_termios,
+	.pm		= zs_pm,
 	.type		= zs_type,
 	.release_port	= zs_release_port,
 	.request_port	= zs_request_port,
@@ -1113,7 +1125,7 @@ static int __init zs_probe_sccs(void)
 
 
 #ifdef CONFIG_SERIAL_ZS_CONSOLE
-static void zs_console_putchar(struct uart_port *uport, int ch)
+static void zs_console_putchar(struct uart_port *uport, unsigned char ch)
 {
 	struct zs_port *zport = to_zport(uport);
 	struct zs_scc *scc = zport->scc;
@@ -1198,6 +1210,7 @@ static int __init zs_console_setup(struct console *co, char *options)
 		return ret;
 
 	zs_reset(zport);
+	zs_pm(uport, 0, -1);
 
 	if (options)
 		uart_parse_options(options, &baud, &parity, &bits, &flow);

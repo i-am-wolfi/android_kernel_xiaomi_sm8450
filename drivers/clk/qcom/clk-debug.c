@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2016, 2019-2021, The Linux Foundation. All rights reserved. */
+/* Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. */
 
 #include <linux/clk.h>
 #include <linux/export.h>
@@ -12,6 +13,7 @@
 #include <linux/bitops.h>
 #include <linux/clk/qcom.h>
 #include <linux/mfd/syscon.h>
+#include <soc/qcom/minidump.h>
 #include <trace/events/power.h>
 
 #define CREATE_TRACE_POINTS
@@ -24,6 +26,7 @@
 static struct clk_hw *measure;
 static bool debug_suspend;
 static bool debug_suspend_atomic;
+static bool qcom_clk_debug_inited;
 static struct dentry *clk_debugfs_suspend;
 static struct dentry *clk_debugfs_suspend_atomic;
 
@@ -50,6 +53,8 @@ static LIST_HEAD(clk_hw_debug_mux_list);
 #define XO_DIV4_TERM_CNT_MASK	GENMASK(19, 0)
 #define MEASURE_CNT		GENMASK(24, 0)
 #define CBCR_ENA		BIT(0)
+
+#define CLK_CORE_SIZE		264
 
 static int _clk_runtime_get_debug_mux(struct clk_debug_mux *mux, bool get)
 {
@@ -286,10 +291,11 @@ static int clk_debug_mux_set_parent(struct clk_hw *hw, u8 index)
 	if (ret)
 		goto err;
 
-	/* Set the mux's post divider bits */
-	ret = regmap_update_bits(mux->regmap, mux->post_div_offset,
-				 mux->post_div_mask,
-				 (mux->post_div_val - 1) << mux->post_div_shift);
+	if (mux->post_div_offset != U32_MAX)
+		/* Set the mux's post divider bits */
+		ret = regmap_update_bits(mux->regmap, mux->post_div_offset,
+					 mux->post_div_mask,
+					 (mux->post_div_val - 1) << mux->post_div_shift);
 
 err:
 	clk_runtime_put_debug_mux(mux);
@@ -321,6 +327,7 @@ const struct clk_ops clk_debug_mux_ops = {
 	.get_parent = clk_debug_mux_get_parent,
 	.set_parent = clk_debug_mux_set_parent,
 	.debug_init = clk_debug_measure_add,
+	.determine_rate = clk_hw_determine_rate_no_reparent,
 	.init = clk_debug_mux_init,
 };
 EXPORT_SYMBOL(clk_debug_mux_ops);
@@ -443,6 +450,9 @@ static int clk_debug_measure_get(void *data, u64 *val)
 	int ret = 0;
 	u32 regval;
 
+	if (!measure)
+		return -EINVAL;
+
 	ret = clk_runtime_get_debug_mux(meas);
 	if (ret)
 		return ret;
@@ -451,7 +461,8 @@ static int clk_debug_measure_get(void *data, u64 *val)
 
 	ret = clk_find_and_set_parent(measure, hw);
 	if (ret) {
-		pr_err("Failed to set the debug mux's parent.\n");
+		pr_err("Failed to set the debug mux's parent for %s\n",
+		       qcom_clk_hw_get_name(hw));
 		goto exit;
 	}
 
@@ -536,33 +547,33 @@ EXPORT_SYMBOL(clk_debug_measure_register);
  * @mux: debug mux that requires a regmap
  *
  * This function attempts to look up and map a regmap for a debug mux
- * using syscon_regmap_lookup_by_phandle if the base name property exists
- * and assigns an appropriate regmap.
+ * using device_node_to_regmap if the base name property exists and
+ * assigns an appropriate regmap.
  *
  * Returns 0 on success, -EBADR when it can't find base name, -EERROR otherwise.
  */
 int map_debug_bases(struct platform_device *pdev, const char *base,
 		    struct clk_debug_mux *mux)
 {
+	struct device_node *syscon_np;
+	int ret = 0;
+
 	if (!of_get_property(pdev->dev.of_node, base, NULL))
 		return -EBADR;
 
-	mux->regmap = syscon_regmap_lookup_by_phandle(pdev->dev.of_node,
-						     base);
+	syscon_np = of_parse_phandle(pdev->dev.of_node, base, 0);
+	if (!syscon_np)
+		return -ENODEV;
+
+	mux->regmap = device_node_to_regmap(syscon_np);
 	if (IS_ERR(mux->regmap)) {
 		pr_err("Failed to map %s (ret=%ld)\n", base,
 				PTR_ERR(mux->regmap));
-		return PTR_ERR(mux->regmap);
+		ret = PTR_ERR(mux->regmap);
 	}
 
-	/*
-	 * syscon_regmap_lookup_by_phandle prepares the 0th clk handle provided
-	 * in the device node. The debug clock controller prepares/enables/
-	 * disables the required clock, thus detach the clock.
-	 */
-	regmap_mmio_detach_clk(mux->regmap);
-
-	return 0;
+	of_node_put(syscon_np);
+	return ret;
 }
 EXPORT_SYMBOL(map_debug_bases);
 
@@ -672,6 +683,14 @@ static int list_rates_show(struct seq_file *s, void *unused)
 	int i = 0, level;
 	unsigned long rate, rate_max = 0;
 
+	/*
+	 * Some RCGs don't populate their freq_tbl until the first
+	 * determine_rate() callback (e.g. DFS and CRM). Ensure this happens by
+	 * calling clk_round_rate(), which will internally call
+	 * determine_rate().
+	 */
+	clk_round_rate(hw->clk, 0);
+
 	/* Find max frequency supported within voltage constraints. */
 	if (!vdd_class) {
 		rate_max = ULONG_MAX;
@@ -711,7 +730,7 @@ void clk_debug_print_hw(struct clk_hw *hw, struct seq_file *f)
 {
 	struct clk_regmap *rclk;
 
-	if (IS_ERR_OR_NULL(hw))
+	if (IS_ERR_OR_NULL(hw) || !hw->core)
 		return;
 
 	clk_debug_print_hw(clk_hw_get_parent(hw), f);
@@ -766,6 +785,27 @@ void clk_common_debug_init(struct clk_hw *hw, struct dentry *dentry)
 	debugfs_create_file("clk_print_regs", 0444, dentry, hw,
 			    &clock_print_hw_fops);
 
+	if (!qcom_clk_debug_inited) {
+		clk_debug_init();
+		qcom_clk_debug_inited = true;
+	}
+}
+
+static int clk_list_rate_vdd_level(struct clk_hw *hw, unsigned int rate)
+{
+	struct clk_regmap *rclk;
+	struct clk_vdd_class_data *vdd_data;
+
+	if (!clk_is_regmap_clk(hw))
+		return 0;
+
+	rclk = to_clk_regmap(hw);
+	vdd_data = &rclk->vdd_data;
+
+	if (!vdd_data->vdd_class)
+		return 0;
+
+	return clk_find_vdd_level(hw, vdd_data, rate);
 }
 
 static int clock_debug_print_clock(struct hw_debug_clk *dclk, struct seq_file *s)
@@ -803,10 +843,12 @@ static int clock_debug_print_clock(struct hw_debug_clk *dclk, struct seq_file *s
 		if (!clk_hw)
 			break;
 
-		clk_rate = clk_hw_get_rate(clk_hw);
-
-		if (!atomic)
+		if (!atomic) {
+			clk_rate = clk_get_rate(clk);
 			vdd_level = clk_list_rate_vdd_level(clk_hw, clk_rate);
+		} else {
+			clk_rate = clk_hw_get_rate(clk_hw);
+		}
 
 		if (s) {
 			/*
@@ -942,7 +984,6 @@ static void clk_debug_suspend_trace_probe(void *unused,
 					const char *action, int val, bool start)
 {
 	if (start && val > 0 && !strcmp("machine_suspend", action)) {
-		pr_info("Enabled Clocks:\n");
 		clock_debug_print_enabled_clocks(NULL);
 	}
 }
@@ -1015,6 +1056,26 @@ static void clk_debug_unregister(void)
 		clk_hw_debug_remove(dclk);
 	mutex_unlock(&clk_debug_lock);
 }
+
+#ifdef CONFIG_QCOM_MINIDUMP_CLK
+void clk_debug_register_minidump(struct clk_hw *hw)
+{
+	struct md_region md_entry;
+
+	if (!msm_minidump_enabled())
+		return;
+
+	scnprintf(md_entry.name, sizeof(md_entry.name), "%s",
+			qcom_clk_hw_get_name(hw));
+	md_entry.virt_addr = (uintptr_t)hw->core;
+	md_entry.phys_addr = virt_to_phys((void *)(hw->core));
+	md_entry.size = CLK_CORE_SIZE;
+
+	if (msm_minidump_add_region(&md_entry) < 0)
+		pr_warn("Failed to register clk %s in minidump\n", md_entry.name);
+}
+EXPORT_SYMBOL_GPL(clk_debug_register_minidump);
+#endif
 
 /**
  * clk_hw_debug_register - add a clk node to the debugfs clk directory

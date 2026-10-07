@@ -231,14 +231,14 @@ static void lx_message_dump(struct lx_rmh *rmh)
 	u8 idx = rmh->cmd_idx;
 	int i;
 
-	snd_printk(LXRMH "command %s\n", dsp_commands[idx].dcOpName);
+	pr_debug(LXRMH "command %s\n", dsp_commands[idx].dcOpName);
 
 	for (i = 0; i != rmh->cmd_len; ++i)
-		snd_printk(LXRMH "\tcmd[%d] %08x\n", i, rmh->cmd[i]);
+		pr_debug(LXRMH "\tcmd[%d] %08x\n", i, rmh->cmd[i]);
 
 	for (i = 0; i != rmh->stat_len; ++i)
-		snd_printk(LXRMH "\tstat[%d]: %08x\n", i, rmh->stat[i]);
-	snd_printk("\n");
+		pr_debug(LXRMH "\tstat[%d]: %08x\n", i, rmh->stat[i]);
+	pr_debug("\n");
 }
 #else
 static inline void lx_message_dump(struct lx_rmh *rmh)
@@ -673,10 +673,6 @@ int lx_stream_set_format(struct lx6464es *chip, struct snd_pcm_runtime *runtime,
 	u32 pipe_cmd = PIPE_INFO_TO_CMD(is_capture, pipe);
 	u32 channels = runtime->channels;
 
-	if (runtime->channels != channels)
-		dev_err(chip->card->dev, "channel count mismatch: %d vs %d",
-			   runtime->channels, channels);
-
 	mutex_lock(&chip->msg_lock);
 	lx_message_init(&chip->rmh, CMD_0C_DEF_STREAM);
 
@@ -1019,7 +1015,10 @@ static int lx_interrupt_request_new_buffer(struct lx6464es *chip,
 	const unsigned int is_capture = lx_stream->is_capture;
 	int err;
 
-	const u32 period_bytes = snd_pcm_lib_period_bytes(substream);
+	const u32 channels = substream->runtime->channels;
+	const u32 bytes_per_frame = channels * 3;
+	const u32 period_size = substream->runtime->period_size;
+	const u32 period_bytes = period_size * bytes_per_frame;
 	const u32 pos = lx_stream->frame_pos;
 	const u32 next_pos = ((pos+1) == substream->runtime->periods) ?
 		0 : pos + 1;

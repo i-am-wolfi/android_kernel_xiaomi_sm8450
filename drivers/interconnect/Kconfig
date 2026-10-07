@@ -11,17 +11,33 @@ menuconfig INTERCONNECT
 
 if INTERCONNECT
 
-menuconfig INTERCONNECT_TEST
-	tristate "Debugfs test"
-	depends on DEBUG_FS
+source "drivers/interconnect/imx/Kconfig"
+source "drivers/interconnect/mediatek/Kconfig"
+source "drivers/interconnect/qcom/Kconfig"
+source "drivers/interconnect/samsung/Kconfig"
+
+config INTERCONNECT_CLK
+	tristate
+	depends on COMMON_CLK
 	help
-	  Expose the interconnect API to userspace for testing purposes. This
-	  will create /sys/kernel/debug/interconnect-test to allow requesting
-	  bandwidth between endpoints.
+	  Support for wrapping clocks into the interconnect nodes.
+
+endif
+
+# --- marble: qcom additions (merged) ---
+menuconfig INTERCONNECT
+	bool "On-Chip Interconnect management support"
+	help
+	  Support for management of the on-chip interconnects.
+
+	  This framework is designed to provide a generic interface for
+	  managing the interconnects in a SoC.
 
 	  If unsure, say no.
 
-source "drivers/interconnect/imx/Kconfig"
-source "drivers/interconnect/qcom/Kconfig"
+config INTERCONNECT_CLK
+	tristate
+	depends on COMMON_CLK
+	help
+	  Support for wrapping clocks into the interconnect nodes.
 
-endif

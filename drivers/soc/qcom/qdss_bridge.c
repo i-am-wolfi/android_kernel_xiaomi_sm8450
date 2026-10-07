@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #define KMSG_COMPONENT "QDSS diag bridge"
@@ -226,8 +226,7 @@ static ssize_t mode_show(struct device *dev,
 {
 	struct qdss_bridge_drvdata *drvdata = dev_get_drvdata(dev);
 
-	return scnprintf(buf, PAGE_SIZE, "%s\n",
-			str_mhi_transfer_mode[drvdata->mode]);
+	return sysfs_emit(buf, "%s\n", str_mhi_transfer_mode[drvdata->mode]);
 }
 
 static ssize_t curr_chan_show(struct device *dev,
@@ -235,7 +234,7 @@ static ssize_t curr_chan_show(struct device *dev,
 {
 	if (curr_chan < QDSS || curr_chan > EMPTY)
 		return -EINVAL;
-	return scnprintf(buf, PAGE_SIZE, "%s\n", str_mhi_curr_chan[curr_chan]);
+	return sysfs_emit(buf, "%s\n", str_mhi_curr_chan[curr_chan]);
 }
 
 static ssize_t mode_store(struct device *dev,
@@ -337,6 +336,8 @@ static void mhi_read_work_fn(struct work_struct *work)
 					     struct qdss_bridge_drvdata,
 					     read_work);
 
+	if (!bridge_drvdata)
+		return;
 	do {
 		spin_lock_bh(&drvdata->lock);
 		if (drvdata->opened != ENABLE) {
@@ -461,7 +462,10 @@ static void usb_write_done(struct qdss_bridge_drvdata *drvdata,
 		pr_err_ratelimited("USB write failed err:%d\n", d_req->status);
 
 	qdss_buf_tbl_remove(drvdata, d_req->buf);
-	mhi_queue_read(drvdata);
+	spin_lock_bh(&drvdata->lock);
+	if (drvdata->opened == ENABLE)
+		mhi_queue_read(drvdata);
+	spin_unlock_bh(&drvdata->lock);
 }
 
 static void usb_notifier(void *priv, unsigned int event,
@@ -852,6 +856,7 @@ static void qdss_mhi_remove(struct mhi_device *mhi_dev)
 	device_destroy(mhi_class, drvdata->cdev->dev);
 	unregister_chrdev_region(drvdata->cdev->dev, 1);
 	cdev_del(drvdata->cdev);
+	bridge_drvdata = NULL;
 }
 
 int qdss_mhi_init(struct qdss_bridge_drvdata *drvdata)
@@ -988,7 +993,7 @@ static int __init qdss_bridge_init(void)
 {
 	int ret;
 
-	mhi_class = class_create(THIS_MODULE, MODULE_NAME);
+	mhi_class = class_create(MODULE_NAME);
 	if (IS_ERR(mhi_class))
 		return -ENODEV;
 
@@ -1008,5 +1013,5 @@ static void __exit qdss_bridge_exit(void)
 
 module_init(qdss_bridge_init);
 module_exit(qdss_bridge_exit);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("QDSS Bridge driver");

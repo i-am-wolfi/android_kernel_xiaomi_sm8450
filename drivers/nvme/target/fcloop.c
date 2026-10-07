@@ -360,7 +360,7 @@ fcloop_h2t_ls_req(struct nvme_fc_local_port *localport,
 		spin_lock(&rport->lock);
 		list_add_tail(&tls_req->ls_list, &rport->ls_list);
 		spin_unlock(&rport->lock);
-		schedule_work(&rport->ls_work);
+		queue_work(nvmet_wq, &rport->ls_work);
 		return ret;
 	}
 
@@ -393,7 +393,7 @@ fcloop_h2t_xmt_ls_rsp(struct nvmet_fc_target_port *targetport,
 		spin_lock(&rport->lock);
 		list_add_tail(&tls_req->ls_list, &rport->ls_list);
 		spin_unlock(&rport->lock);
-		schedule_work(&rport->ls_work);
+		queue_work(nvmet_wq, &rport->ls_work);
 	}
 
 	return 0;
@@ -448,7 +448,7 @@ fcloop_t2h_ls_req(struct nvmet_fc_target_port *targetport, void *hosthandle,
 		spin_lock(&tport->lock);
 		list_add_tail(&tls_req->ls_list, &tport->ls_list);
 		spin_unlock(&tport->lock);
-		schedule_work(&tport->ls_work);
+		queue_work(nvmet_wq, &tport->ls_work);
 		return ret;
 	}
 
@@ -480,7 +480,7 @@ fcloop_t2h_xmt_ls_rsp(struct nvme_fc_local_port *localport,
 		spin_lock(&tport->lock);
 		list_add_tail(&tls_req->ls_list, &tport->ls_list);
 		spin_unlock(&tport->lock);
-		schedule_work(&tport->ls_work);
+		queue_work(nvmet_wq, &tport->ls_work);
 	}
 
 	return 0;
@@ -490,6 +490,16 @@ static void
 fcloop_t2h_host_release(void *hosthandle)
 {
 	/* host handle ignored for now */
+}
+
+static int
+fcloop_t2h_host_traddr(void *hosthandle, u64 *wwnn, u64 *wwpn)
+{
+	struct fcloop_rport *rport = hosthandle;
+
+	*wwnn = rport->lport->localport->node_name;
+	*wwpn = rport->lport->localport->port_name;
+	return 0;
 }
 
 /*
@@ -520,7 +530,7 @@ fcloop_tgt_discovery_evt(struct nvmet_fc_target_port *tgtport)
 	tgt_rscn->tport = tgtport->private;
 	INIT_WORK(&tgt_rscn->work, fcloop_tgt_rscn_work);
 
-	schedule_work(&tgt_rscn->work);
+	queue_work(nvmet_wq, &tgt_rscn->work);
 }
 
 static void
@@ -564,17 +574,62 @@ fcloop_call_host_done(struct nvmefc_fcp_req *fcpreq,
 	fcloop_tfcp_req_put(tfcp_req);
 }
 
+static bool drop_fabric_opcode;
+#define DROP_OPCODE_MASK	0x00FF
+/* fabrics opcode will have a bit set above 1st byte */
+static int drop_opcode = -1;
+static int drop_instance;
+static int drop_amount;
+static int drop_current_cnt;
+
+/*
+ * Routine to parse io and determine if the io is to be dropped.
+ * Returns:
+ *  0 if io is not obstructed
+ *  1 if io was dropped
+ */
+static int check_for_drop(struct fcloop_fcpreq *tfcp_req)
+{
+	struct nvmefc_fcp_req *fcpreq = tfcp_req->fcpreq;
+	struct nvme_fc_cmd_iu *cmdiu = fcpreq->cmdaddr;
+	struct nvme_command *sqe = &cmdiu->sqe;
+
+	if (drop_opcode == -1)
+		return 0;
+
+	pr_info("%s: seq opcd x%02x fctype x%02x: drop F %s op x%02x "
+		"inst %d start %d amt %d\n",
+		__func__, sqe->common.opcode, sqe->fabrics.fctype,
+		drop_fabric_opcode ? "y" : "n",
+		drop_opcode, drop_current_cnt, drop_instance, drop_amount);
+
+	if ((drop_fabric_opcode &&
+	     (sqe->common.opcode != nvme_fabrics_command ||
+	      sqe->fabrics.fctype != drop_opcode)) ||
+	    (!drop_fabric_opcode && sqe->common.opcode != drop_opcode))
+		return 0;
+
+	if (++drop_current_cnt >= drop_instance) {
+		if (drop_current_cnt >= drop_instance + drop_amount)
+			drop_opcode = -1;
+		return 1;
+	}
+
+	return 0;
+}
+
 static void
 fcloop_fcp_recv_work(struct work_struct *work)
 {
 	struct fcloop_fcpreq *tfcp_req =
 		container_of(work, struct fcloop_fcpreq, fcp_rcv_work);
-	struct nvmefc_fcp_req *fcpreq = tfcp_req->fcpreq;
+	struct nvmefc_fcp_req *fcpreq;
 	unsigned long flags;
 	int ret = 0;
 	bool aborted = false;
 
 	spin_lock_irqsave(&tfcp_req->reqlock, flags);
+	fcpreq = tfcp_req->fcpreq;
 	switch (tfcp_req->inistate) {
 	case INI_IO_START:
 		tfcp_req->inistate = INI_IO_ACTIVE;
@@ -589,16 +644,21 @@ fcloop_fcp_recv_work(struct work_struct *work)
 	}
 	spin_unlock_irqrestore(&tfcp_req->reqlock, flags);
 
-	if (unlikely(aborted))
-		ret = -ECANCELED;
-	else
-		ret = nvmet_fc_rcv_fcp_req(tfcp_req->tport->targetport,
-				&tfcp_req->tgt_fcp_req,
-				fcpreq->cmdaddr, fcpreq->cmdlen);
+	if (unlikely(aborted)) {
+		/* the abort handler will call fcloop_call_host_done */
+		return;
+	}
+
+	if (unlikely(check_for_drop(tfcp_req))) {
+		pr_info("%s: dropped command ********\n", __func__);
+		return;
+	}
+
+	ret = nvmet_fc_rcv_fcp_req(tfcp_req->tport->targetport,
+				   &tfcp_req->tgt_fcp_req,
+				   fcpreq->cmdaddr, fcpreq->cmdlen);
 	if (ret)
 		fcloop_call_host_done(fcpreq, tfcp_req, ret);
-
-	return;
 }
 
 static void
@@ -611,9 +671,10 @@ fcloop_fcp_abort_recv_work(struct work_struct *work)
 	unsigned long flags;
 
 	spin_lock_irqsave(&tfcp_req->reqlock, flags);
-	fcpreq = tfcp_req->fcpreq;
 	switch (tfcp_req->inistate) {
 	case INI_IO_ABORTED:
+		fcpreq = tfcp_req->fcpreq;
+		tfcp_req->fcpreq = NULL;
 		break;
 	case INI_IO_COMPLETED:
 		completed = true;
@@ -634,10 +695,6 @@ fcloop_fcp_abort_recv_work(struct work_struct *work)
 	if (tfcp_req->tport->targetport)
 		nvmet_fc_rcv_fcp_abort(tfcp_req->tport->targetport,
 					&tfcp_req->tgt_fcp_req);
-
-	spin_lock_irqsave(&tfcp_req->reqlock, flags);
-	tfcp_req->fcpreq = NULL;
-	spin_unlock_irqrestore(&tfcp_req->reqlock, flags);
 
 	fcloop_call_host_done(fcpreq, tfcp_req, -ECANCELED);
 	/* call_host_done releases reference for abort downcall */
@@ -694,7 +751,7 @@ fcloop_fcp_req(struct nvme_fc_local_port *localport,
 	INIT_WORK(&tfcp_req->tio_done_work, fcloop_tgt_fcprqst_done_work);
 	kref_init(&tfcp_req->ref);
 
-	schedule_work(&tfcp_req->fcp_rcv_work);
+	queue_work(nvmet_wq, &tfcp_req->fcp_rcv_work);
 
 	return 0;
 }
@@ -878,7 +935,7 @@ fcloop_fcp_req_release(struct nvmet_fc_target_port *tgtport,
 {
 	struct fcloop_fcpreq *tfcp_req = tgt_fcp_req_to_fcpreq(tgt_fcpreq);
 
-	schedule_work(&tfcp_req->tio_done_work);
+	queue_work(nvmet_wq, &tfcp_req->tio_done_work);
 }
 
 static void
@@ -934,7 +991,7 @@ fcloop_fcp_abort(struct nvme_fc_local_port *localport,
 
 	if (abortio)
 		/* leave the reference while the work item is scheduled */
-		WARN_ON(!schedule_work(&tfcp_req->abort_rcv_work));
+		WARN_ON(!queue_work(nvmet_wq, &tfcp_req->abort_rcv_work));
 	else  {
 		/*
 		 * as the io has already had the done callback made,
@@ -949,11 +1006,6 @@ fcloop_nport_free(struct kref *ref)
 {
 	struct fcloop_nport *nport =
 		container_of(ref, struct fcloop_nport, ref);
-	unsigned long flags;
-
-	spin_lock_irqsave(&fcloop_lock, flags);
-	list_del(&nport->nport_list);
-	spin_unlock_irqrestore(&fcloop_lock, flags);
 
 	kfree(nport);
 }
@@ -1033,6 +1085,7 @@ static struct nvmet_fc_target_template tgttemplate = {
 	.ls_req			= fcloop_t2h_ls_req,
 	.ls_abort		= fcloop_t2h_ls_abort,
 	.host_release		= fcloop_t2h_host_release,
+	.host_traddr		= fcloop_t2h_host_traddr,
 	.max_hw_queues		= FCLOOP_HW_QUEUES,
 	.max_sgl_segments	= FCLOOP_SGL_SEGS,
 	.max_dif_sgl_segments	= FCLOOP_SGL_SEGS,
@@ -1120,7 +1173,8 @@ __wait_localport_unreg(struct fcloop_lport *lport)
 
 	ret = nvme_fc_unregister_localport(lport->localport);
 
-	wait_for_completion(&lport->unreg_done);
+	if (!ret)
+		wait_for_completion(&lport->unreg_done);
 
 	kfree(lport);
 
@@ -1310,6 +1364,8 @@ __unlink_remote_port(struct fcloop_nport *nport)
 		nport->tport->remoteport = NULL;
 	nport->rport = NULL;
 
+	list_del(&nport->nport_list);
+
 	return rport;
 }
 
@@ -1455,6 +1511,34 @@ fcloop_delete_target_port(struct device *dev, struct device_attribute *attr,
 	return ret ? ret : count;
 }
 
+static ssize_t
+fcloop_set_cmd_drop(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	unsigned int opcode;
+	int starting, amount;
+
+	if (sscanf(buf, "%x:%d:%d", &opcode, &starting, &amount) != 3)
+		return -EBADRQC;
+
+	drop_current_cnt = 0;
+	drop_fabric_opcode = (opcode & ~DROP_OPCODE_MASK) ? true : false;
+	drop_opcode = (opcode & DROP_OPCODE_MASK);
+	drop_instance = starting;
+	/* the check to drop routine uses instance + count to know when
+	 * to end. Thus, if dropping 1 instance, count should be 0.
+	 * so subtract 1 from the count.
+	 */
+	drop_amount = amount - 1;
+
+	pr_info("%s: DROP: Starting at instance %d of%s opcode x%x drop +%d "
+		"instances\n",
+		__func__, drop_instance, drop_fabric_opcode ? " fabric" : "",
+		drop_opcode, drop_amount);
+
+	return count;
+}
+
 
 static DEVICE_ATTR(add_local_port, 0200, NULL, fcloop_create_local_port);
 static DEVICE_ATTR(del_local_port, 0200, NULL, fcloop_delete_local_port);
@@ -1462,6 +1546,7 @@ static DEVICE_ATTR(add_remote_port, 0200, NULL, fcloop_create_remote_port);
 static DEVICE_ATTR(del_remote_port, 0200, NULL, fcloop_delete_remote_port);
 static DEVICE_ATTR(add_target_port, 0200, NULL, fcloop_create_target_port);
 static DEVICE_ATTR(del_target_port, 0200, NULL, fcloop_delete_target_port);
+static DEVICE_ATTR(set_cmd_drop, 0200, NULL, fcloop_set_cmd_drop);
 
 static struct attribute *fcloop_dev_attrs[] = {
 	&dev_attr_add_local_port.attr,
@@ -1470,10 +1555,11 @@ static struct attribute *fcloop_dev_attrs[] = {
 	&dev_attr_del_remote_port.attr,
 	&dev_attr_add_target_port.attr,
 	&dev_attr_del_target_port.attr,
+	&dev_attr_set_cmd_drop.attr,
 	NULL
 };
 
-static struct attribute_group fclopp_dev_attrs_group = {
+static const struct attribute_group fclopp_dev_attrs_group = {
 	.attrs		= fcloop_dev_attrs,
 };
 
@@ -1482,7 +1568,9 @@ static const struct attribute_group *fcloop_dev_attr_groups[] = {
 	NULL,
 };
 
-static struct class *fcloop_class;
+static const struct class fcloop_class = {
+	.name = "fcloop",
+};
 static struct device *fcloop_device;
 
 
@@ -1490,15 +1578,14 @@ static int __init fcloop_init(void)
 {
 	int ret;
 
-	fcloop_class = class_create(THIS_MODULE, "fcloop");
-	if (IS_ERR(fcloop_class)) {
+	ret = class_register(&fcloop_class);
+	if (ret) {
 		pr_err("couldn't register class fcloop\n");
-		ret = PTR_ERR(fcloop_class);
 		return ret;
 	}
 
 	fcloop_device = device_create_with_groups(
-				fcloop_class, NULL, MKDEV(0, 0), NULL,
+				&fcloop_class, NULL, MKDEV(0, 0), NULL,
 				fcloop_dev_attr_groups, "ctl");
 	if (IS_ERR(fcloop_device)) {
 		pr_err("couldn't create ctl device!\n");
@@ -1511,14 +1598,14 @@ static int __init fcloop_init(void)
 	return 0;
 
 out_destroy_class:
-	class_destroy(fcloop_class);
+	class_unregister(&fcloop_class);
 	return ret;
 }
 
 static void __exit fcloop_exit(void)
 {
-	struct fcloop_lport *lport;
-	struct fcloop_nport *nport;
+	struct fcloop_lport *lport = NULL;
+	struct fcloop_nport *nport = NULL;
 	struct fcloop_tport *tport;
 	struct fcloop_rport *rport;
 	unsigned long flags;
@@ -1569,11 +1656,12 @@ static void __exit fcloop_exit(void)
 
 	put_device(fcloop_device);
 
-	device_destroy(fcloop_class, MKDEV(0, 0));
-	class_destroy(fcloop_class);
+	device_destroy(&fcloop_class, MKDEV(0, 0));
+	class_unregister(&fcloop_class);
 }
 
 module_init(fcloop_init);
 module_exit(fcloop_exit);
 
+MODULE_DESCRIPTION("NVMe target FC loop transport driver");
 MODULE_LICENSE("GPL v2");

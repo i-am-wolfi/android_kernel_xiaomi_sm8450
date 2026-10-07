@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017-2018, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/module.h>
@@ -202,4 +201,4 @@ static struct platform_driver reg_dev_driver = {
 	.probe = reg_dev_probe,
 };
 module_platform_driver(reg_dev_driver);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

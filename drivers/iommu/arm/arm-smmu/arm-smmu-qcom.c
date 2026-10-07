@@ -1,68 +1,387 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/acpi.h>
 #include <linux/adreno-smmu-priv.h>
-#include <linux/bitfield.h>
-#include <linux/interrupt.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+
 #include <linux/of_device.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
 #include "arm-smmu.h"
-#include "arm-smmu-debug.h"
-#include <linux/debugfs.h>
-#include <linux/uaccess.h>
+#include "arm-smmu-qcom.h"
 
-struct qcom_smmu {
-	struct arm_smmu_device smmu;
-	bool bypass_quirk;
-	u8 bypass_cbndx;
+#define QCOM_DUMMY_VAL	-1
+
+#define IMPL_DEF4_MICRO_MMU_CTRL	0
+#define IMPL_DEF4_CLK_ON_STATUS		0x50
+#define IMPL_DEF4_CLK_ON_CLIENT_STATUS	0x54
+#define MICRO_MMU_CTRL_LOCAL_HALT_REQ	BIT(2)
+#define MICRO_MMU_CTRL_IDLE		BIT(3)
+
+/* Definitions for implementation-defined registers */
+#define ACTLR_QCOM_OSH			BIT(28)
+#define ACTLR_QCOM_ISH			BIT(29)
+#define ACTLR_QCOM_NSH			BIT(30)
+
+struct arm_smmu_impl_def_reg {
+	u32 offset;
+	u32 value;
 };
 
-static int qcom_sdm845_smmu500_cfg_probe(struct arm_smmu_device *smmu)
+struct qsmmuv2_archdata {
+	spinlock_t			atos_lock;
+	struct arm_smmu_impl_def_reg	*impl_def_attach_registers;
+	unsigned int			num_impl_def_attach_registers;
+	struct arm_smmu_device		smmu;
+};
+
+#define to_qsmmuv2_archdata(smmu)				\
+	container_of(smmu, struct qsmmuv2_archdata, smmu)
+
+static int qsmmuv2_wait_for_halt(struct arm_smmu_device *smmu)
 {
-	u32 s2cr;
-	u32 smr;
-	int i;
+	void __iomem *reg = arm_smmu_page(smmu, ARM_SMMU_IMPL_DEF4);
+	struct device *dev = smmu->dev;
+	u32 tmp;
 
-	for (i = 0; i < smmu->num_mapping_groups; i++) {
-		smr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_SMR(i));
-		s2cr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_S2CR(i));
-
-		smmu->smrs[i].mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr);
-		smmu->smrs[i].id = FIELD_GET(ARM_SMMU_SMR_ID, smr);
-		if (smmu->features & ARM_SMMU_FEAT_EXIDS)
-			smmu->smrs[i].valid = FIELD_GET(
-						ARM_SMMU_S2CR_EXIDVALID,
-						s2cr);
-		else
-			smmu->smrs[i].valid = FIELD_GET(
-						ARM_SMMU_SMR_VALID,
-						smr);
-
-		smmu->s2crs[i].group = NULL;
-		smmu->s2crs[i].count = 0;
-		smmu->s2crs[i].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, s2cr);
-		smmu->s2crs[i].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, s2cr);
-		smmu->s2crs[i].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, s2cr);
-
-		if (!smmu->smrs[i].valid)
-			continue;
-
-		smmu->s2crs[i].pinned = true;
-		bitmap_set(smmu->context_map, smmu->s2crs[i].cbndx, 1);
+	if (readl_poll_timeout_atomic(reg + IMPL_DEF4_MICRO_MMU_CTRL, tmp,
+				(tmp & MICRO_MMU_CTRL_IDLE), 0, 30000)) {
+		dev_err(dev, "Couldn't halt SMMU!\n");
+		return -EBUSY;
 	}
 
 	return 0;
+}
+
+static int __qsmmuv2_halt(struct arm_smmu_device *smmu, bool wait)
+{
+	u32 val;
+
+	val = arm_smmu_readl(smmu, ARM_SMMU_IMPL_DEF4,
+				     IMPL_DEF4_MICRO_MMU_CTRL);
+	val |= MICRO_MMU_CTRL_LOCAL_HALT_REQ;
+
+	arm_smmu_writel(smmu, ARM_SMMU_IMPL_DEF4, IMPL_DEF4_MICRO_MMU_CTRL,
+				val);
+
+	return wait ? qsmmuv2_wait_for_halt(smmu) : 0;
+}
+
+static int qsmmuv2_halt(struct arm_smmu_device *smmu)
+{
+	return __qsmmuv2_halt(smmu, true);
+}
+
+static int qsmmuv2_halt_nowait(struct arm_smmu_device *smmu)
+{
+	return __qsmmuv2_halt(smmu, false);
+}
+
+static void qsmmuv2_resume(struct arm_smmu_device *smmu)
+{
+	u32 val;
+
+	val = arm_smmu_readl(smmu, ARM_SMMU_IMPL_DEF4,
+			     IMPL_DEF4_MICRO_MMU_CTRL);
+	val &= ~MICRO_MMU_CTRL_LOCAL_HALT_REQ;
+
+	arm_smmu_writel(smmu, ARM_SMMU_IMPL_DEF4, IMPL_DEF4_MICRO_MMU_CTRL,
+				val);
+}
+
+
+static phys_addr_t __qsmmuv2_iova_to_phys_hard(
+					struct arm_smmu_domain *smmu_domain,
+					dma_addr_t iova)
+{
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct device *dev = smmu->dev;
+	int idx = cfg->cbndx;
+	void __iomem *reg;
+	u32 tmp;
+	u64 phys;
+	unsigned long va;
+
+	/* ATS1 registers can only be written atomically */
+	va = iova & ~0xfffUL;
+	if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64)
+		arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_ATS1PR, va);
+	else
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_ATS1PR, va);
+
+	reg = arm_smmu_page(smmu, ARM_SMMU_CB(smmu, idx));
+	if (readl_poll_timeout_atomic(reg + ARM_SMMU_CB_ATSR, tmp,
+				      !(tmp & ARM_SMMU_CB_ATSR_ACTIVE), 5, 50)) {
+		dev_err(dev, "iova to phys timed out on %pad.\n", &iova);
+		phys = 0;
+		return phys;
+	}
+
+	phys = arm_smmu_cb_readq(smmu, idx, ARM_SMMU_CB_PAR);
+	if (phys & ARM_SMMU_CB_PAR_F) {
+		dev_err(dev, "translation fault!\n");
+		dev_err(dev, "PAR = 0x%llx\n", phys);
+		phys = 0;
+	} else {
+		phys = (phys & (PHYS_MASK & ~0xfffULL)) | (iova & 0xfff);
+	}
+
+	return phys;
+}
+
+static phys_addr_t qsmmuv2_iova_to_phys_hard(
+					struct arm_smmu_domain *smmu_domain,
+					struct qcom_iommu_atos_txn *txn)
+{
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	struct qsmmuv2_archdata *data = to_qsmmuv2_archdata(smmu);
+	int idx = smmu_domain->cfg.cbndx;
+	dma_addr_t iova = txn->addr;
+	phys_addr_t phys = 0;
+	unsigned long flags;
+	u32 sctlr, sctlr_orig, fsr;
+
+	spin_lock_irqsave(&data->atos_lock, flags);
+
+	qsmmuv2_halt_nowait(smmu);
+
+	/* disable stall mode momentarily */
+	sctlr_orig = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_SCTLR);
+	sctlr = sctlr_orig & ~(ARM_SMMU_SCTLR_CFCFG);
+	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, sctlr);
+
+	/* clear FSR to allow ATOS to log any faults */
+	fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
+	if (fsr & ARM_SMMU_CB_FSR_FAULT) {
+		/* Clear pending interrupts */
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_FSR, fsr);
+		/*
+		 * Barrier required to ensure that the FSR is cleared
+		 * before resuming SMMU operation
+		 */
+		wmb();
+
+		/*
+		 *  TBU halt takes care of resuming any stalled transcation.
+		 *  Kept it here for completeness sake.
+		 */
+		if (fsr & ARM_SMMU_CB_FSR_SS)
+			arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_RESUME,
+				ARM_SMMU_RESUME_TERMINATE);
+	}
+
+	qsmmuv2_wait_for_halt(smmu);
+
+	phys = __qsmmuv2_iova_to_phys_hard(smmu_domain, iova);
+
+	/* restore SCTLR */
+	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, sctlr_orig);
+
+	qsmmuv2_resume(smmu);
+	spin_unlock_irqrestore(&data->atos_lock, flags);
+
+	return phys;
+}
+
+static void qsmmuv2_tlb_sync_timeout(struct arm_smmu_device *smmu)
+{
+	u32 clk_on, clk_on_client;
+
+	dev_err_ratelimited(smmu->dev,
+			"TLB sync timed out -- SMMU may be deadlocked\n");
+
+	clk_on = arm_smmu_readl(smmu, ARM_SMMU_IMPL_DEF4,
+				IMPL_DEF4_CLK_ON_STATUS);
+	clk_on_client = arm_smmu_readl(smmu, ARM_SMMU_IMPL_DEF4,
+				IMPL_DEF4_CLK_ON_CLIENT_STATUS);
+	dev_err_ratelimited(smmu->dev,
+				    "clk on 0x%x, clk on client 0x%x status\n",
+						    clk_on, clk_on_client);
+
+	BUG_ON(IS_ENABLED(CONFIG_IOMMU_TLBSYNC_DEBUG));
+}
+
+static int qsmmuv2_device_reset(struct arm_smmu_device *smmu)
+{
+	struct qsmmuv2_archdata *data = to_qsmmuv2_archdata(smmu);
+	struct arm_smmu_impl_def_reg *regs = data->impl_def_attach_registers;
+	u32 i;
+
+	/* Program implementation defined registers */
+	qsmmuv2_halt(smmu);
+	for (i = 0; i < data->num_impl_def_attach_registers; ++i)
+		arm_smmu_gr0_write(smmu, regs[i].offset, regs[i].value);
+	qsmmuv2_resume(smmu);
+
+	return 0;
+}
+
+static void qsmmuv2_init_cb(struct arm_smmu_domain *smmu_domain,
+					struct device *dev)
+{
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	int idx = smmu_domain->cfg.cbndx;
+	const struct iommu_flush_ops *tlb;
+	u32 val;
+
+	tlb = smmu_domain->flush_ops;
+
+	val = ACTLR_QCOM_ISH | ACTLR_QCOM_OSH | ACTLR_QCOM_NSH;
+
+	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_ACTLR, val);
+
+	/*
+	 * Flush the context bank after modifying ACTLR to ensure there
+	 * are no cache entries with stale state
+	 */
+	tlb->tlb_flush_all(smmu_domain);
+}
+
+static int arm_smmu_parse_impl_def_registers(struct arm_smmu_device *smmu)
+{
+	struct device *dev = smmu->dev;
+	struct qsmmuv2_archdata *data = to_qsmmuv2_archdata(smmu);
+	int i, ntuples, ret;
+	u32 *tuples;
+	struct arm_smmu_impl_def_reg *regs, *regit;
+
+	if (!of_find_property(dev->of_node, "attach-impl-defs", &ntuples))
+		return 0;
+
+	ntuples /= sizeof(u32);
+	if (ntuples % 2) {
+		dev_err(dev,
+			"Invalid number of attach-impl-defs registers: %d\n",
+			ntuples);
+		return -EINVAL;
+	}
+
+	regs = devm_kzalloc(dev, sizeof(*data->impl_def_attach_registers) *
+		ntuples, GFP_KERNEL);
+
+	if (!regs)
+		return -ENOMEM;
+
+	tuples = kzalloc(sizeof(u32) * ntuples * 2, GFP_KERNEL);
+	if (!tuples)
+		return -ENOMEM;
+
+	ret = of_property_read_u32_array(dev->of_node, "attach-impl-defs",
+					tuples, ntuples);
+	if (ret) {
+		kfree(tuples);
+		return ret;
+	}
+
+	for (i = 0, regit = regs; i < ntuples; i += 2, ++regit) {
+		regit->offset = tuples[i];
+		regit->value = tuples[i + 1];
+	}
+
+	kfree(tuples);
+
+	data->impl_def_attach_registers = regs;
+	data->num_impl_def_attach_registers = ntuples / 2;
+
+	return 0;
+}
+
+
+static struct qcom_smmu *to_qcom_smmu(struct arm_smmu_device *smmu)
+{
+	return container_of(smmu, struct qcom_smmu, smmu);
+}
+
+static void qcom_smmu_tlb_sync(struct arm_smmu_device *smmu, int page,
+				int sync, int status)
+{
+	unsigned int spin_cnt, delay;
+	u32 reg;
+
+	arm_smmu_writel(smmu, page, sync, QCOM_DUMMY_VAL);
+	for (delay = 1; delay < TLB_LOOP_TIMEOUT; delay *= 2) {
+		for (spin_cnt = TLB_SPIN_COUNT; spin_cnt > 0; spin_cnt--) {
+			reg = arm_smmu_readl(smmu, page, status);
+			if (!(reg & ARM_SMMU_sTLBGSTATUS_GSACTIVE))
+				return;
+			cpu_relax();
+		}
+		udelay(delay);
+	}
+
+	qcom_smmu_tlb_sync_debug(smmu);
+}
+
+static void qcom_adreno_smmu_write_sctlr(struct arm_smmu_device *smmu, int idx,
+		u32 reg)
+{
+	struct qcom_smmu *qsmmu = to_qcom_smmu(smmu);
+
+	/*
+	 * On the GPU device we want to process subsequent transactions after a
+	 * fault to keep the GPU from hanging
+	 */
+	reg |= ARM_SMMU_SCTLR_HUPCF;
+
+	if (qsmmu->stall_enabled & BIT(idx))
+		reg |= ARM_SMMU_SCTLR_CFCFG;
+
+	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, reg);
+}
+
+static void qcom_adreno_smmu_get_fault_info(const void *cookie,
+		struct adreno_smmu_fault_info *info)
+{
+	struct arm_smmu_domain *smmu_domain = (void *)cookie;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+
+	info->fsr = arm_smmu_cb_read(smmu, cfg->cbndx, ARM_SMMU_CB_FSR);
+	info->fsynr0 = arm_smmu_cb_read(smmu, cfg->cbndx, ARM_SMMU_CB_FSYNR0);
+	info->fsynr1 = arm_smmu_cb_read(smmu, cfg->cbndx, ARM_SMMU_CB_FSYNR1);
+	info->far = arm_smmu_cb_readq(smmu, cfg->cbndx, ARM_SMMU_CB_FAR);
+	info->cbfrsynra = arm_smmu_gr1_read(smmu, ARM_SMMU_GR1_CBFRSYNRA(cfg->cbndx));
+	info->ttbr0 = arm_smmu_cb_readq(smmu, cfg->cbndx, ARM_SMMU_CB_TTBR0);
+	info->contextidr = arm_smmu_cb_read(smmu, cfg->cbndx, ARM_SMMU_CB_CONTEXTIDR);
+}
+
+static void qcom_adreno_smmu_set_stall(const void *cookie, bool enabled)
+{
+	struct arm_smmu_domain *smmu_domain = (void *)cookie;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct qcom_smmu *qsmmu = to_qcom_smmu(smmu_domain->smmu);
+
+	if (enabled)
+		qsmmu->stall_enabled |= BIT(cfg->cbndx);
+	else
+		qsmmu->stall_enabled &= ~BIT(cfg->cbndx);
+}
+
+static void qcom_adreno_smmu_resume_translation(const void *cookie, bool terminate)
+{
+	struct arm_smmu_domain *smmu_domain = (void *)cookie;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	u32 reg = 0;
+
+	if (terminate)
+		reg |= ARM_SMMU_RESUME_TERMINATE;
+
+	arm_smmu_cb_write(smmu, cfg->cbndx, ARM_SMMU_CB_RESUME, reg);
 }
 
 #define QCOM_ADRENO_SMMU_GPU_SID 0
@@ -165,12 +484,26 @@ static int qcom_adreno_smmu_alloc_context_bank(struct arm_smmu_domain *smmu_doma
 	return __arm_smmu_alloc_bitmap(smmu->context_map, start, count);
 }
 
+static bool qcom_adreno_can_do_ttbr1(struct arm_smmu_device *smmu)
+{
+	const struct device_node *np = smmu->dev->of_node;
+
+	if (of_device_is_compatible(np, "qcom,msm8996-smmu-v2"))
+		return false;
+
+	return true;
+}
+
+static const struct of_device_id __maybe_unused qcom_smmu_impl_of_match[];
 static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 		struct io_pgtable_cfg *pgtbl_cfg, struct device *dev)
 {
 	struct adreno_smmu_priv *priv;
+	const struct device_node *np = smmu_domain->smmu->dev->of_node;
 	struct qcom_io_pgtable_info *input_info =
 		container_of(pgtbl_cfg, struct qcom_io_pgtable_info, cfg);
+
+	smmu_domain->cfg.flush_walk_prefer_tlbiasid = true;
 
 	/* Only enable split pagetables for the GPU device (SID 0) */
 	if (!qcom_adreno_smmu_is_gpu_device(dev))
@@ -181,7 +514,8 @@ static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	 * be AARCH64 stage 1 but double check because the arm-smmu code assumes
 	 * that is the case when the TTBR1 quirk is enabled
 	 */
-	if ((smmu_domain->stage == ARM_SMMU_DOMAIN_S1) &&
+	if (qcom_adreno_can_do_ttbr1(smmu_domain->smmu) &&
+	    (smmu_domain->stage == ARM_SMMU_DOMAIN_S1) &&
 	    (smmu_domain->cfg.fmt == ARM_SMMU_CTX_FMT_AARCH64))
 		pgtbl_cfg->quirks |= IO_PGTABLE_QUIRK_ARM_TTBR1;
 
@@ -193,14 +527,23 @@ static int qcom_adreno_smmu_init_context(struct arm_smmu_domain *smmu_domain,
 	priv->cookie = smmu_domain;
 	priv->get_ttbr1_cfg = qcom_adreno_smmu_get_ttbr1_cfg;
 	priv->set_ttbr0_cfg = qcom_adreno_smmu_set_ttbr0_cfg;
+	priv->get_fault_info = qcom_adreno_smmu_get_fault_info;
 	priv->pgtbl_info = *input_info;
 
-	return 0;
-}
+	/*
+	 * These functions are only compatible with the data structures used by the
+	 * QCOM SMMU implementation hooks, and are thus not appropriate to set for other
+	 * implementations (e.g. QSMMUV500).
+	 *
+	 * Providing these functions as part of the GPU interface also makes little sense
+	 * as context banks are set to stall by default anyway.
+	 */
+	if (of_match_node(qcom_smmu_impl_of_match, np)) {
+		priv->set_stall = qcom_adreno_smmu_set_stall;
+		priv->resume_translation = qcom_adreno_smmu_resume_translation;
+	}
 
-static struct qcom_smmu *to_qcom_smmu(struct arm_smmu_device *smmu)
-{
-	return container_of(smmu, struct qcom_smmu, smmu);
+	return 0;
 }
 
 static const struct of_device_id qcom_smmu_client_of_match[] __maybe_unused = {
@@ -208,12 +551,31 @@ static const struct of_device_id qcom_smmu_client_of_match[] __maybe_unused = {
 	{ .compatible = "qcom,adreno-gmu" },
 	{ .compatible = "qcom,mdp4" },
 	{ .compatible = "qcom,mdss" },
+	{ .compatible = "qcom,qcm2290-mdss" },
 	{ .compatible = "qcom,sc7180-mdss" },
 	{ .compatible = "qcom,sc7180-mss-pil" },
+	{ .compatible = "qcom,sc7280-mdss" },
+	{ .compatible = "qcom,sc7280-mss-pil" },
+	{ .compatible = "qcom,sc8180x-mdss" },
+	{ .compatible = "qcom,sc8280xp-mdss" },
+	{ .compatible = "qcom,sdm670-mdss" },
 	{ .compatible = "qcom,sdm845-mdss" },
 	{ .compatible = "qcom,sdm845-mss-pil" },
+	{ .compatible = "qcom,sm6350-mdss" },
+	{ .compatible = "qcom,sm6375-mdss" },
+	{ .compatible = "qcom,sm8150-mdss" },
+	{ .compatible = "qcom,sm8250-mdss" },
+	{ .compatible = "qcom,x1e80100-mdss" },
 	{ }
 };
+
+static int qcom_smmu_init_context(struct arm_smmu_domain *smmu_domain,
+		struct io_pgtable_cfg *pgtbl_cfg, struct device *dev)
+{
+	smmu_domain->cfg.flush_walk_prefer_tlbiasid = true;
+
+	return 0;
+}
 
 static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 {
@@ -224,27 +586,18 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 	int i;
 
 	/*
-	 * MSM8998 LPASS SMMU reports 13 context banks, but accessing
-	 * the last context bank crashes the system.
-	 */
-	if (of_device_is_compatible(smmu->dev->of_node, "qcom,msm8998-smmu-v2") && smmu->num_context_banks == 13)
-		smmu->num_context_banks = 12;
-
-	/*
 	 * Some platforms support more than the Arm SMMU architected maximum of
-	 * 128 stream matching groups. The additional registers appear to have
-	 * the same behavior as the architected registers in the hardware.
-	 * However, on some firmware versions, the hypervisor does not
-	 * correctly trap and emulate accesses to the additional registers,
-	 * resulting in unexpected behavior.
-	 *
-	 * If there are more than 128 groups, use the last reliable group to
-	 * detect if we need to apply the bypass quirk.
+	 * 128 stream matching groups. For unknown reasons, the additional
+	 * groups don't exhibit the same behavior as the architected registers,
+	 * so limit the groups to 128 until the behavior is fixed for the other
+	 * groups.
 	 */
-	if (smmu->num_mapping_groups > 128)
-		last_s2cr = ARM_SMMU_GR0_S2CR(127);
-	else
-		last_s2cr = ARM_SMMU_GR0_S2CR(smmu->num_mapping_groups - 1);
+	if (smmu->num_mapping_groups > 128) {
+		dev_notice(smmu->dev, "\tLimiting the stream matching groups to 128\n");
+		smmu->num_mapping_groups = 128;
+	}
+
+	last_s2cr = ARM_SMMU_GR0_S2CR(smmu->num_mapping_groups - 1);
 
 	/*
 	 * With some firmware versions writes to S2CR of type FAULT are
@@ -267,11 +620,6 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 
 		reg = FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S1_TRANS_S2_BYPASS);
 		arm_smmu_gr1_write(smmu, ARM_SMMU_GR1_CBAR(qsmmu->bypass_cbndx), reg);
-
-		if (smmu->num_mapping_groups > 128) {
-			dev_notice(smmu->dev, "\tLimiting the stream matching groups to 128\n");
-			smmu->num_mapping_groups = 128;
-		}
 	}
 
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
@@ -283,12 +631,21 @@ static int qcom_smmu_cfg_probe(struct arm_smmu_device *smmu)
 			smmu->smrs[i].id = FIELD_GET(ARM_SMMU_SMR_ID, smr);
 			smmu->smrs[i].mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr);
 			smmu->smrs[i].valid = true;
+			smmu->smrs[i].used = true;
 
 			smmu->s2crs[i].type = S2CR_TYPE_BYPASS;
 			smmu->s2crs[i].privcfg = S2CR_PRIVCFG_DEFAULT;
 			smmu->s2crs[i].cbndx = 0xff;
 		}
 	}
+
+	return 0;
+}
+
+static int qcom_adreno_smmuv2_cfg_probe(struct arm_smmu_device *smmu)
+{
+	/* Support for 16K pages is advertised on some SoCs, but it doesn't seem to work */
+	smmu->features &= ~ARM_SMMU_FEAT_FMT_AARCH64_16K;
 
 	return 0;
 }
@@ -340,6 +697,8 @@ static int qcom_sdm845_smmu500_reset(struct arm_smmu_device *smmu)
 {
 	int ret;
 
+	arm_mmu500_reset(smmu);
+
 	/*
 	 * To address performance degradation in non-real time clients,
 	 * such as USB and UFS, turn off wait-for-safe on sdm845 based boards,
@@ -353,27 +712,59 @@ static int qcom_sdm845_smmu500_reset(struct arm_smmu_device *smmu)
 	return ret;
 }
 
-static int qcom_smmu500_reset(struct arm_smmu_device *smmu)
-{
-	const struct device_node *np = smmu->dev->of_node;
-
-	arm_mmu500_reset(smmu);
-
-	if (of_device_is_compatible(np, "qcom,sdm845-smmu-500"))
-		return qcom_sdm845_smmu500_reset(smmu);
-
-	return 0;
-}
-
-static const struct arm_smmu_impl qcom_smmu_impl = {
+static const struct arm_smmu_impl qcom_smmu_v2_impl = {
+	.init_context = qcom_smmu_init_context,
 	.cfg_probe = qcom_smmu_cfg_probe,
 	.def_domain_type = qcom_smmu_def_domain_type,
-	.cfg_probe = qcom_sdm845_smmu500_cfg_probe,
-	.reset = qcom_smmu500_reset,
 	.write_s2cr = qcom_smmu_write_s2cr,
+	.tlb_sync = qcom_smmu_tlb_sync,
 };
 
-#define TCU_HW_VERSION_HLOS1		(0x18)
+static const struct arm_smmu_impl qcom_smmu_500_impl = {
+	.init_context = qcom_smmu_init_context,
+	.cfg_probe = qcom_smmu_cfg_probe,
+	.def_domain_type = qcom_smmu_def_domain_type,
+	.reset = arm_mmu500_reset,
+	.write_s2cr = qcom_smmu_write_s2cr,
+	.tlb_sync = qcom_smmu_tlb_sync,
+#ifdef CONFIG_ARM_SMMU_QCOM_DEBUG
+	.context_fault = qcom_smmu_context_fault,
+	.context_fault_needs_threaded_irq = true,
+#endif
+};
+
+static const struct arm_smmu_impl sdm845_smmu_500_impl = {
+	.init_context = qcom_smmu_init_context,
+	.cfg_probe = qcom_smmu_cfg_probe,
+	.def_domain_type = qcom_smmu_def_domain_type,
+	.reset = qcom_sdm845_smmu500_reset,
+	.write_s2cr = qcom_smmu_write_s2cr,
+	.tlb_sync = qcom_smmu_tlb_sync,
+#ifdef CONFIG_ARM_SMMU_QCOM_DEBUG
+	.context_fault = qcom_smmu_context_fault,
+	.context_fault_needs_threaded_irq = true,
+#endif
+};
+
+static const struct arm_smmu_impl qcom_adreno_smmu_v2_impl = {
+	.init_context = qcom_adreno_smmu_init_context,
+	.cfg_probe = qcom_adreno_smmuv2_cfg_probe,
+	.def_domain_type = qcom_smmu_def_domain_type,
+	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
+	.write_sctlr = qcom_adreno_smmu_write_sctlr,
+	.tlb_sync = qcom_smmu_tlb_sync,
+};
+
+static const struct arm_smmu_impl qcom_adreno_smmu_500_impl = {
+	.init_context = qcom_adreno_smmu_init_context,
+	.def_domain_type = qcom_smmu_def_domain_type,
+	.reset = arm_mmu500_reset,
+	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
+	.write_sctlr = qcom_adreno_smmu_write_sctlr,
+	.tlb_sync = qcom_smmu_tlb_sync,
+};
+
+#define TBUID_SHIFT			10
 
 #define DEBUG_SID_HALT_REG		0x0
 #define DEBUG_SID_HALT_REQ		BIT(16)
@@ -407,13 +798,21 @@ static const struct arm_smmu_impl qcom_smmu_impl = {
 #define DEBUG_AXUSER_CDMID_VAL          255
 
 #define TBU_DBG_TIMEOUT_US		100
+#define TBU_MICRO_IDLE_DELAY_US		5
 
+#define TNX_TCR_CNTL			0x130
+#define TNX_TCR_CNTL_TBU_OT_CAPTURE_EN	BIT(18)
+#define TNX_TCR_CNTL_ALWAYS_CAPTURE	BIT(15)
+#define TNX_TCR_CNTL_MATCH_MASK_UPD	BIT(7)
+#define TNX_TCR_CNTL_MATCH_MASK_VALID	BIT(6)
 
-#define TCU_TESTBUS_SEL_ALL		0xf
-#define TBU_TESTBUS_SEL_ALL		0xff
+#define CAPTURE1_SNAPSHOT_1		0x138
+
+#define TNX_TCR_CNTL_2			0x178
+#define TNX_TCR_CNTL_2_CAP1_VALID	BIT(0)
 
 /* QTB constants */
-#define QTB_DBG_TIMEOUT_US		500
+#define QTB_DBG_TIMEOUT_US		100
 
 #define QTB_SWID_LOW			0x0
 
@@ -449,7 +848,7 @@ static const struct arm_smmu_impl qcom_smmu_impl = {
 #define QTB_OVR_ECATS_STATUS_DONE	BIT(0)
 
 #define QTB_OVR_ECATS_OUTFLD0			0x458
-#define QTB_OVR_ECATS_OUTFLD0_PA		GENMASK(63, 12)
+#define QTB_OVR_ECATS_OUTFLD0_PA		GENMASK_ULL(63, 12)
 #define QTB_OVR_ECATS_OUTFLD0_FAULT_TYPE	GENMASK(5, 4)
 #define QTB_OVR_ECATS_OUTFLD0_FAULT		BIT(0)
 
@@ -461,13 +860,12 @@ struct actlr_setting {
 };
 
 struct qsmmuv500_archdata {
+	struct arm_smmu_device		smmu;
 	struct list_head		tbus;
 	struct actlr_setting		*actlrs;
 	u32				actlr_tbl_size;
 	struct work_struct		outstanding_tnx_work;
 	spinlock_t			atos_lock;
-	struct arm_smmu_device		smmu;
-	void __iomem			*tcu_base;
 };
 #define to_qsmmuv500_archdata(smmu)				\
 	container_of(smmu, struct qsmmuv500_archdata, smmu)
@@ -485,7 +883,6 @@ struct qsmmuv500_tbu_device {
 	struct device			*dev;
 	struct arm_smmu_device		*smmu;
 	void __iomem			*base;
-	void __iomem			*status_reg;
 
 	const struct qsmmuv500_tbu_impl	*impl;
 	struct arm_smmu_power_resources *pwr;
@@ -496,8 +893,6 @@ struct qsmmuv500_tbu_device {
 	/* Protects halt count */
 	spinlock_t			halt_lock;
 	u32				halt_count;
-
-	unsigned int			*irqs;
 };
 
 struct qsmmuv500_tbu_impl {
@@ -505,7 +900,7 @@ struct qsmmuv500_tbu_impl {
 	int (*halt_poll)(struct qsmmuv500_tbu_device *tbu);
 	void (*resume)(struct qsmmuv500_tbu_device *tbu);
 	phys_addr_t (*trigger_atos)(struct qsmmuv500_tbu_device *tbu, dma_addr_t iova, u32 sid,
-				 unsigned long trans_flags);
+				    unsigned long trans_flags);
 	void (*write_sync)(struct qsmmuv500_tbu_device *tbu);
 	void (*log_outstanding_transactions)(struct qsmmuv500_tbu_device *tbu);
 };
@@ -521,7 +916,6 @@ struct qtb500_device {
 	struct qsmmuv500_tbu_device tbu;
 	bool no_halt;
 	u32 num_ports;
-	void __iomem			*debugchain_base;
 };
 
 #define to_qtb500(tbu)		container_of(tbu, struct qtb500_device, tbu)
@@ -568,13 +962,14 @@ static void arm_tbu_resume(struct qsmmuv500_tbu_device *tbu)
 	writel_relaxed(val, base + DEBUG_SID_HALT_REG);
 }
 
-static phys_addr_t arm_tbu_trigger_atos(struct qsmmuv500_tbu_device *tbu, dma_addr_t iova,
-					  u32 sid, unsigned long trans_flags)
+static phys_addr_t arm_tbu_trigger_atos(struct qsmmuv500_tbu_device *tbu, dma_addr_t iova, u32 sid,
+					unsigned long trans_flags)
 {
 	void __iomem *tbu_base = tbu->base;
 	phys_addr_t phys = 0;
 	u64 val;
 	ktime_t timeout;
+	bool ecats_timedout = false;
 
 	/* Set address and stream-id */
 	val = readq_relaxed(tbu_base + DEBUG_SID_HALT_REG);
@@ -595,7 +990,7 @@ static phys_addr_t arm_tbu_trigger_atos(struct qsmmuv500_tbu_device *tbu, dma_ad
 	if (trans_flags & IOMMU_TRANS_WRITE)
 		val |= DEBUG_TXN_WRITE;
 
-	/* Priviledged or Unpriviledged Access */
+	/* Privileged or Unprivileged Access */
 	if (trans_flags & IOMMU_TRANS_PRIV)
 		val |= FIELD_PREP(DEBUG_TXN_AXPROT, DEBUG_TXN_AXPROT_PRIV);
 
@@ -615,7 +1010,7 @@ static phys_addr_t arm_tbu_trigger_atos(struct qsmmuv500_tbu_device *tbu, dma_ad
 		if (val & DEBUG_PAR_FAULT_VAL)
 			break;
 		if (ktime_compare(ktime_get(), timeout) > 0) {
-			dev_err_ratelimited(tbu->dev, "ECATS translation timed out!\n");
+			ecats_timedout = true;
 			break;
 		}
 	}
@@ -624,6 +1019,8 @@ static phys_addr_t arm_tbu_trigger_atos(struct qsmmuv500_tbu_device *tbu, dma_ad
 	if (val & DEBUG_PAR_FAULT_VAL)
 		dev_err(tbu->dev, "ECATS generated a fault interrupt! PAR = %llx, SID=0x%x\n",
 			val, sid);
+	else if (ecats_timedout)
+		dev_err_ratelimited(tbu->dev, "ECATS translation timed out!\n");
 	else
 		phys = FIELD_GET(DEBUG_PAR_PA, val);
 
@@ -679,6 +1076,7 @@ static void arm_tbu_log_outstanding_transactions(struct qsmmuv500_tbu_device *tb
 	dev_err_ratelimited(tbu->dev,
 			    "Outstanding Transaction Bitmap: 0x%llx\n",
 			    outstanding_tnxs);
+
 poll_timeout:
 	/* Write TBU_OT_CAPTURE_EN to 0 of TNX_TCR_CNTL */
 	writeq_relaxed(tcr_cntl_val & ~TNX_TCR_CNTL_TBU_OT_CAPTURE_EN,
@@ -720,8 +1118,8 @@ static int __arm_tbu_micro_idle_cfg(struct arm_smmu_device *smmu,
 	reg += APPS_SMMU_TBU_REG_ACCESS_ACK_NS;
 	ret = readl_poll_timeout_atomic(reg, tmp, ((tmp & mask) == val), 0, 200);
 	if (ret)
-		WARN(1, "%s: Timed out configuring micro idle! %x instead of %x\n",
-			dev_name(smmu->dev), tmp, new);
+		dev_WARN(smmu->dev, "Timed out configuring micro idle! %x instead of %x\n", tmp,
+			 new);
 	/*
 	 * While the micro-idle guard sequence registers may have been configured
 	 * properly, it is possible that the intended effect has not been realized
@@ -730,7 +1128,7 @@ static int __arm_tbu_micro_idle_cfg(struct arm_smmu_device *smmu,
 	 * Spin for a short amount of time to allow for the desired configuration to
 	 * take effect before proceeding.
 	 */
-	udelay(ARM_SMMU_MICRO_IDLE_DELAY_US);
+	udelay(TBU_MICRO_IDLE_DELAY_US);
 	spin_unlock_irqrestore(&smmu->global_sync_lock, flags);
 	return ret;
 }
@@ -763,11 +1161,6 @@ void arm_tbu_micro_idle_allow(struct arm_smmu_power_resources *pwr)
 	__arm_tbu_micro_idle_cfg(tbu->smmu, 0, val);
 }
 
-static const struct of_device_id qsmmuv500_tbu_of_match[] = {
-	{.compatible = "qcom,qsmmuv500-tbu"},
-	{}
-};
-
 static struct qsmmuv500_tbu_device *arm_tbu_impl_init(struct qsmmuv500_tbu_device *tbu)
 {
 	struct arm_tbu_device *arm_tbu;
@@ -778,7 +1171,6 @@ static struct qsmmuv500_tbu_device *arm_tbu_impl_init(struct qsmmuv500_tbu_devic
 		return ERR_PTR(-ENOMEM);
 
 	arm_tbu->tbu.impl = &arm_tbu_impl;
-
 	arm_tbu->has_micro_idle = of_property_read_bool(dev->of_node, "qcom,micro-idle");
 
 	if (arm_tbu->has_micro_idle) {
@@ -788,559 +1180,6 @@ static struct qsmmuv500_tbu_device *arm_tbu_impl_init(struct qsmmuv500_tbu_devic
 
 	return &arm_tbu->tbu;
 }
-
-static struct qsmmuv500_tbu_device *qsmmuv500_find_tbu(
-	struct arm_smmu_device *smmu, u32 sid)
-{
-	struct qsmmuv500_tbu_device *tbu = NULL;
-	struct qsmmuv500_archdata *data = to_qsmmuv500_archdata(smmu);
-
-	list_for_each_entry(tbu, &data->tbus, list) {
-		if (tbu->sid_start <= sid &&
-		    sid < tbu->sid_start + tbu->num_sids)
-			return tbu;
-	}
-	return NULL;
-}
-
-static int qsmmuv500_tbu_halt(struct qsmmuv500_tbu_device *tbu,
-			      struct arm_smmu_domain *smmu_domain)
-{
-	unsigned long flags;
-	struct arm_smmu_device *smmu = smmu_domain->smmu;
-	int ret = 0, idx = smmu_domain->cfg.cbndx;
-	u32 fsr;
-
-	if (of_property_read_bool(tbu->dev->of_node, "qcom,opt-out-tbu-halting")) {
-		dev_notice(tbu->dev, "TBU opted-out for halting!\n");
-		return -EBUSY;
-	}
-
-	spin_lock_irqsave(&tbu->halt_lock, flags);
-	if (tbu->halt_count) {
-		tbu->halt_count++;
-		goto out;
-	}
-
-	ret = tbu->impl->halt_req(tbu);
-	if (ret)
-		goto out;
-
-	fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
-	if ((fsr & ARM_SMMU_FSR_FAULT) && (fsr & ARM_SMMU_FSR_SS)) {
-		u32 sctlr_orig, sctlr;
-		/*
-		 * We are in a fault; Our request to halt the bus will not
-		 * complete until transactions in front of us (such as the fault
-		 * itself) have completed. Disable iommu faults and terminate
-		 * any existing transactions.
-		 */
-		sctlr_orig = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_SCTLR);
-		sctlr = sctlr_orig & ~(ARM_SMMU_SCTLR_CFCFG | ARM_SMMU_SCTLR_CFIE);
-		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, sctlr);
-
-		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_FSR, fsr);
-		/*
-		 * Barrier required to ensure that the FSR is cleared
-		 * before resuming SMMU operation
-		 */
-		wmb();
-		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_RESUME,
-				  ARM_SMMU_RESUME_TERMINATE);
-
-		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, sctlr_orig);
-	}
-
-	ret = tbu->impl->halt_poll(tbu);
-	if (ret)
-		goto out;
-
-	tbu->halt_count = 1;
-out:
-	spin_unlock_irqrestore(&tbu->halt_lock, flags);
-	return ret;
-}
-
-static void qsmmuv500_tbu_resume(struct qsmmuv500_tbu_device *tbu)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&tbu->halt_lock, flags);
-	if (WARN(!tbu->halt_count, "%s bad tbu->halt_count", dev_name(tbu->dev))) {
-		goto out;
-
-	} else if (tbu->halt_count > 1) {
-		tbu->halt_count--;
-		goto out;
-	}
-
-	tbu->impl->resume(tbu);
-
-	tbu->halt_count = 0;
-out:
-	spin_unlock_irqrestore(&tbu->halt_lock, flags);
-}
-
-/*
- * Provides mutually exclusive access to the registers used by the
- * outstanding transaction snapshot feature and the transaction
- * snapshot capture feature.
- */
-static DEFINE_MUTEX(capture_reg_lock);
-static DEFINE_SPINLOCK(testbus_lock);
-
-static void qsmmuv500_log_outstanding_transactions(struct work_struct *work)
-{
-	struct qsmmuv500_tbu_device *tbu = NULL;
-	struct qsmmuv500_archdata *data = container_of(work,
-						struct qsmmuv500_archdata,
-						outstanding_tnx_work);
-	struct arm_smmu_device *smmu = &data->smmu;
-
-	if (!mutex_trylock(&capture_reg_lock)) {
-		dev_warn_ratelimited(smmu->dev,
-			"Tnx snapshot regs in use, not dumping OT tnxs.\n");
-		goto bug;
-	}
-
-	if (arm_smmu_power_on(smmu->pwr)) {
-		dev_err_ratelimited(smmu->dev,
-				    "%s: Failed to power on SMMU.\n",
-				    __func__);
-		goto unlock;
-	}
-
-	list_for_each_entry(tbu, &data->tbus, list) {
-		if (arm_smmu_power_on(tbu->pwr)) {
-			dev_err_ratelimited(tbu->dev,
-					    "%s: Failed to power on TBU.\n",
-					    __func__);
-			continue;
-		}
-
-		tbu->impl->log_outstanding_transactions(tbu);
-
-		arm_smmu_power_off(smmu, tbu->pwr);
-	}
-
-	arm_smmu_power_off(smmu, smmu->pwr);
-unlock:
-	mutex_unlock(&capture_reg_lock);
-bug:
-	BUG_ON(IS_ENABLED(CONFIG_IOMMU_TLBSYNC_DEBUG));
-}
-
-__maybe_unused static struct dentry *get_iommu_debug_dir(void)
-{
-	struct dentry *iommu_debug_dir;
-	int ret;
-
-	iommu_debug_dir = debugfs_lookup("iommu-debug", NULL);
-	if (IS_ERR_OR_NULL(iommu_debug_dir)) {
-		iommu_debug_dir = debugfs_create_dir("iommu-debug", NULL);
-		if (IS_ERR_OR_NULL(iommu_debug_dir)) {
-			ret = PTR_ERR(iommu_debug_dir);
-			pr_err_ratelimited("Unable to create iommu-debug directory, ret=%d\n",
-					ret);
-			return NULL;
-		}
-	}
-	return iommu_debug_dir;
-}
-
-#ifdef CONFIG_ARM_SMMU_TESTBUS_DEBUGFS
-static struct dentry *debugfs_testbus_dir;
-
-static ssize_t arm_smmu_debug_debugchain_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset)
-
-{
-	char *buf;
-	ssize_t retval;
-	size_t buflen;
-	int buf_len;
-	struct qsmmuv500_tbu_device *tbu = file->private_data;
-	struct qtb500_device *qtb = to_qtb500(tbu);
-	void __iomem *debugchain_base = qtb->debugchain_base;
-	long chain_length = 0;
-	u64 val;
-
-	if (*offset)
-		return 0;
-
-	arm_smmu_power_on(tbu->pwr);
-	chain_length = arm_smmu_debug_qtb_debugchain_load(debugchain_base);
-	buf_len = chain_length * sizeof(u64);
-	buf = kzalloc(buf_len, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	arm_smmu_debug_qtb_debugchain_dump(debugchain_base);
-	do {
-		val = arm_smmu_debug_qtb_debugchain_dump(debugchain_base);
-		scnprintf(buf + strlen(buf), buf_len - strlen(buf), "0x%0x\n", val);
-	} while (chain_length--);
-	arm_smmu_power_off(tbu->smmu, tbu->pwr);
-
-	buflen = min(count, strlen(buf));
-	if (copy_to_user(ubuf, buf, buflen)) {
-		pr_err_ratelimited("Couldn't copy_to_user\n");
-		retval = -EFAULT;
-	} else {
-		*offset = 1;
-		retval = buflen;
-	}
-	return retval;
-}
-
-static ssize_t arm_smmu_debug_testbus_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset,
-		enum testbus_sel tbu, enum testbus_ops ops)
-
-{
-	char buf[100];
-	ssize_t retval;
-	size_t buflen;
-	int buf_len = sizeof(buf);
-
-	if (*offset)
-		return 0;
-
-	memset(buf, 0, buf_len);
-
-	if (tbu == SEL_TBU) {
-		struct qsmmuv500_tbu_device *tbu = file->private_data;
-		void __iomem *tbu_base = tbu->base;
-		long val;
-
-		arm_smmu_power_on(tbu->pwr);
-		if (ops == TESTBUS_SELECT)
-			val = arm_smmu_debug_tbu_testbus_select(tbu_base,
-							READ, 0);
-		else
-			val = arm_smmu_debug_tbu_testbus_output(tbu_base);
-		arm_smmu_power_off(tbu->smmu, tbu->pwr);
-
-		scnprintf(buf, buf_len, "0x%0x\n", val);
-	} else {
-
-		struct arm_smmu_device *smmu = file->private_data;
-		struct qsmmuv500_archdata *data = to_qsmmuv500_archdata(smmu);
-		phys_addr_t phys_addr = smmu->phys_addr;
-		void __iomem *tcu_base = data->tcu_base;
-
-		arm_smmu_power_on(smmu->pwr);
-
-		if (ops == TESTBUS_SELECT) {
-			scnprintf(buf, buf_len, "TCU clk testbus sel: 0x%0x\n",
-				  arm_smmu_debug_tcu_testbus_select(phys_addr,
-					tcu_base, CLK_TESTBUS, READ, 0));
-			scnprintf(buf + strlen(buf), buf_len - strlen(buf),
-				  "TCU testbus sel : 0x%0x\n",
-				  arm_smmu_debug_tcu_testbus_select(phys_addr,
-					 tcu_base, PTW_AND_CACHE_TESTBUS,
-					 READ, 0));
-		} else {
-			scnprintf(buf, buf_len, "0x%0x\n",
-				  arm_smmu_debug_tcu_testbus_output(phys_addr));
-		}
-
-		arm_smmu_power_off(smmu, smmu->pwr);
-	}
-	buflen = min(count, strlen(buf));
-	if (copy_to_user(ubuf, buf, buflen)) {
-		pr_err_ratelimited("Couldn't copy_to_user\n");
-		retval = -EFAULT;
-	} else {
-		*offset = 1;
-		retval = buflen;
-	}
-
-	return retval;
-}
-
-static ssize_t arm_smmu_debug_tcu_testbus_sel_write(struct file *file,
-		const char __user *ubuf, size_t count, loff_t *offset)
-{
-	struct arm_smmu_device *smmu = file->private_data;
-	struct qsmmuv500_archdata *data = to_qsmmuv500_archdata(smmu);
-	void __iomem *tcu_base = data->tcu_base;
-	phys_addr_t phys_addr = smmu->phys_addr;
-	char *comma;
-	char buf[100];
-	u64 sel, val;
-
-	if (count >= 100) {
-		pr_err_ratelimited("Value too large\n");
-		return -EINVAL;
-	}
-
-	memset(buf, 0, 100);
-
-	if (copy_from_user(buf, ubuf, count)) {
-		pr_err_ratelimited("Couldn't copy from user\n");
-		return -EFAULT;
-	}
-
-	comma = strnchr(buf, count, ',');
-	if (!comma)
-		goto invalid_format;
-
-	/* split up the words */
-	*comma = '\0';
-
-	if (kstrtou64(buf, 0, &sel))
-		goto invalid_format;
-
-	if (sel != 1 && sel != 2)
-		goto invalid_format;
-
-	if (kstrtou64(comma + 1, 0, &val))
-		goto invalid_format;
-
-	arm_smmu_power_on(smmu->pwr);
-
-	if (sel == 1)
-		arm_smmu_debug_tcu_testbus_select(phys_addr,
-				tcu_base, CLK_TESTBUS, WRITE, val);
-	else if (sel == 2)
-		arm_smmu_debug_tcu_testbus_select(phys_addr,
-				tcu_base, PTW_AND_CACHE_TESTBUS, WRITE, val);
-
-	arm_smmu_power_off(smmu, smmu->pwr);
-
-	return count;
-
-invalid_format:
-	pr_err_ratelimited("Invalid format. Expected: <1, testbus select> for tcu CLK testbus (or) <2, testbus select> for tcu PTW/CACHE testbuses\n");
-	return -EINVAL;
-}
-
-static ssize_t arm_smmu_debug_tcu_testbus_sel_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset)
-{
-	return arm_smmu_debug_testbus_read(file, ubuf,
-			count, offset, SEL_TCU, TESTBUS_SELECT);
-}
-
-static const struct file_operations arm_smmu_debug_tcu_testbus_sel_fops = {
-	.open	= simple_open,
-	.write	= arm_smmu_debug_tcu_testbus_sel_write,
-	.read	= arm_smmu_debug_tcu_testbus_sel_read,
-};
-
-static ssize_t arm_smmu_debug_tcu_testbus_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset)
-{
-	return arm_smmu_debug_testbus_read(file, ubuf,
-			count, offset, SEL_TCU, TESTBUS_OUTPUT);
-}
-
-static const struct file_operations arm_smmu_debug_tcu_testbus_fops = {
-	.open	= simple_open,
-	.read	= arm_smmu_debug_tcu_testbus_read,
-};
-
-static int qsmmuv500_tcu_testbus_init(struct arm_smmu_device *smmu)
-{
-	struct dentry *testbus_dir, *iommu_debug_dir;
-
-	iommu_debug_dir = get_iommu_debug_dir();
-	if (!iommu_debug_dir)
-		return 0;
-
-	if (!debugfs_testbus_dir) {
-		debugfs_testbus_dir = debugfs_create_dir("testbus",
-						       iommu_debug_dir);
-		if (IS_ERR(debugfs_testbus_dir)) {
-			pr_err_ratelimited("Couldn't create iommu/testbus debugfs directory\n");
-			return -ENODEV;
-		}
-	}
-
-	testbus_dir = debugfs_create_dir(dev_name(smmu->dev),
-				debugfs_testbus_dir);
-
-	if (IS_ERR(testbus_dir)) {
-		pr_err_ratelimited("Couldn't create iommu/testbus/%s debugfs directory\n",
-		       dev_name(smmu->dev));
-		goto err;
-	}
-
-	if (IS_ERR(debugfs_create_file("tcu_testbus_sel", 0400,
-					testbus_dir, smmu,
-					&arm_smmu_debug_tcu_testbus_sel_fops))) {
-		pr_err_ratelimited("Couldn't create iommu/testbus/%s/tcu_testbus_sel debugfs file\n",
-		       dev_name(smmu->dev));
-		goto err_rmdir;
-	}
-
-	if (IS_ERR(debugfs_create_file("tcu_testbus_output", 0400,
-					testbus_dir, smmu,
-					&arm_smmu_debug_tcu_testbus_fops))) {
-		pr_err_ratelimited("Couldn't create iommu/testbus/%s/tcu_testbus_output debugfs file\n",
-				   dev_name(smmu->dev));
-		goto err_rmdir;
-	}
-
-	return 0;
-err_rmdir:
-	debugfs_remove_recursive(testbus_dir);
-err:
-	return 0;
-}
-
-static ssize_t arm_smmu_debug_tbu_testbus_sel_write(struct file *file,
-		const char __user *ubuf, size_t count, loff_t *offset)
-{
-	struct qsmmuv500_tbu_device *tbu = file->private_data;
-	void __iomem *tbu_base = tbu->base;
-	u64 val;
-
-	if (kstrtoull_from_user(ubuf, count, 0, &val)) {
-		pr_err_ratelimited("Invalid format for tbu testbus select\n");
-		return -EINVAL;
-	}
-
-	if (of_device_is_compatible(tbu->dev->of_node, "qcom,qtb500"))
-		return 0;
-
-	arm_smmu_power_on(tbu->pwr);
-	arm_smmu_debug_tbu_testbus_select(tbu_base, WRITE, val);
-	arm_smmu_power_off(tbu->smmu, tbu->pwr);
-
-	return count;
-}
-
-static ssize_t arm_smmu_debug_tbu_testbus_sel_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset)
-{
-	return arm_smmu_debug_testbus_read(file, ubuf,
-			count, offset, SEL_TBU, TESTBUS_SELECT);
-}
-
-static const struct file_operations arm_smmu_debug_tbu_testbus_sel_fops = {
-	.open	= simple_open,
-	.write	= arm_smmu_debug_tbu_testbus_sel_write,
-	.read	= arm_smmu_debug_tbu_testbus_sel_read,
-};
-
-static ssize_t arm_smmu_debug_tbu_testbus_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset)
-{
-	struct qsmmuv500_tbu_device *tbu = file->private_data;
-
-	if (of_device_is_compatible(tbu->dev->of_node, "qcom,qtb500"))
-		return arm_smmu_debug_debugchain_read(file, ubuf,
-				count, offset);
-	else
-		return arm_smmu_debug_testbus_read(file, ubuf,
-			count, offset, SEL_TBU, TESTBUS_OUTPUT);
-}
-
-static const struct file_operations arm_smmu_debug_tbu_testbus_fops = {
-	.open	= simple_open,
-	.read	= arm_smmu_debug_tbu_testbus_read,
-};
-
-static int qsmmuv500_tbu_testbus_init(struct qsmmuv500_tbu_device *tbu)
-{
-	struct dentry *testbus_dir, *iommu_debug_dir;
-
-	iommu_debug_dir = get_iommu_debug_dir();
-	if (!iommu_debug_dir)
-		return 0;
-
-	if (!debugfs_testbus_dir) {
-		debugfs_testbus_dir = debugfs_create_dir("testbus",
-						       iommu_debug_dir);
-		if (IS_ERR(debugfs_testbus_dir)) {
-			pr_err_ratelimited("Couldn't create iommu/testbus debugfs directory\n");
-			return -ENODEV;
-		}
-	}
-
-	testbus_dir = debugfs_create_dir(dev_name(tbu->dev),
-				debugfs_testbus_dir);
-
-	if (IS_ERR(testbus_dir)) {
-		pr_err_ratelimited("Couldn't create iommu/testbus/%s debugfs directory\n",
-		       dev_name(tbu->dev));
-		goto err;
-	}
-
-	if (IS_ERR(debugfs_create_file("tbu_testbus_sel", 0400,
-					testbus_dir, tbu,
-					&arm_smmu_debug_tbu_testbus_sel_fops)))	{
-		pr_err_ratelimited("Couldn't create iommu/testbus/%s/tbu_testbus_sel debugfs file\n",
-		       dev_name(tbu->dev));
-		goto err_rmdir;
-	}
-
-	if (IS_ERR(debugfs_create_file("tbu_testbus_output", 0400,
-					testbus_dir, tbu,
-					&arm_smmu_debug_tbu_testbus_fops))) {
-		pr_err_ratelimited("Couldn't create iommu/testbus/%s/tbu_testbus_output debugfs file\n",
-		       dev_name(tbu->dev));
-		goto err_rmdir;
-	}
-
-	return 0;
-err_rmdir:
-	debugfs_remove_recursive(testbus_dir);
-err:
-	return 0;
-}
-#else
-static int qsmmuv500_tcu_testbus_init(struct arm_smmu_device *smmu)
-{
-	return 0;
-}
-
-static int qsmmuv500_tbu_testbus_init(struct qsmmuv500_tbu_device *tbu)
-{
-	return 0;
-}
-#endif
-
-static int qtb500_tbu_halt_req(struct qsmmuv500_tbu_device *tbu);
-static int qtb500_tbu_halt_poll(struct qsmmuv500_tbu_device *tbu);
-static void qtb500_tbu_resume(struct qsmmuv500_tbu_device *tbu);
-
-static void arm_smmu_testbus_dump(struct arm_smmu_device *smmu, u16 sid)
-{
-	if (smmu->model == QCOM_SMMUV500 &&
-	    IS_ENABLED(CONFIG_ARM_SMMU_TESTBUS_DUMP)) {
-		struct qsmmuv500_archdata *data = to_qsmmuv500_archdata(smmu);
-		struct qsmmuv500_tbu_device *tbu;
-
-		tbu = qsmmuv500_find_tbu(smmu, sid);
-		spin_lock(&testbus_lock);
-		if (tbu) {
-			if (of_device_is_compatible(tbu->dev->of_node, "qcom,qtb500")) {
-				struct qtb500_device *qtb = to_qtb500(tbu);
-
-				qtb500_tbu_halt_req(tbu);
-				if (!qtb500_tbu_halt_poll(tbu)) {
-					arm_smmu_debug_dump_debugchain(tbu->dev,
-							qtb->debugchain_base);
-					qtb500_tbu_resume(tbu);
-				}
-				arm_smmu_debug_dump_qtb_regs(tbu->dev, tbu->base);
-			} else {
-				arm_smmu_debug_dump_tbu_testbus(tbu->dev,
-							tbu->base,
-							TBU_TESTBUS_SEL_ALL);
-			}
-		} else {
-			arm_smmu_debug_dump_tcu_testbus(smmu->dev,
-							smmu->phys_addr,
-							data->tcu_base,
-							TCU_TESTBUS_SEL_ALL);
-		}
-		spin_unlock(&testbus_lock);
-	}
-}
-
 
 static int qtb500_tbu_halt_req(struct qsmmuv500_tbu_device *tbu)
 {
@@ -1499,48 +1338,162 @@ static const struct qsmmuv500_tbu_impl qtb500_impl = {
 
 static struct qsmmuv500_tbu_device *qtb500_impl_init(struct qsmmuv500_tbu_device *tbu)
 {
-	int ret;
 	struct qtb500_device *qtb;
 	struct device *dev = tbu->dev;
-	struct resource *res;
-	struct platform_device *pdev = to_platform_device(dev);
+	int ret;
 
 	qtb = devm_krealloc(dev, tbu, sizeof(*qtb), GFP_KERNEL);
 	if (!qtb)
 		return ERR_PTR(-ENOMEM);
 
+	qtb->tbu.impl = &qtb500_impl;
+
 	ret = of_property_read_u32(dev->of_node, "qcom,num-qtb-ports", &qtb->num_ports);
 	if (ret)
 		return ERR_PTR(ret);
 
-	qtb->tbu.impl = &qtb500_impl;
 	qtb->no_halt = of_property_read_bool(dev->of_node, "qcom,no-qtb-atos-halt");
-
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "debugchain-base");
-
-	if (res) {
-		qtb->debugchain_base = devm_ioremap_resource(dev, res);
-		if (IS_ERR(qtb->debugchain_base)) {
-			dev_info(dev, "devm_ioremap failure, overlapping regs\n");
-
-			/*
-			 * use devm_ioremap for qtb's sharing same debug chain register space
-			 * for eg : sf and hf qtb's on mmnoc.
-			 */
-			qtb->debugchain_base = devm_ioremap(dev, res->start, resource_size(res));
-			if (qtb->debugchain_base == NULL) {
-				dev_err(dev, "unable to ioremap the debugchain-base\n");
-				return ERR_PTR(-EINVAL);
-			}
-		}
-	} else {
-		qtb->debugchain_base = NULL;
-	}
 
 	return &qtb->tbu;
 }
 
-#define QCOM_IOVA_WIDTH_DEFAULT			36
+static struct qsmmuv500_tbu_device *qsmmuv500_find_tbu(struct arm_smmu_device *smmu, u32 sid)
+{
+	struct qsmmuv500_tbu_device *tbu = NULL;
+	struct qsmmuv500_archdata *data = to_qsmmuv500_archdata(smmu);
+
+	list_for_each_entry(tbu, &data->tbus, list) {
+		if (tbu->sid_start <= sid &&
+		    sid < tbu->sid_start + tbu->num_sids)
+			return tbu;
+	}
+
+	return NULL;
+}
+
+static int qsmmuv500_tbu_halt(struct qsmmuv500_tbu_device *tbu,
+			      struct arm_smmu_domain *smmu_domain)
+{
+	unsigned long flags;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	int ret = 0, idx = smmu_domain->cfg.cbndx;
+	u32 fsr;
+
+	if (of_property_read_bool(tbu->dev->of_node, "qcom,opt-out-tbu-halting")) {
+		dev_notice(tbu->dev, "TBU opted-out for halting!\n");
+		return -EBUSY;
+	}
+
+	spin_lock_irqsave(&tbu->halt_lock, flags);
+	if (tbu->halt_count) {
+		tbu->halt_count++;
+		goto out;
+	}
+
+	ret = tbu->impl->halt_req(tbu);
+	if (ret)
+		goto out;
+
+	fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
+	if ((fsr & ARM_SMMU_CB_FSR_FAULT) && (fsr & ARM_SMMU_CB_FSR_SS)) {
+		u32 sctlr_orig, sctlr;
+		/*
+		 * We are in a fault; Our request to halt the bus will not
+		 * complete until transactions in front of us (such as the fault
+		 * itself) have completed. Disable iommu faults and terminate
+		 * any existing transactions.
+		 */
+		sctlr_orig = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_SCTLR);
+		sctlr = sctlr_orig & ~(ARM_SMMU_SCTLR_CFCFG | ARM_SMMU_SCTLR_CFIE);
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, sctlr);
+
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_FSR, fsr);
+		/*
+		 * Barrier required to ensure that the FSR is cleared
+		 * before resuming SMMU operation
+		 */
+		wmb();
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_RESUME,
+				  ARM_SMMU_RESUME_TERMINATE);
+
+		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, sctlr_orig);
+	}
+
+	ret = tbu->impl->halt_poll(tbu);
+	if (ret)
+		goto out;
+
+	tbu->halt_count = 1;
+out:
+	spin_unlock_irqrestore(&tbu->halt_lock, flags);
+	return ret;
+}
+
+static void qsmmuv500_tbu_resume(struct qsmmuv500_tbu_device *tbu)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tbu->halt_lock, flags);
+	if (WARN(!tbu->halt_count, "%s bad tbu->halt_count", dev_name(tbu->dev))) {
+		goto out;
+
+	} else if (tbu->halt_count > 1) {
+		tbu->halt_count--;
+		goto out;
+	}
+
+	tbu->impl->resume(tbu);
+
+	tbu->halt_count = 0;
+out:
+	spin_unlock_irqrestore(&tbu->halt_lock, flags);
+}
+
+/*
+ * Provides mutually exclusive access to the registers used by the
+ * outstanding transaction snapshot feature and the transaction
+ * snapshot capture feature.
+ */
+static DEFINE_MUTEX(capture_reg_lock);
+
+static void qsmmuv500_log_outstanding_transactions(struct work_struct *work)
+{
+	struct qsmmuv500_tbu_device *tbu = NULL;
+	struct qsmmuv500_archdata *data = container_of(work,
+						struct qsmmuv500_archdata,
+						outstanding_tnx_work);
+	struct arm_smmu_device *smmu = &data->smmu;
+
+	if (!mutex_trylock(&capture_reg_lock)) {
+		dev_warn_ratelimited(smmu->dev,
+			"Tnx snapshot regs in use, not dumping OT tnxs.\n");
+		goto bug;
+	}
+
+	if (arm_smmu_power_on(smmu->pwr)) {
+		dev_err_ratelimited(smmu->dev,
+				    "%s: Failed to power on SMMU.\n",
+				    __func__);
+		goto unlock;
+	}
+
+	list_for_each_entry(tbu, &data->tbus, list) {
+		if (arm_smmu_power_on(tbu->pwr)) {
+			dev_err_ratelimited(tbu->dev, "%s: Failed to power on TBU.\n", __func__);
+			continue;
+		}
+
+		tbu->impl->log_outstanding_transactions(tbu);
+
+		arm_smmu_power_off(smmu, tbu->pwr);
+	}
+
+	arm_smmu_power_off(smmu, smmu->pwr);
+unlock:
+	mutex_unlock(&capture_reg_lock);
+bug:
+	BUG_ON(IS_ENABLED(CONFIG_IOMMU_TLBSYNC_DEBUG));
+}
 
 static struct qsmmuv500_tbu_device *qsmmuv500_tbu_impl_init(struct qsmmuv500_tbu_device *tbu)
 {
@@ -1552,9 +1505,9 @@ static struct qsmmuv500_tbu_device *qsmmuv500_tbu_impl_init(struct qsmmuv500_tbu
 
 static int qsmmuv500_tbu_probe(struct platform_device *pdev)
 {
-	struct resource *res;
 	struct device *dev = &pdev->dev;
 	struct qsmmuv500_tbu_device *tbu;
+	struct resource *res;
 	const __be32 *cell;
 	int ret, len;
 
@@ -1581,10 +1534,13 @@ static int qsmmuv500_tbu_probe(struct platform_device *pdev)
 
 	spin_lock_init(&tbu->halt_lock);
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "base");
-	tbu->base = devm_ioremap_resource(dev, res);
-	if (IS_ERR(tbu->base))
-		return PTR_ERR(tbu->base);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return -EINVAL;
+
+	tbu->base = devm_ioremap(dev, res->start, resource_size(res));
+	if (!tbu->base)
+		return -ENOMEM;
 
 	cell = of_get_property(dev->of_node, "qcom,stream-id-range", &len);
 	if (!cell || len < 8)
@@ -1595,11 +1551,16 @@ static int qsmmuv500_tbu_probe(struct platform_device *pdev)
 
 	ret = of_property_read_u32(dev->of_node, "qcom,iova-width", &tbu->iova_width);
 	if (ret < 0)
-		tbu->iova_width = QCOM_IOVA_WIDTH_DEFAULT;
+		return ret;
 
 	dev_set_drvdata(dev, tbu);
 	return 0;
 }
+
+static const struct of_device_id qsmmuv500_tbu_of_match[] = {
+	{.compatible = "qcom,qsmmuv500-tbu"},
+	{}
+};
 
 struct platform_driver qsmmuv500_tbu_driver = {
 	.driver	= {
@@ -1609,338 +1570,14 @@ struct platform_driver qsmmuv500_tbu_driver = {
 	.probe	= qsmmuv500_tbu_probe,
 };
 
-static ssize_t arm_smmu_debug_capturebus_snapshot_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset)
-{
-	struct qsmmuv500_tbu_device *tbu = file->private_data;
-	struct arm_smmu_device *smmu = tbu->smmu;
-	void __iomem *tbu_base = tbu->base;
-	u64 snapshot[NO_OF_CAPTURE_POINTS][REGS_PER_CAPTURE_POINT];
-	char buf[400];
-	ssize_t retval;
-	size_t buflen;
-	int buf_len = sizeof(buf);
-	int i, j;
-
-	if (*offset)
-		return 0;
-
-	memset(buf, 0, buf_len);
-
-	if (arm_smmu_power_on(smmu->pwr))
-		return -EINVAL;
-
-	if (arm_smmu_power_on(tbu->pwr)) {
-		arm_smmu_power_off(smmu, smmu->pwr);
-		return -EINVAL;
-	}
-
-	if (!mutex_trylock(&capture_reg_lock)) {
-		dev_warn_ratelimited(smmu->dev,
-			"capture bus regs in use, not dumping it.\n");
-		return -EBUSY;
-	}
-
-	arm_smmu_debug_get_capture_snapshot(tbu_base, snapshot);
-
-	mutex_unlock(&capture_reg_lock);
-	arm_smmu_power_off(tbu->smmu, tbu->pwr);
-	arm_smmu_power_off(smmu, smmu->pwr);
-
-	for (i = 0; i < NO_OF_CAPTURE_POINTS ; ++i) {
-		for (j = 0; j < REGS_PER_CAPTURE_POINT; ++j) {
-			scnprintf(buf + strlen(buf), buf_len - strlen(buf),
-				 "Capture_%d_Snapshot_%d : 0x%0llx\n",
-				  i+1, j+1, snapshot[i][j]);
-		}
-	}
-
-	buflen = min(count, strlen(buf));
-	if (copy_to_user(ubuf, buf, buflen)) {
-		dev_err_ratelimited(smmu->dev, "Couldn't copy_to_user\n");
-		retval = -EFAULT;
-	} else {
-		*offset = 1;
-		retval = buflen;
-	}
-
-	return retval;
-}
-
-static const struct file_operations arm_smmu_debug_capturebus_snapshot_fops = {
-	.open	= simple_open,
-	.read	= arm_smmu_debug_capturebus_snapshot_read,
-};
-
-static ssize_t arm_smmu_debug_capturebus_config_write(struct file *file,
-		const char __user *ubuf, size_t count, loff_t *offset)
-{
-	struct qsmmuv500_tbu_device *tbu = file->private_data;
-	struct arm_smmu_device *smmu = tbu->smmu;
-	void __iomem *tbu_base = tbu->base;
-	char *comma1, *comma2;
-	char buf[100];
-	u64 sel, mask, match, val;
-
-	if (count >= sizeof(buf)) {
-		dev_err_ratelimited(smmu->dev, "Input too large\n");
-		goto invalid_format;
-	}
-
-	memset(buf, 0, sizeof(buf));
-
-	if (copy_from_user(buf, ubuf, count)) {
-		dev_err_ratelimited(smmu->dev, "Couldn't copy from user\n");
-		return -EFAULT;
-	}
-
-	comma1 = strnchr(buf, count, ',');
-	if (!comma1)
-		goto invalid_format;
-
-	*comma1  = '\0';
-
-	if (kstrtou64(buf, 0, &sel))
-		goto invalid_format;
-
-	if (sel > 4) {
-		goto invalid_format;
-	} else if (sel == 4) {
-		if (kstrtou64(comma1 + 1, 0, &val))
-			goto invalid_format;
-		goto program_capturebus;
-	}
-
-	comma2 = strnchr(comma1 + 1, count, ',');
-	if (!comma2)
-		goto invalid_format;
-
-	/* split up the words */
-	*comma2 = '\0';
-
-	if (kstrtou64(comma1 + 1, 0, &mask))
-		goto invalid_format;
-
-	if (kstrtou64(comma2 + 1, 0, &match))
-		goto invalid_format;
-
-program_capturebus:
-	if (arm_smmu_power_on(smmu->pwr))
-		return -EINVAL;
-
-	if (arm_smmu_power_on(tbu->pwr)) {
-		arm_smmu_power_off(smmu, smmu->pwr);
-		return -EINVAL;
-	}
-
-	if (!mutex_trylock(&capture_reg_lock)) {
-		dev_warn_ratelimited(smmu->dev,
-			"capture bus regs in use, not configuring it.\n");
-		return -EBUSY;
-	}
-
-	if (sel == 4)
-		arm_smmu_debug_set_tnx_tcr_cntl(tbu_base, val);
-	else
-		arm_smmu_debug_set_mask_and_match(tbu_base, sel, mask, match);
-
-	mutex_unlock(&capture_reg_lock);
-	arm_smmu_power_off(tbu->smmu, tbu->pwr);
-	arm_smmu_power_off(smmu, smmu->pwr);
-
-	return count;
-
-invalid_format:
-	dev_err_ratelimited(smmu->dev, "Invalid format\n");
-	dev_err_ratelimited(smmu->dev,
-			    "Expected:<1/2/3,Mask,Match> <4,TNX_TCR_CNTL>\n");
-	return -EINVAL;
-}
-
-static ssize_t arm_smmu_debug_capturebus_config_read(struct file *file,
-		char __user *ubuf, size_t count, loff_t *offset)
-{
-	struct qsmmuv500_tbu_device *tbu = file->private_data;
-	struct arm_smmu_device *smmu = tbu->smmu;
-	void __iomem *tbu_base = tbu->base;
-	u64 val;
-	u64 mask[NO_OF_MASK_AND_MATCH], match[NO_OF_MASK_AND_MATCH];
-	char buf[400];
-	ssize_t retval;
-	size_t buflen;
-	int buf_len = sizeof(buf);
-	int i;
-
-	if (*offset)
-		return 0;
-
-	memset(buf, 0, buf_len);
-
-	if (arm_smmu_power_on(smmu->pwr))
-		return -EINVAL;
-
-	if (arm_smmu_power_on(tbu->pwr)) {
-		arm_smmu_power_off(smmu, smmu->pwr);
-		return -EINVAL;
-	}
-
-	if (!mutex_trylock(&capture_reg_lock)) {
-		dev_warn_ratelimited(smmu->dev,
-			"capture bus regs in use, not configuring it.\n");
-		return -EBUSY;
-	}
-
-	arm_smmu_debug_get_mask_and_match(tbu_base,
-					mask, match);
-	val = arm_smmu_debug_get_tnx_tcr_cntl(tbu_base);
-
-	mutex_unlock(&capture_reg_lock);
-	arm_smmu_power_off(tbu->smmu, tbu->pwr);
-	arm_smmu_power_off(smmu, smmu->pwr);
-
-	for (i = 0; i < NO_OF_MASK_AND_MATCH; ++i) {
-		scnprintf(buf + strlen(buf), buf_len - strlen(buf),
-				"Mask_%d : 0x%0llx\t", i+1, mask[i]);
-		scnprintf(buf + strlen(buf), buf_len - strlen(buf),
-				"Match_%d : 0x%0llx\n", i+1, match[i]);
-	}
-	scnprintf(buf + strlen(buf), buf_len - strlen(buf), "0x%0lx\n", val);
-
-	buflen = min(count, strlen(buf));
-	if (copy_to_user(ubuf, buf, buflen)) {
-		dev_err_ratelimited(smmu->dev, "Couldn't copy_to_user\n");
-		retval = -EFAULT;
-	} else {
-		*offset = 1;
-		retval = buflen;
-	}
-
-	return retval;
-}
-
-static const struct file_operations arm_smmu_debug_capturebus_config_fops = {
-	.open	= simple_open,
-	.write	= arm_smmu_debug_capturebus_config_write,
-	.read	= arm_smmu_debug_capturebus_config_read,
-};
-
-#ifdef CONFIG_ARM_SMMU_CAPTUREBUS_DEBUGFS
-static struct dentry *debugfs_capturebus_dir;
-
-static int qsmmuv500_capturebus_init(struct qsmmuv500_tbu_device *tbu)
-{
-	struct dentry *capturebus_dir, *iommu_debug_dir;
-
-	iommu_debug_dir = get_iommu_debug_dir();
-	if (!iommu_debug_dir)
-		return 0;
-
-	if (!debugfs_capturebus_dir) {
-		debugfs_capturebus_dir = debugfs_create_dir(
-					 "capturebus", iommu_debug_dir);
-		if (IS_ERR(debugfs_capturebus_dir)) {
-			dev_err_ratelimited(tbu->dev, "Couldn't create iommu/capturebus debugfs directory\n");
-			return PTR_ERR(debugfs_capturebus_dir);
-		}
-	}
-
-	capturebus_dir = debugfs_create_dir(dev_name(tbu->dev),
-				debugfs_capturebus_dir);
-	if (IS_ERR(capturebus_dir)) {
-		dev_err_ratelimited(tbu->dev, "Couldn't create iommu/capturebus/%s debugfs directory\n",
-				dev_name(tbu->dev));
-		goto err;
-	}
-
-	if (IS_ERR(debugfs_create_file("config", 0400, capturebus_dir, tbu,
-			&arm_smmu_debug_capturebus_config_fops))) {
-		dev_err_ratelimited(tbu->dev, "Couldn't create iommu/capturebus/%s/config debugfs file\n",
-				dev_name(tbu->dev));
-		goto err_rmdir;
-	}
-
-	if (IS_ERR(debugfs_create_file("snapshot", 0400, capturebus_dir, tbu,
-			&arm_smmu_debug_capturebus_snapshot_fops))) {
-		dev_err_ratelimited(tbu->dev, "Couldn't create iommu/capturebus/%s/snapshot debugfs file\n",
-				dev_name(tbu->dev));
-		goto err_rmdir;
-	}
-	return 0;
-err_rmdir:
-	debugfs_remove_recursive(capturebus_dir);
-err:
-	return -ENODEV;
-}
-#else
-static int qsmmuv500_capturebus_init(struct qsmmuv500_tbu_device *tbu)
-{
-	return 0;
-}
-#endif
-
-static irqreturn_t arm_smmu_debug_capture_bus_match(int irq, void *dev)
-{
-	struct qsmmuv500_tbu_device *tbu = dev;
-	struct arm_smmu_device *smmu = tbu->smmu;
-	void __iomem *tbu_base = tbu->base;
-	u64 mask[NO_OF_MASK_AND_MATCH], match[NO_OF_MASK_AND_MATCH];
-	u64 snapshot[NO_OF_CAPTURE_POINTS][REGS_PER_CAPTURE_POINT];
-	int i, j;
-	u64 val;
-
-	if (arm_smmu_power_on(smmu->pwr))
-		return IRQ_NONE;
-
-	if (arm_smmu_power_on(tbu->pwr)) {
-		arm_smmu_power_off(smmu, smmu->pwr);
-		return IRQ_NONE;
-	}
-
-	if (!mutex_trylock(&capture_reg_lock)) {
-		dev_warn_ratelimited(smmu->dev,
-			"capture bus regs in use, not dumping it.\n");
-		return IRQ_NONE;
-	}
-
-	val = arm_smmu_debug_get_tnx_tcr_cntl(tbu_base);
-	arm_smmu_debug_get_mask_and_match(tbu_base, mask, match);
-	arm_smmu_debug_get_capture_snapshot(tbu_base, snapshot);
-	arm_smmu_debug_clear_intr_and_validbits(tbu_base);
-
-	mutex_unlock(&capture_reg_lock);
-	arm_smmu_power_off(tbu->smmu, tbu->pwr);
-	arm_smmu_power_off(smmu, smmu->pwr);
-
-	dev_info(tbu->dev, "TNX_TCR_CNTL : 0x%0llx\n", val);
-
-	for (i = 0; i < NO_OF_MASK_AND_MATCH; ++i) {
-		dev_info(tbu->dev,
-				"Mask_%d : 0x%0llx\n", i+1, mask[i]);
-		dev_info(tbu->dev,
-				"Match_%d : 0x%0llx\n", i+1, match[i]);
-	}
-
-	for (i = 0; i < NO_OF_CAPTURE_POINTS ; ++i) {
-		for (j = 0; j < REGS_PER_CAPTURE_POINT; ++j) {
-			dev_info(tbu->dev,
-					"Capture_%d_Snapshot_%d : 0x%0llx\n",
-					i+1, j+1, snapshot[i][j]);
-		}
-	}
-
-	return IRQ_HANDLED;
-}
-
 static void qsmmuv500_tlb_sync_timeout(struct arm_smmu_device *smmu)
 {
-	u32 sync_inv_ack, tbu_pwr_status, sync_inv_progress, safe_sec_cfg;
+	u32 sync_inv_ack, tbu_pwr_status, sync_inv_progress;
 	u32 tbu_inv_pending = 0, tbu_sync_pending = 0;
 	u32 tbu_inv_acked = 0, tbu_sync_acked = 0;
 	u32 tcu_inv_pending = 0, tcu_sync_pending = 0;
-	u32 safe_req = 0, safe_ack = 0;
 	unsigned long tbu_ids = 0;
 	struct qsmmuv500_archdata *data = to_qsmmuv500_archdata(smmu);
-	bool dump_safe_info = false;
 	int ret;
 
 	static DEFINE_RATELIMIT_STATE(_rs,
@@ -1969,9 +1606,17 @@ static void qsmmuv500_tlb_sync_timeout(struct arm_smmu_device *smmu)
 				    ret);
 		goto out;
 	}
-	sync_inv_progress = arm_smmu_readl(smmu,
-				      0,
-				      ARM_SMMU_MMU2QSS_AND_SAFE_WAIT_CNTR);
+
+	ret = qcom_scm_io_readl((unsigned long)(smmu->phys_addr +
+				ARM_SMMU_MMU2QSS_AND_SAFE_WAIT_CNTR),
+				&sync_inv_progress);
+	if (ret) {
+		dev_err_ratelimited(smmu->dev,
+				    "SCM read of TBU sync/inv prog fails: %d\n",
+				    ret);
+		goto out;
+	}
+
 	if (tbu_pwr_status) {
 		if (tbu_sync_pending)
 			tbu_ids = tbu_pwr_status & ~tbu_sync_acked;
@@ -1981,21 +1626,6 @@ static void qsmmuv500_tlb_sync_timeout(struct arm_smmu_device *smmu)
 
 	tcu_inv_pending = FIELD_GET(TCU_INV_IN_PRGSS, sync_inv_progress);
 	tcu_sync_pending = FIELD_GET(TCU_SYNC_IN_PRGSS, sync_inv_progress);
-
-	/*
-	 * Let's continue to dump other TBU information in case of an error.
-	 */
-	ret = qcom_scm_io_readl((unsigned long)(smmu->phys_addr +
-				APPS_SMMU_SAFE_SEC_CFG), &safe_sec_cfg);
-	if (!ret) {
-		safe_req = FIELD_GET(SAFE_REQ, safe_sec_cfg);
-		safe_ack = FIELD_GET(SAFE_ACK, safe_sec_cfg);
-		dump_safe_info = true;
-	} else {
-		dev_err_ratelimited(smmu->dev,
-				"SCM read of SAFE_SEC_CFG failed: %d\n",
-				ret);
-	}
 
 	if (__ratelimit(&_rs)) {
 		unsigned long tbu_id;
@@ -2007,12 +1637,6 @@ static void qsmmuv500_tlb_sync_timeout(struct arm_smmu_device *smmu)
 			"TCU invalidation %s, TCU sync %s\n",
 			tcu_inv_pending?"pending":"completed",
 			tcu_sync_pending?"pending":"completed");
-		if (dump_safe_info)
-			dev_err(smmu->dev,
-				"safe_sec_cfg 0x%x safe_req %s and safe_ack %s\n",
-				safe_sec_cfg,
-				safe_req ? "not received" : "received",
-				safe_ack ? "not received" : "received");
 
 		for_each_set_bit(tbu_id, &tbu_ids, sizeof(tbu_ids) *
 				 BITS_PER_BYTE) {
@@ -2029,15 +1653,8 @@ static void qsmmuv500_tlb_sync_timeout(struct arm_smmu_device *smmu)
 					tbu_sync_pending ?
 					"check pending transactions on TBU"
 					: "check for TBU power status");
-				arm_smmu_testbus_dump(smmu,
-						(u16)(tbu_id << TBUID_SHIFT));
 			}
 		}
-
-		/*dump TCU testbus*/
-		arm_smmu_testbus_dump(smmu, U16_MAX);
-
-
 	}
 
 	if (tcu_sync_pending) {
@@ -2082,7 +1699,6 @@ static bool smr_is_subset(struct arm_smmu_smr *smr2, struct arm_smmu_smr *smr)
 	    !((smr->id ^ smr2->id) & ~smr->mask);
 }
 
-
 /*
  * Zero means failure.
  */
@@ -2103,13 +1719,13 @@ static phys_addr_t qsmmuv500_iova_to_phys(struct arm_smmu_domain *smmu_domain, d
 	if (!tbu)
 		return 0;
 
+	if (arm_smmu_power_on(tbu->pwr))
+		return 0;
+
 	if (iova >= (1ULL << tbu->iova_width)) {
 		dev_err_ratelimited(tbu->dev, "ECATS: address too large: %pad\n", &iova);
 		return 0;
 	}
-
-	if (arm_smmu_power_on(tbu->pwr))
-		return 0;
 
 	if (qsmmuv500_tbu_halt(tbu, smmu_domain))
 		goto out_power_off;
@@ -2123,7 +1739,7 @@ static phys_addr_t qsmmuv500_iova_to_phys(struct arm_smmu_domain *smmu_domain, d
 	arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_SCTLR, sctlr);
 
 	fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
-	if (fsr & ARM_SMMU_FSR_FAULT) {
+	if (fsr & ARM_SMMU_CB_FSR_FAULT) {
 		/* Clear pending interrupts */
 		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_FSR, fsr);
 		/*
@@ -2136,7 +1752,7 @@ static phys_addr_t qsmmuv500_iova_to_phys(struct arm_smmu_domain *smmu_domain, d
 		 * TBU halt takes care of resuming any stalled transcation.
 		 * Kept it here for completeness sake.
 		 */
-		if (fsr & ARM_SMMU_FSR_SS)
+		if (fsr & ARM_SMMU_CB_FSR_SS)
 			arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_RESUME,
 					  ARM_SMMU_RESUME_TERMINATE);
 	}
@@ -2152,7 +1768,7 @@ static phys_addr_t qsmmuv500_iova_to_phys(struct arm_smmu_domain *smmu_domain, d
 		phys = tbu->impl->trigger_atos(tbu, iova, sid, trans_flags);
 
 		fsr = arm_smmu_cb_read(smmu, idx, ARM_SMMU_CB_FSR);
-		if (fsr & ARM_SMMU_FSR_FAULT) {
+		if (fsr & ARM_SMMU_CB_FSR_FAULT) {
 			/* Clear pending interrupts */
 			arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_FSR, fsr);
 			/*
@@ -2161,7 +1777,7 @@ static phys_addr_t qsmmuv500_iova_to_phys(struct arm_smmu_domain *smmu_domain, d
 			 */
 			wmb();
 
-			if (fsr & ARM_SMMU_FSR_SS)
+			if (fsr & ARM_SMMU_CB_FSR_SS)
 				arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_RESUME,
 						  ARM_SMMU_RESUME_TERMINATE);
 		}
@@ -2271,13 +1887,10 @@ static void qsmmuv500_init_cb(struct arm_smmu_domain *smmu_domain,
 
 static int qsmmuv500_tbu_register(struct device *dev, void *cookie)
 {
-	struct resource *res;
 	struct qsmmuv500_tbu_device *tbu;
 	struct qsmmuv500_archdata *data = cookie;
-	struct platform_device *pdev = to_platform_device(dev);
-	int i, err, num_irqs = 0;
 
-	if (!dev->driver) {
+	if (!dev->driver_data) {
 		dev_err(dev, "TBU failed probe, QSMMUV500 cannot continue!\n");
 		return -EINVAL;
 	}
@@ -2287,44 +1900,6 @@ static int qsmmuv500_tbu_register(struct device *dev, void *cookie)
 	INIT_LIST_HEAD(&tbu->list);
 	tbu->smmu = &data->smmu;
 	list_add(&tbu->list, &data->tbus);
-
-	while ((res = platform_get_resource(pdev, IORESOURCE_IRQ, num_irqs)))
-		num_irqs++;
-
-	tbu->irqs = devm_kzalloc(dev, sizeof(*tbu->irqs) * num_irqs,
-				  GFP_KERNEL);
-	if (!tbu->irqs)
-		return -ENOMEM;
-
-	for (i = 0; i < num_irqs; ++i) {
-		int irq = platform_get_irq(pdev, i);
-
-		if (irq < 0) {
-			dev_err(dev, "failed to get irq index %d\n", i);
-			return -ENODEV;
-		}
-		tbu->irqs[i] = irq;
-
-		err = devm_request_threaded_irq(tbu->dev, tbu->irqs[i],
-					NULL, arm_smmu_debug_capture_bus_match,
-					IRQF_ONESHOT | IRQF_SHARED,
-					"capture bus", tbu);
-		if (err) {
-			dev_err(dev, "failed to request capture bus irq%d (%u)\n",
-				i, tbu->irqs[i]);
-			return err;
-		}
-	}
-
-	/*
-	 * Create testbus debugfs only if debugchain base
-	 * property is set in devicetree in case of qtb500.
-	 */
-
-	if (!of_device_is_compatible(tbu->dev->of_node, "qcom,qtb500") ||
-			to_qtb500(tbu)->debugchain_base)
-		qsmmuv500_tbu_testbus_init(tbu);
-	qsmmuv500_capturebus_init(tbu);
 	return 0;
 }
 
@@ -2404,8 +1979,10 @@ static int qsmmuv500_cfg_probe(struct arm_smmu_device *smmu)
  * Client wants to use S1 bypass
  *
  * Same as Case 3, except use the platform dma ops.
+ *
+ * This function can be used for qsmmuv500 and qsmmuv2.
  */
-static int qsmmuv500_def_domain_type(struct device *dev)
+static int qcom_def_domain_type(struct device *dev)
 {
 	const char *str;
 	struct device_node *np;
@@ -2438,7 +2015,7 @@ static const struct arm_smmu_impl qsmmuv500_impl = {
 	.tlb_sync_timeout = qsmmuv500_tlb_sync_timeout,
 	.device_remove = qsmmuv500_device_remove,
 	.device_group = qsmmuv500_device_group,
-	.def_domain_type = qsmmuv500_def_domain_type,
+	.def_domain_type = qcom_def_domain_type,
 };
 
 static const struct arm_smmu_impl qsmmuv500_adreno_impl = {
@@ -2450,7 +2027,25 @@ static const struct arm_smmu_impl qsmmuv500_adreno_impl = {
 	.tlb_sync_timeout = qsmmuv500_tlb_sync_timeout,
 	.device_remove = qsmmuv500_device_remove,
 	.device_group = qsmmuv500_device_group,
-	.def_domain_type = qsmmuv500_def_domain_type,
+	.def_domain_type = qcom_def_domain_type,
+};
+
+static const struct arm_smmu_impl qsmmuv2_impl = {
+	.init_context_bank = qsmmuv2_init_cb,
+	.iova_to_phys_hard = qsmmuv2_iova_to_phys_hard,
+	.tlb_sync_timeout = qsmmuv2_tlb_sync_timeout,
+	.reset = qsmmuv2_device_reset,
+	.def_domain_type = qcom_def_domain_type,
+};
+
+static const struct arm_smmu_impl qsmmuv2_adreno_impl = {
+	.init_context = qcom_adreno_smmu_init_context,
+	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
+	.init_context_bank = qsmmuv2_init_cb,
+	.iova_to_phys_hard = qsmmuv2_iova_to_phys_hard,
+	.tlb_sync_timeout = qsmmuv2_tlb_sync_timeout,
+	.reset = qsmmuv2_device_reset,
+	.def_domain_type = qcom_def_domain_type,
 };
 
 /* We only have access to arm-architected registers */
@@ -2458,19 +2053,22 @@ static const struct arm_smmu_impl qsmmuv500_virt_impl = {
 	.cfg_probe = qsmmuv500_cfg_probe,
 	.init_context_bank = qsmmuv500_init_cb,
 	.device_group = qsmmuv500_device_group,
-	.def_domain_type = qsmmuv500_def_domain_type,
+	.def_domain_type = qcom_def_domain_type,
 };
 
 struct arm_smmu_device *qsmmuv500_create(struct arm_smmu_device *smmu,
 		const struct arm_smmu_impl *impl)
 {
-	struct resource *res;
 	struct device *dev = smmu->dev;
 	struct qsmmuv500_archdata *data;
-	struct platform_device *pdev;
 	int ret;
 
-	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+	/*
+	 * devm_krealloc() invokes devm_kmalloc(), so we pass __GFP_ZERO
+	 * to ensure that fields after smmu are initialized, even if we don't
+	 * initialize them (e.g. ACTLR related fields).
+	 */
+	data = devm_krealloc(dev, smmu, sizeof(*data), GFP_KERNEL | __GFP_ZERO);
 	if (!data)
 		return ERR_PTR(-ENOMEM);
 
@@ -2478,22 +2076,7 @@ struct arm_smmu_device *qsmmuv500_create(struct arm_smmu_device *smmu,
 	spin_lock_init(&data->atos_lock);
 	INIT_WORK(&data->outstanding_tnx_work,
 		  qsmmuv500_log_outstanding_transactions);
-
-	data->smmu = *smmu;
 	data->smmu.impl = impl;
-	devm_kfree(smmu->dev, smmu);
-
-	pdev = to_platform_device(dev);
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tcu-base");
-	if (!res) {
-		dev_err(dev, "Unable to get the tcu-base\n");
-		return ERR_PTR(-EINVAL);
-	}
-	data->tcu_base = devm_ioremap_resource(dev, res);
-	if (IS_ERR(data->tcu_base))
-		return ERR_CAST(data->tcu_base);
-
-	qsmmuv500_tcu_testbus_init(&data->smmu);
 
 	ret = qsmmuv500_read_actlr_tbl(data);
 	if (ret)
@@ -2518,7 +2101,7 @@ static struct arm_smmu_device *qsmmuv500_virt_create(struct arm_smmu_device *smm
 	struct qsmmuv500_archdata *data;
 	int ret;
 
-	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+	data = devm_krealloc(dev, smmu, sizeof(*data), GFP_KERNEL | __GFP_ZERO);
 	if (!data)
 		return ERR_PTR(-ENOMEM);
 
@@ -2526,10 +2109,7 @@ static struct arm_smmu_device *qsmmuv500_virt_create(struct arm_smmu_device *smm
 	spin_lock_init(&data->atos_lock);
 	INIT_WORK(&data->outstanding_tnx_work,
 		  qsmmuv500_log_outstanding_transactions);
-
-	data->smmu = *smmu;
 	data->smmu.impl = impl;
-	devm_kfree(smmu->dev, smmu);
 
 	ret = qsmmuv500_read_actlr_tbl(data);
 	if (ret)
@@ -2549,40 +2129,208 @@ struct arm_smmu_device *qsmmuv500_impl_init(struct arm_smmu_device *smmu)
 	return qsmmuv500_create(smmu, &qsmmuv500_impl);
 }
 
-static const struct arm_smmu_impl qcom_adreno_smmu_impl = {
-	.init_context = qcom_adreno_smmu_init_context,
-	.def_domain_type = qcom_smmu_def_domain_type,
-	.reset = qcom_smmu500_reset,
-	.alloc_context_bank = qcom_adreno_smmu_alloc_context_bank,
-};
-
 static struct arm_smmu_device *qcom_smmu_create(struct arm_smmu_device *smmu,
-		const struct arm_smmu_impl *impl)
+		const struct qcom_smmu_match_data *data)
 {
+	const struct device_node *np = smmu->dev->of_node;
+	const struct arm_smmu_impl *impl;
 	struct qcom_smmu *qsmmu;
+
+	if (!data)
+		return ERR_PTR(-EINVAL);
+
+	if (np && of_device_is_compatible(np, "qcom,adreno-smmu"))
+		impl = data->adreno_impl;
+	else
+		impl = data->impl;
+
+	if (!impl)
+		return smmu;
 
 	/* Check to make sure qcom_scm has finished probing */
 	if (!qcom_scm_is_available())
-		return ERR_PTR(-EPROBE_DEFER);
+		return ERR_PTR(dev_err_probe(smmu->dev, -EPROBE_DEFER,
+			"qcom_scm not ready\n"));
 
-	qsmmu = devm_kzalloc(smmu->dev, sizeof(*qsmmu), GFP_KERNEL);
+	qsmmu = devm_krealloc(smmu->dev, smmu, sizeof(*qsmmu), GFP_KERNEL);
 	if (!qsmmu)
 		return ERR_PTR(-ENOMEM);
 
-	qsmmu->smmu = *smmu;
-
 	qsmmu->smmu.impl = impl;
-	devm_kfree(smmu->dev, smmu);
+	qsmmu->cfg = data->cfg;
 
 	return &qsmmu->smmu;
 }
 
-struct arm_smmu_device *qcom_smmu_impl_init(struct arm_smmu_device *smmu)
+/* Implementation Defined Register Space 0 register offsets */
+static const u32 qcom_smmu_impl0_reg_offset[] = {
+	[QCOM_SMMU_TBU_PWR_STATUS]		= 0x2204,
+	[QCOM_SMMU_STATS_SYNC_INV_TBU_ACK]	= 0x25dc,
+	[QCOM_SMMU_MMU2QSS_AND_SAFE_WAIT_CNTR]	= 0x2670,
+};
+
+static const struct qcom_smmu_config qcom_smmu_impl0_cfg = {
+	.reg_offset = qcom_smmu_impl0_reg_offset,
+};
+
+/*
+ * It is not yet possible to use MDP SMMU with the bypass quirk on the msm8996,
+ * there are not enough context banks.
+ */
+static const struct qcom_smmu_match_data msm8996_smmu_data = {
+	.impl = NULL,
+	.adreno_impl = &qcom_adreno_smmu_v2_impl,
+};
+
+static const struct qcom_smmu_match_data qcom_smmu_v2_data = {
+	.impl = &qcom_smmu_v2_impl,
+	.adreno_impl = &qcom_adreno_smmu_v2_impl,
+};
+
+static const struct qcom_smmu_match_data sdm845_smmu_500_data = {
+	.impl = &sdm845_smmu_500_impl,
+	/*
+	 * No need for adreno impl here. On sdm845 the Adreno SMMU is handled
+	 * by the separate sdm845-smmu-v2 device.
+	 */
+	/* Also no debug configuration. */
+};
+
+static const struct qcom_smmu_match_data qcom_smmu_500_impl0_data = {
+	.impl = &qcom_smmu_500_impl,
+	.adreno_impl = &qcom_adreno_smmu_500_impl,
+	.cfg = &qcom_smmu_impl0_cfg,
+};
+
+/*
+ * Do not add any more qcom,SOC-smmu-500 entries to this list, unless they need
+ * special handling and can not be covered by the qcom,smmu-500 entry.
+ */
+static const struct of_device_id __maybe_unused qcom_smmu_impl_of_match[] = {
+	{ .compatible = "qcom,msm8996-smmu-v2", .data = &msm8996_smmu_data },
+	{ .compatible = "qcom,msm8998-smmu-v2", .data = &qcom_smmu_v2_data },
+	{ .compatible = "qcom,qcm2290-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,qdu1000-smmu-500", .data = &qcom_smmu_500_impl0_data  },
+	{ .compatible = "qcom,sc7180-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sc7180-smmu-v2", .data = &qcom_smmu_v2_data },
+	{ .compatible = "qcom,sc7280-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sc8180x-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sc8280xp-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sdm630-smmu-v2", .data = &qcom_smmu_v2_data },
+	{ .compatible = "qcom,sdm845-smmu-v2", .data = &qcom_smmu_v2_data },
+	{ .compatible = "qcom,sdm845-smmu-500", .data = &sdm845_smmu_500_data },
+	{ .compatible = "qcom,sm6115-smmu-500", .data = &qcom_smmu_500_impl0_data},
+	{ .compatible = "qcom,sm6125-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sm6350-smmu-v2", .data = &qcom_smmu_v2_data },
+	{ .compatible = "qcom,sm6350-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sm6375-smmu-v2", .data = &qcom_smmu_v2_data },
+	{ .compatible = "qcom,sm6375-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sm7150-smmu-v2", .data = &qcom_smmu_v2_data },
+	{ .compatible = "qcom,sm8150-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sm8250-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sm8350-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,sm8450-smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ .compatible = "qcom,smmu-500", .data = &qcom_smmu_500_impl0_data },
+	{ }
+};
+
+#ifdef CONFIG_ACPI
+static struct acpi_platform_list qcom_acpi_platlist[] = {
+	{ "LENOVO", "CB-01   ", 0x8180, ACPI_SIG_IORT, equal, "QCOM SMMU" },
+	{ "QCOM  ", "QCOMEDK2", 0x8180, ACPI_SIG_IORT, equal, "QCOM SMMU" },
+	{ }
+};
+#endif
+
+static int qcom_smmu_tbu_probe(struct platform_device *pdev)
 {
-	return qcom_smmu_create(smmu, &qcom_smmu_impl);
+	struct device *dev = &pdev->dev;
+	int ret;
+
+	if (IS_ENABLED(CONFIG_ARM_SMMU_QCOM_DEBUG)) {
+		ret = qcom_tbu_probe(pdev);
+		if (ret)
+			return ret;
+	}
+
+	if (dev->pm_domain) {
+		pm_runtime_set_active(dev);
+		pm_runtime_enable(dev);
+	}
+
+	return 0;
 }
 
-struct arm_smmu_device *qcom_adreno_smmu_impl_init(struct arm_smmu_device *smmu)
+static const struct of_device_id qcom_smmu_tbu_of_match[] = {
+	{ .compatible = "qcom,sc7280-tbu" },
+	{ .compatible = "qcom,sdm845-tbu" },
+	{ }
+};
+
+static struct platform_driver qcom_smmu_tbu_driver = {
+	.driver = {
+		.name           = "qcom_tbu",
+		.of_match_table = qcom_smmu_tbu_of_match,
+	},
+	.probe = qcom_smmu_tbu_probe,
+};
+
+struct arm_smmu_device *qcom_smmu_impl_init(struct arm_smmu_device *smmu)
 {
-	return qcom_smmu_create(smmu, &qcom_adreno_smmu_impl);
+	const struct device_node *np = smmu->dev->of_node;
+	const struct of_device_id *match;
+	static u8 tbu_registered;
+
+	if (!tbu_registered++)
+		platform_driver_register(&qcom_smmu_tbu_driver);
+
+#ifdef CONFIG_ACPI
+	if (np == NULL) {
+		/* Match platform for ACPI boot */
+		if (acpi_match_platform_list(qcom_acpi_platlist) >= 0)
+			return qcom_smmu_create(smmu, &qcom_smmu_500_impl0_data);
+	}
+#endif
+
+	match = of_match_node(qcom_smmu_impl_of_match, np);
+	if (match)
+		return qcom_smmu_create(smmu, match->data);
+
+	/*
+	 * If you hit this WARN_ON() you are missing an entry in the
+	 * qcom_smmu_impl_of_match[] table, and GPU per-process page-
+	 * tables will be broken.
+	 */
+	WARN(of_device_is_compatible(np, "qcom,adreno-smmu"),
+	     "Missing qcom_smmu_impl_of_match entry for: %s",
+	     dev_name(smmu->dev));
+
+	return smmu;
+}
+
+struct arm_smmu_device *qsmmuv2_impl_init(struct arm_smmu_device *smmu)
+{
+	struct device *dev = smmu->dev;
+	struct qsmmuv2_archdata *data;
+	struct platform_device *pdev;
+	int ret;
+
+	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return ERR_PTR(-ENOMEM);
+
+	pdev = to_platform_device(dev);
+
+	spin_lock_init(&data->atos_lock);
+	data->smmu = *smmu;
+	if (of_device_is_compatible(smmu->dev->of_node, "qcom,adreno-smmu"))
+		data->smmu.impl = &qsmmuv2_adreno_impl;
+	else
+		data->smmu.impl = &qsmmuv2_impl;
+
+	ret = arm_smmu_parse_impl_def_registers(&data->smmu);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return &data->smmu;
 }

@@ -156,7 +156,7 @@ kalmia_bind(struct usbnet *dev, struct usb_interface *intf)
 	if (status)
 		return status;
 
-	memcpy(dev->net->dev_addr, ethernet_addr, ETH_ALEN);
+	eth_hw_addr_set(dev->net, ethernet_addr);
 
 	return status;
 }
@@ -275,14 +275,6 @@ kalmia_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			netdev_dbg(dev->net,
 				"Received header: %6phC. Package length: %i\n",
 				header_start, skb->len - KALMIA_HEADER_LENGTH);
-
-		/* both framing headers must be present before we subtract
-		 * them, otherwise usb_packet_length underflows and the
-		 * device-supplied ether_packet_length drives an out of bounds
-		 * access below
-		 */
-		if (skb->len < 2 * KALMIA_HEADER_LENGTH)
-			return 0;
 
 		/* subtract start header and end header */
 		usb_packet_length = skb->len - (2 * KALMIA_HEADER_LENGTH);

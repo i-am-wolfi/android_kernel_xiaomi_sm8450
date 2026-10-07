@@ -35,6 +35,7 @@
 #include <net/sock.h>
 #include <linux/in.h>
 #include <linux/export.h>
+#include <linux/sched/clock.h>
 #include <linux/time.h>
 #include <linux/rds.h>
 
@@ -362,21 +363,6 @@ void rds_recv_incoming(struct rds_connection *conn, struct in6_addr *saddr,
 	rs = rds_find_bound(daddr, inc->i_hdr.h_dport, conn->c_bound_if);
 	if (!rs) {
 		rds_stats_inc(s_recv_drop_no_sock);
-		goto out;
-	}
-
-	/*
-	 * rds_find_bound() uses a global (netns-agnostic) hash table.
-	 * An RDS connection created in netns A can match a socket bound
-	 * in the init netns, delivering inc cross-netns with inc->i_conn
-	 * pointing into netns A.  When cleanup_net() then frees that conn,
-	 * any subsequent dereference of inc->i_conn is a use-after-free.
-	 * Drop the inc if the receiving socket lives in a different netns.
-	 */
-	if (!net_eq(sock_net(rds_rs_to_sk(rs)), rds_conn_net(conn))) {
-		rds_stats_inc(s_recv_drop_no_sock);
-		rds_sock_put(rs);
-		rs = NULL;
 		goto out;
 	}
 
@@ -741,8 +727,6 @@ int rds_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 
 		if (msg->msg_name) {
 			if (ipv6_addr_v4mapped(&inc->i_saddr)) {
-				sin = (struct sockaddr_in *)msg->msg_name;
-
 				sin->sin_family = AF_INET;
 				sin->sin_port = inc->i_hdr.h_sport;
 				sin->sin_addr.s_addr =
@@ -750,8 +734,6 @@ int rds_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 				memset(sin->sin_zero, 0, sizeof(sin->sin_zero));
 				msg->msg_namelen = sizeof(*sin);
 			} else {
-				sin6 = (struct sockaddr_in6 *)msg->msg_name;
-
 				sin6->sin6_family = AF_INET6;
 				sin6->sin6_port = inc->i_hdr.h_sport;
 				sin6->sin6_addr = inc->i_saddr;

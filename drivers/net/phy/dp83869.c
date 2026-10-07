@@ -16,6 +16,7 @@
 #include <dt-bindings/net/ti-dp83869.h>
 
 #define DP83869_PHY_ID		0x2000a0f1
+#define DP83561_PHY_ID		0x2000a1a4
 #define DP83869_DEVADDR		0x1f
 
 #define MII_DP83869_PHYCTRL	0x10
@@ -30,7 +31,6 @@
 #define DP83869_RGMIICTL	0x0032
 #define DP83869_STRAP_STS1	0x006e
 #define DP83869_RGMIIDCTL	0x0086
-#define DP83869_ANA_PLL_PROG_PI	0x00c6
 #define DP83869_RXFCFG		0x0134
 #define DP83869_RXFPMD1		0x0136
 #define DP83869_RXFPMD2		0x0137
@@ -153,19 +153,32 @@ struct dp83869_private {
 	int mode;
 };
 
+static int dp83869_config_aneg(struct phy_device *phydev)
+{
+	struct dp83869_private *dp83869 = phydev->priv;
+
+	if (dp83869->mode != DP83869_RGMII_1000_BASE)
+		return genphy_config_aneg(phydev);
+
+	return genphy_c37_config_aneg(phydev);
+}
+
 static int dp83869_read_status(struct phy_device *phydev)
 {
 	struct dp83869_private *dp83869 = phydev->priv;
+	bool changed;
 	int ret;
+
+	if (dp83869->mode == DP83869_RGMII_1000_BASE)
+		return genphy_c37_read_status(phydev, &changed);
 
 	ret = genphy_read_status(phydev);
 	if (ret)
 		return ret;
 
-	if (linkmode_test_bit(ETHTOOL_LINK_MODE_FIBRE_BIT, phydev->supported)) {
+	if (dp83869->mode == DP83869_RGMII_100_BASE) {
 		if (phydev->link) {
-			if (dp83869->mode == DP83869_RGMII_100_BASE)
-				phydev->speed = SPEED_100;
+			phydev->speed = SPEED_100;
 		} else {
 			phydev->speed = SPEED_UNKNOWN;
 			phydev->duplex = DUPLEX_UNKNOWN;
@@ -187,9 +200,13 @@ static int dp83869_ack_interrupt(struct phy_device *phydev)
 
 static int dp83869_config_intr(struct phy_device *phydev)
 {
-	int micr_status = 0;
+	int micr_status = 0, err;
 
 	if (phydev->interrupts == PHY_INTERRUPT_ENABLED) {
+		err = dp83869_ack_interrupt(phydev);
+		if (err)
+			return err;
+
 		micr_status = phy_read(phydev, MII_DP83869_MICR);
 		if (micr_status < 0)
 			return micr_status;
@@ -202,10 +219,16 @@ static int dp83869_config_intr(struct phy_device *phydev)
 			MII_DP83869_MICR_DUP_MODE_CHNG_INT_EN |
 			MII_DP83869_MICR_SLEEP_MODE_CHNG_INT_EN);
 
-		return phy_write(phydev, MII_DP83869_MICR, micr_status);
+		err = phy_write(phydev, MII_DP83869_MICR, micr_status);
+	} else {
+		err = phy_write(phydev, MII_DP83869_MICR, micr_status);
+		if (err)
+			return err;
+
+		err = dp83869_ack_interrupt(phydev);
 	}
 
-	return phy_write(phydev, MII_DP83869_MICR, micr_status);
+	return err;
 }
 
 static irqreturn_t dp83869_handle_interrupt(struct phy_device *phydev)
@@ -237,7 +260,7 @@ static int dp83869_set_wol(struct phy_device *phydev,
 {
 	struct net_device *ndev = phydev->attached_dev;
 	int val_rxcfg, val_micr;
-	u8 *mac;
+	const u8 *mac;
 	int ret;
 
 	val_rxcfg = phy_read_mmd(phydev, DP83869_DEVADDR, DP83869_RXFCFG);
@@ -255,7 +278,7 @@ static int dp83869_set_wol(struct phy_device *phydev,
 
 		if (wol->wolopts & WAKE_MAGIC ||
 		    wol->wolopts & WAKE_MAGICSECURE) {
-			mac = (u8 *)ndev->dev_addr;
+			mac = (const u8 *)ndev->dev_addr;
 
 			if (!is_valid_ether_addr(mac))
 				return -EINVAL;
@@ -681,8 +704,20 @@ static int dp83869_configure_mode(struct phy_device *phydev,
 	/* Below init sequence for each operational mode is defined in
 	 * section 9.4.8 of the datasheet.
 	 */
+	phy_ctrl_val = dp83869->mode;
+	if (phydev->interface == PHY_INTERFACE_MODE_MII) {
+		if (dp83869->mode == DP83869_100M_MEDIA_CONVERT ||
+		    dp83869->mode == DP83869_RGMII_100_BASE ||
+		    dp83869->mode == DP83869_RGMII_COPPER_ETHERNET) {
+			phy_ctrl_val |= DP83869_OP_MODE_MII;
+		} else {
+			phydev_err(phydev, "selected op-mode is not valid with MII mode\n");
+			return -EINVAL;
+		}
+	}
+
 	ret = phy_write_mmd(phydev, DP83869_DEVADDR, DP83869_OP_MODE,
-			    dp83869->mode);
+			    phy_ctrl_val);
 	if (ret)
 		return ret;
 
@@ -792,22 +827,12 @@ static int dp83869_config_init(struct phy_device *phydev)
 		dp83869_config_port_mirroring(phydev);
 
 	/* Clock output selection if muxing property is set */
-	if (dp83869->clk_output_sel != DP83869_CLK_O_SEL_REF_CLK) {
-		/*
-		 * Table 7-121 in datasheet says we have to set register 0xc6
-		 * to value 0x10 before CLK_O_SEL can be modified.
-		 */
-		ret = phy_write_mmd(phydev, DP83869_DEVADDR,
-				    DP83869_ANA_PLL_PROG_PI, 0x10);
-		if (ret)
-			return ret;
-
+	if (dp83869->clk_output_sel != DP83869_CLK_O_SEL_REF_CLK)
 		ret = phy_modify_mmd(phydev,
 				     DP83869_DEVADDR, DP83869_IO_MUX_CFG,
 				     DP83869_IO_MUX_CFG_CLK_O_SEL_MASK,
 				     dp83869->clk_output_sel <<
 				     DP83869_IO_MUX_CFG_CLK_O_SEL_SHIFT);
-	}
 
 	if (phy_interface_is_rgmii(phydev)) {
 		ret = phy_write_mmd(phydev, DP83869_DEVADDR, DP83869_RGMIIDCTL,
@@ -876,35 +901,36 @@ static int dp83869_phy_reset(struct phy_device *phydev)
 	return dp83869_config_init(phydev);
 }
 
+
+#define DP83869_PHY_DRIVER(_id, _name)				\
+{								\
+	PHY_ID_MATCH_MODEL(_id),				\
+	.name		= (_name),				\
+	.probe          = dp83869_probe,			\
+	.config_init	= dp83869_config_init,			\
+	.soft_reset	= dp83869_phy_reset,			\
+	.config_intr	= dp83869_config_intr,			\
+	.handle_interrupt = dp83869_handle_interrupt,		\
+	.config_aneg    = dp83869_config_aneg,                  \
+	.read_status	= dp83869_read_status,			\
+	.get_tunable	= dp83869_get_tunable,			\
+	.set_tunable	= dp83869_set_tunable,			\
+	.get_wol	= dp83869_get_wol,			\
+	.set_wol	= dp83869_set_wol,			\
+	.suspend	= genphy_suspend,			\
+	.resume		= genphy_resume,			\
+}
+
 static struct phy_driver dp83869_driver[] = {
-	{
-		PHY_ID_MATCH_MODEL(DP83869_PHY_ID),
-		.name		= "TI DP83869",
+	DP83869_PHY_DRIVER(DP83869_PHY_ID, "TI DP83869"),
+	DP83869_PHY_DRIVER(DP83561_PHY_ID, "TI DP83561-SP"),
 
-		.probe          = dp83869_probe,
-		.config_init	= dp83869_config_init,
-		.soft_reset	= dp83869_phy_reset,
-
-		/* IRQ related */
-		.ack_interrupt	= dp83869_ack_interrupt,
-		.config_intr	= dp83869_config_intr,
-		.handle_interrupt = dp83869_handle_interrupt,
-		.read_status	= dp83869_read_status,
-
-		.get_tunable	= dp83869_get_tunable,
-		.set_tunable	= dp83869_set_tunable,
-
-		.get_wol	= dp83869_get_wol,
-		.set_wol	= dp83869_set_wol,
-
-		.suspend	= genphy_suspend,
-		.resume		= genphy_resume,
-	},
 };
 module_phy_driver(dp83869_driver);
 
 static struct mdio_device_id __maybe_unused dp83869_tbl[] = {
 	{ PHY_ID_MATCH_MODEL(DP83869_PHY_ID) },
+	{ PHY_ID_MATCH_MODEL(DP83561_PHY_ID) },
 	{ }
 };
 MODULE_DEVICE_TABLE(mdio, dp83869_tbl);

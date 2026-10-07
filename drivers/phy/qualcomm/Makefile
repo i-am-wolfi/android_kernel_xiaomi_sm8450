@@ -1,20 +1,60 @@
 # SPDX-License-Identifier: GPL-2.0
-obj-$(CONFIG_PHY_ATH79_USB)		+= phy-ath79-usb.o
-obj-$(CONFIG_PHY_QCOM_APQ8064_SATA)	+= phy-qcom-apq8064-sata.o
-obj-$(CONFIG_PHY_QCOM_IPQ4019_USB)	+= phy-qcom-ipq4019-usb.o
-obj-$(CONFIG_PHY_QCOM_IPQ806X_SATA)	+= phy-qcom-ipq806x-sata.o
-obj-$(CONFIG_PHY_QCOM_PCIE2)		+= phy-qcom-pcie2.o
-obj-$(CONFIG_PHY_QCOM_QMP)		+= phy-qcom-qmp.o
-obj-$(CONFIG_PHY_QCOM_QUSB2)		+= phy-qcom-qusb2.o
-obj-$(CONFIG_PHY_QCOM_UFS)		+= phy-qcom-ufs.o
-obj-$(CONFIG_PHY_QCOM_UFS_V4)		+= phy-qcom-ufs-qmp-v4-lahaina.o phy-qcom-ufs-qmp-v4-waipio.o phy-qcom-ufs-qmp-v4-diwali.o phy-qcom-ufs-qmp-v4-cape.o phy-qcom-ufs-qmp-v4-parrot.o phy-qcom-ufs-qmp-v4-anarok.o
-obj-$(CONFIG_PHY_QCOM_UFS_V3)           += phy-qcom-ufs-qmp-v3.o
-obj-$(CONFIG_PHY_QCOM_UFS_14NM)		+= phy-qcom-ufs-qmp-14nm.o
-obj-$(CONFIG_PHY_QCOM_UFS_20NM)		+= phy-qcom-ufs-qmp-20nm.o
-obj-$(CONFIG_PHY_QCOM_USB_HS) 		+= phy-qcom-usb-hs.o
-obj-$(CONFIG_PHY_QCOM_USB_HSIC) 	+= phy-qcom-usb-hsic.o
+
+ccflags-y += -I$(src)
+
+obj-$(CONFIG_PHY_QCOM_UFS) += phy-qcom-ufs.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_CANOE) += phy-qcom-ufs-qmp-v4-canoe.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_KALAMA) += phy-qcom-ufs-qmp-v4-kalama.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_YUPIK) += phy-qcom-ufs-qmp-v4-yupik.o
+
+obj-$(CONFIG_PHY_QCOM_SNPS_EUSB2) += phy-qcom-snps-eusb2.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_KHAJE) += phy-qcom-ufs-qmp-v4-khaje.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_LAHAINA) += phy-qcom-ufs-qmp-v4-lahaina.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V3) += phy-qcom-ufs-qmp-v3-660.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_SUN) += phy-qcom-ufs-qmp-v4-sun.o
+
 obj-$(CONFIG_PHY_QCOM_UFS_QRBTC_SDM845) += phy-qcom-ufs-qrbtc-sdm845.o
-obj-$(CONFIG_PHY_QCOM_USB_HS_28NM)	+= phy-qcom-usb-hs-28nm.o
-obj-$(CONFIG_PHY_QCOM_USB_SS)		+= phy-qcom-usb-ss.o
-obj-$(CONFIG_PHY_QCOM_USB_SNPS_FEMTO_V2)+= phy-qcom-snps-femto-v2.o
-obj-$(CONFIG_PHY_QCOM_IPQ806X_USB)		+= phy-qcom-ipq806x-usb.o
+
+obj-$(CONFIG_PHY_QCOM_EUSB2_REPEATER) += phy-qcom-eusb2-repeater.o
+
+obj-$(CONFIG_PHY_QCOM_M31_EUSB2) += phy-qcom-m31-eusb2.o
+
+obj-$(CONFIG_PHY_QCOM_QMP_COMBO) += phy-qcom-qmp-combo.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_WAIPIO) += phy-qcom-ufs-qmp-v4-waipio.o
+obj-$(CONFIG_PHY_QCOM_UFS_V4_CAPE) += phy-qcom-ufs-qmp-v4-cape.o
+
+obj-$(CONFIG_PHY_QCOM_UFS_V4_CROW) += phy-qcom-ufs-qmp-v4-crow.o
+
+obj-$(CONFIG_PHY_QCOM_QMP_USB) += phy-qcom-qmp-usb.o
+
+obj-$(CONFIG_PHY_QCOM_SGMII_ETH) += phy-qcom-sgmii-eth.o
+
+
+# --- marble: objs upstream restaurados ---
+obj-$(CONFIG_PHY_ATH79_USB) += phy-ath79-usb.o
+obj-$(CONFIG_PHY_QCOM_APQ8064_SATA) += phy-qcom-apq8064-sata.o
+obj-$(CONFIG_PHY_QCOM_EDP) += phy-qcom-edp.o
+obj-$(CONFIG_PHY_QCOM_IPQ4019_USB) += phy-qcom-ipq4019-usb.o
+obj-$(CONFIG_PHY_QCOM_IPQ806X_SATA) += phy-qcom-ipq806x-sata.o
+obj-$(CONFIG_PHY_QCOM_M31_USB) += phy-qcom-m31.o
+obj-$(CONFIG_PHY_QCOM_PCIE2) += phy-qcom-pcie2.o
+obj-$(CONFIG_PHY_QCOM_QMP_COMBO) += phy-qcom-qmp-usbc.o
+obj-$(CONFIG_PHY_QCOM_QMP_PCIE) += phy-qcom-qmp-pcie.o
+obj-$(CONFIG_PHY_QCOM_QMP_PCIE_8996) += phy-qcom-qmp-pcie-msm8996.o
+obj-$(CONFIG_PHY_QCOM_QMP_UFS) += phy-qcom-qmp-ufs.o
+obj-$(CONFIG_PHY_QCOM_QMP_USB_LEGACY) += phy-qcom-qmp-usb-legacy.o
+obj-$(CONFIG_PHY_QCOM_QUSB2) += phy-qcom-qusb2.o
+obj-$(CONFIG_PHY_QCOM_USB_HS) += phy-qcom-usb-hs.o
+obj-$(CONFIG_PHY_QCOM_USB_HSIC) += phy-qcom-usb-hsic.o
+obj-$(CONFIG_PHY_QCOM_USB_HS_28NM) += phy-qcom-usb-hs-28nm.o
+obj-$(CONFIG_PHY_QCOM_USB_SS) += phy-qcom-usb-ss.o
+obj-$(CONFIG_PHY_QCOM_USB_SNPS_FEMTO_V2) += phy-qcom-snps-femto-v2.o
+obj-$(CONFIG_PHY_QCOM_IPQ806X_USB) += phy-qcom-ipq806x-usb.o

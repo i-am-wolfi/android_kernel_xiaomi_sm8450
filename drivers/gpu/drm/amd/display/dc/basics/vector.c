@@ -23,8 +23,6 @@
  *
  */
 
-#include <linux/slab.h>
-
 #include "dm_services.h"
 #include "include/vector.h"
 
@@ -52,12 +50,11 @@ bool dal_vector_construct(
 	return true;
 }
 
-bool dal_vector_presized_costruct(
-	struct vector *vector,
-	struct dc_context *ctx,
-	uint32_t count,
-	void *initial_value,
-	uint32_t struct_size)
+static bool dal_vector_presized_costruct(struct vector *vector,
+					 struct dc_context *ctx,
+					 uint32_t count,
+					 void *initial_value,
+					 uint32_t struct_size)
 {
 	uint32_t i;
 
@@ -292,7 +289,7 @@ bool dal_vector_reserve(struct vector *vector, uint32_t capacity)
 		return true;
 
 	new_container = krealloc(vector->container,
-				 array_size(capacity, vector->struct_size), GFP_KERNEL);
+				 capacity * vector->struct_size, GFP_KERNEL);
 
 	if (new_container) {
 		vector->container = new_container;

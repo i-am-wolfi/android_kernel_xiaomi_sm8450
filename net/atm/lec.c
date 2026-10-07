@@ -142,7 +142,6 @@ static void lec_handle_bridge(struct sk_buff *skb, struct net_device *dev)
 		struct sock *sk;
 		struct sk_buff *skb2;
 		struct atmlec_msg *mesg;
-		struct atm_vcc *vcc;
 
 		skb2 = alloc_skb(sizeof(struct atmlec_msg), GFP_ATOMIC);
 		if (skb2 == NULL)
@@ -155,6 +154,7 @@ static void lec_handle_bridge(struct sk_buff *skb, struct net_device *dev)
 					/* 0x01 is topology change */
 
 		priv = netdev_priv(dev);
+		struct atm_vcc *vcc;
 
 		rcu_read_lock();
 		vcc = rcu_dereference(priv->lecd);
@@ -351,12 +351,12 @@ static int lec_close(struct net_device *dev)
 
 static int lec_atm_send(struct atm_vcc *vcc, struct sk_buff *skb)
 {
+	static const u8 zero_addr[ETH_ALEN] = {};
 	unsigned long flags;
 	struct net_device *dev = (struct net_device *)vcc->proto_data;
 	struct lec_priv *priv = netdev_priv(dev);
 	struct atmlec_msg *mesg;
 	struct lec_arp_table *entry;
-	int i;
 	char *tmp;		/* FIXME */
 
 	WARN_ON(refcount_sub_and_test(skb->truesize, &sk_atm(vcc)->sk_wmem_alloc));
@@ -366,12 +366,10 @@ static int lec_atm_send(struct atm_vcc *vcc, struct sk_buff *skb)
 	pr_debug("%s: msg from zeppelin:%d\n", dev->name, mesg->type);
 	switch (mesg->type) {
 	case l_set_mac_addr:
-		for (i = 0; i < 6; i++)
-			dev->dev_addr[i] = mesg->content.normal.mac_addr[i];
+		eth_hw_addr_set(dev, mesg->content.normal.mac_addr);
 		break;
 	case l_del_mac_addr:
-		for (i = 0; i < 6; i++)
-			dev->dev_addr[i] = 0;
+		eth_hw_addr_set(dev, zero_addr);
 		break;
 	case l_addr_delete:
 		lec_addr_delete(priv, mesg->content.normal.atm_addr,
@@ -452,7 +450,6 @@ static int lec_atm_send(struct atm_vcc *vcc, struct sk_buff *skb)
 			/* hit from bridge table, send LE_ARP_RESPONSE */
 			struct sk_buff *skb2;
 			struct sock *sk;
-			struct atm_vcc *vcc;
 
 			pr_debug("%s: entry found, responding to zeppelin\n",
 				 dev->name);
@@ -461,6 +458,7 @@ static int lec_atm_send(struct atm_vcc *vcc, struct sk_buff *skb)
 				break;
 			skb2->len = sizeof(struct atmlec_msg);
 			skb_copy_to_linear_data(skb2, mesg, sizeof(*mesg));
+			struct atm_vcc *vcc;
 
 			rcu_read_lock();
 			vcc = rcu_dereference(priv->lecd);
@@ -2271,4 +2269,5 @@ out:
 	spin_unlock_irqrestore(&priv->lec_arp_lock, flags);
 }
 
+MODULE_DESCRIPTION("ATM LAN Emulation (LANE) support");
 MODULE_LICENSE("GPL");

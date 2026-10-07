@@ -4,8 +4,8 @@
  *
  * Copyright (C) 2016 Linaro Ltd
  * Copyright (C) 2015 Sony Mobile Communications Inc
- * Copyright (c) 2012-2013, 2020-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/firmware.h>
@@ -13,6 +13,7 @@
 #include <linux/module.h>
 #include <linux/notifier.h>
 #include <linux/remoteproc.h>
+#include <linux/auxiliary_bus.h>
 #include <linux/rpmsg/qcom_glink.h>
 #include <linux/rpmsg/qcom_smd.h>
 #include <linux/slab.h>
@@ -22,8 +23,8 @@
 #include <trace/hooks/remoteproc.h>
 #include <trace/events/rproc_qcom.h>
 
-#include "remoteproc_elf_helpers.h"
-#include "remoteproc_internal.h"
+#include "drivers/remoteproc/remoteproc_elf_helpers.h"
+#include "drivers/remoteproc/remoteproc_internal.h"
 #include "qcom_common.h"
 
 #define SSR_NOTIF_TIMEOUT CONFIG_RPROC_SSR_NOTIF_TIMEOUT
@@ -31,17 +32,18 @@
 #define to_glink_subdev(d) container_of(d, struct qcom_rproc_glink, subdev)
 #define to_smd_subdev(d) container_of(d, struct qcom_rproc_subdev, subdev)
 #define to_ssr_subdev(d) container_of(d, struct qcom_rproc_ssr, subdev)
+#define to_pdm_subdev(d) container_of(d, struct qcom_rproc_pdm, subdev)
 
 #define GLINK_SUBDEV_NAME	"glink"
 #define SMD_SUBDEV_NAME		"smd"
 #define SSR_SUBDEV_NAME		"ssr"
 
-#define MAX_NUM_OF_SS           10
+#define MAX_NUM_OF_SS           30
 #define MAX_REGION_NAME_LENGTH  16
 #define SBL_MINIDUMP_SMEM_ID	602
-#define MD_REGION_VALID		('V' << 24 | 'A' << 16 | 'L' << 8 | 'I' << 0)
-#define MD_SS_ENCR_DONE		('D' << 24 | 'O' << 16 | 'N' << 8 | 'E' << 0)
-#define MD_SS_ENABLED		('E' << 24 | 'N' << 16 | 'B' << 8 | 'L' << 0)
+#define MINIDUMP_REGION_VALID		('V' << 24 | 'A' << 16 | 'L' << 8 | 'I' << 0)
+#define MINIDUMP_SS_ENCR_DONE		('D' << 24 | 'O' << 16 | 'N' << 8 | 'E' << 0)
+#define MINIDUMP_SS_ENABLED		('E' << 24 | 'N' << 16 | 'B' << 8 | 'L' << 0)
 
 /**
  * struct minidump_region - Minidump region
@@ -60,7 +62,7 @@ struct minidump_region {
 };
 
 /**
- * struct minidump_subsystem_toc: Subsystem's SMEM Table of content
+ * struct minidump_subsystem - Subsystem's SMEM Table of content
  * @status : Subsystem toc init status
  * @enabled : if set to 1, this region would be copied during coredump
  * @encryption_status: Encryption status for this subsystem
@@ -78,7 +80,7 @@ struct minidump_subsystem {
 };
 
 /**
- * struct minidump_global_toc: Global Table of Content
+ * struct minidump_global_toc - Global Table of Content
  * @status : Global Minidump init status
  * @md_revision : Minidump revision
  * @enabled : Minidump enable status
@@ -102,8 +104,13 @@ static struct kobject *sysfs_kobject;
 bool qcom_device_shutdown_in_progress;
 EXPORT_SYMBOL(qcom_device_shutdown_in_progress);
 
+static bool qcom_collect_both_coredumps;
+
 static LIST_HEAD(qcom_ssr_subsystem_list);
 static DEFINE_MUTEX(qcom_ssr_subsys_lock);
+
+void (*rproc_recovery_set_fn)(struct rproc *rproc) = NULL;
+EXPORT_SYMBOL_GPL(rproc_recovery_set_fn);
 
 static const char * const ssr_timeout_msg = "srcu notifier chain for %s:%s taking too long";
 
@@ -124,6 +131,31 @@ static ssize_t qcom_rproc_shutdown_request_store(struct kobject *kobj, struct ko
 static struct kobj_attribute shutdown_requested_attr = __ATTR(shutdown_in_progress, 0220, NULL,
 							  qcom_rproc_shutdown_request_store);
 
+static ssize_t qcom_collect_both_coredumps_show(struct kobject *kobj, struct kobj_attribute *attr,
+						char *buf)
+{
+	return scnprintf(buf, 3, "%u\n", qcom_collect_both_coredumps);
+}
+
+static ssize_t qcom_collect_both_coredumps_store(struct kobject *kobj, struct kobj_attribute *attr,
+						 const char *buf, size_t count)
+{
+	bool val;
+	int ret;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	qcom_collect_both_coredumps = val;
+	pr_info("qcom rproc: Collect both coredumps: %s\n", val ? "true" : "false");
+	return count;
+}
+
+static struct kobj_attribute both_coredumps_attr =
+	__ATTR(collect_both_coredumps, 0644, qcom_collect_both_coredumps_show,
+	       qcom_collect_both_coredumps_store);
+
 static void qcom_minidump_cleanup(struct rproc *rproc)
 {
 	struct rproc_dump_segment *entry, *tmp;
@@ -141,9 +173,11 @@ static int qcom_add_minidump_segments(struct rproc *rproc, struct minidump_subsy
 	struct minidump_region __iomem *ptr;
 	struct minidump_region region;
 	int seg_cnt, i;
+	int ret = 0;
 	dma_addr_t da;
 	size_t size;
-	char *name;
+	char *name, *dbg_buf_name = "md_dbg_buf";
+	int len = strlen(dbg_buf_name);
 
 	if (WARN_ON(!list_empty(&rproc->dump_segments))) {
 		dev_err(&rproc->dev, "dump segment list already populated\n");
@@ -158,20 +192,34 @@ static int qcom_add_minidump_segments(struct rproc *rproc, struct minidump_subsy
 
 	for (i = 0; i < seg_cnt; i++) {
 		memcpy_fromio(&region, ptr + i, sizeof(region));
-		if (region.valid == MD_REGION_VALID) {
-			name = kstrdup(region.name, GFP_KERNEL);
+		if (le32_to_cpu(region.valid) == MINIDUMP_REGION_VALID) {
+			name = kstrndup(region.name, MAX_REGION_NAME_LENGTH - 1, GFP_KERNEL);
 			if (!name) {
-				iounmap(ptr);
-				return -ENOMEM;
+				ret = -ENOMEM;
+				break;
 			}
 			da = le64_to_cpu(region.address);
 			size = le32_to_cpu(region.size);
-			rproc_coredump_add_custom_segment(rproc, da, size, dumpfn, name);
+			if (le32_to_cpu(subsystem->encryption_status) != MINIDUMP_SS_ENCR_DONE) {
+				if (!i && len < MAX_REGION_NAME_LENGTH &&
+				    !strcmp(name, dbg_buf_name)) {
+					ret = rproc_coredump_add_custom_segment(rproc, da, size,
+										dumpfn, name);
+					if (ret)
+						kfree(name);
+				}
+				break;
+			}
+			ret = rproc_coredump_add_custom_segment(rproc, da, size, dumpfn, name);
+			if (ret) {
+				kfree(name);
+				break;
+			}
 		}
 	}
 
 	iounmap(ptr);
-	return 0;
+	return ret;
 }
 
 static void qcom_rproc_minidump(struct rproc *rproc, struct device *md_dev)
@@ -280,8 +328,8 @@ static void qcom_rproc_minidump(struct rproc *rproc, struct device *md_dev)
 	dev_coredumpv(md_dev, data, data_size, GFP_KERNEL);
 }
 
-void qcom_minidump(struct rproc *rproc, struct device *md_dev,
-				unsigned int minidump_id, rproc_dumpfn_t dumpfn)
+void qcom_minidump(struct rproc *rproc, struct device *md_dev, unsigned int minidump_id,
+		   rproc_dumpfn_t dumpfn, bool both_dumps)
 {
 	int ret;
 	struct minidump_subsystem *subsystem;
@@ -305,15 +353,21 @@ void qcom_minidump(struct rproc *rproc, struct device *md_dev,
 	 */
 	if (subsystem->regions_baseptr == 0 ||
 	    le32_to_cpu(subsystem->status) != 1 ||
-	    le32_to_cpu(subsystem->enabled) != MD_SS_ENABLED) {
+	    le32_to_cpu(subsystem->enabled) != MINIDUMP_SS_ENABLED) {
 		return rproc_coredump(rproc);
 	}
 
-	if (le32_to_cpu(subsystem->encryption_status) != MD_SS_ENCR_DONE) {
-		dev_err(&rproc->dev, "Minidump not ready, skipping\n");
-		return;
-	}
+	if (both_dumps && IS_ENABLED(CONFIG_QCOM_RPROC_BOTH_DUMPS) &&
+	    qcom_collect_both_coredumps)
+		rproc_coredump(rproc);
 
+	if (le32_to_cpu(subsystem->encryption_status) != MINIDUMP_SS_ENCR_DONE)
+		dev_err(&rproc->dev, "encryption_status != MINIDUMP_SS_ENCR_DONE\n");
+
+	/**
+	 * Clear out the dump segments populated by parse_fw before
+	 * re-populating them with minidump segments.
+	 */
 	rproc_coredump_cleanup(rproc);
 
 	ret = qcom_add_minidump_segments(rproc, subsystem, dumpfn);
@@ -337,19 +391,10 @@ static int glink_early_ssr_notifier_event(struct notifier_block *this,
 {
 	struct qcom_rproc_glink *glink = container_of(this, struct qcom_rproc_glink, nb);
 
-	qcom_glink_early_ssr_notify(glink->edge);
-	return NOTIFY_DONE;
-}
-
-static int glink_subdev_prepare(struct rproc_subdev *subdev)
-{
-	struct qcom_rproc_glink *glink = to_glink_subdev(subdev);
-
 	trace_rproc_qcom_event(dev_name(glink->dev->parent), GLINK_SUBDEV_NAME, "prepare");
 
-	glink->edge = qcom_glink_smem_register(glink->dev, glink->node);
-
-	return PTR_ERR_OR_ZERO(glink->edge);
+	qcom_glink_smem_early_ssr_notify(glink->edge);
+	return NOTIFY_DONE;
 }
 
 static int glink_subdev_start(struct rproc_subdev *subdev)
@@ -357,6 +402,12 @@ static int glink_subdev_start(struct rproc_subdev *subdev)
 	struct qcom_rproc_glink *glink = to_glink_subdev(subdev);
 
 	trace_rproc_qcom_event(dev_name(glink->dev->parent), GLINK_SUBDEV_NAME, "start");
+
+	glink->edge = qcom_glink_smem_register(glink->dev, glink->node);
+	if (IS_ERR(glink->edge)) {
+		dev_err(glink->dev, "Failed to register glink smem\n");
+		return PTR_ERR_OR_ZERO(glink->edge);
+	}
 
 	glink->nb.notifier_call = glink_early_ssr_notifier_event;
 
@@ -376,6 +427,7 @@ static void glink_subdev_stop(struct rproc_subdev *subdev, bool crashed)
 
 	if (!glink->edge)
 		return;
+
 	trace_rproc_qcom_event(dev_name(glink->dev->parent), GLINK_SUBDEV_NAME,
 			       crashed ? "crash stop" : "stop");
 
@@ -418,7 +470,6 @@ void qcom_add_glink_subdev(struct rproc *rproc, struct qcom_rproc_glink *glink,
 
 	glink->dev = dev;
 	glink->subdev.start = glink_subdev_start;
-	glink->subdev.prepare = glink_subdev_prepare;
 	glink->subdev.stop = glink_subdev_stop;
 	glink->subdev.unprepare = glink_subdev_unprepare;
 
@@ -545,12 +596,9 @@ void qcom_remove_smd_subdev(struct rproc *rproc, struct qcom_rproc_subdev *smd)
 }
 EXPORT_SYMBOL_GPL(qcom_remove_smd_subdev);
 
-static struct qcom_ssr_subsystem *qcom_ssr_get_subsys(const char *name)
+struct qcom_ssr_subsystem *qcom_ssr_get_subsys(const char *name)
 {
 	struct qcom_ssr_subsystem *info;
-
-	if (!name)
-		return ERR_PTR(-EINVAL);
 
 	mutex_lock(&qcom_ssr_subsys_lock);
 	/* Match in the global qcom_ssr_subsystem_list with name */
@@ -574,6 +622,7 @@ out:
 	mutex_unlock(&qcom_ssr_subsys_lock);
 	return info;
 }
+EXPORT_SYMBOL_GPL(qcom_ssr_get_subsys);
 
 void *qcom_register_early_ssr_notifier(const char *name, struct notifier_block *nb)
 {
@@ -598,8 +647,6 @@ EXPORT_SYMBOL(qcom_unregister_early_ssr_notifier);
 void qcom_notify_early_ssr_clients(struct rproc_subdev *subdev)
 {
 	struct qcom_rproc_ssr *ssr = to_ssr_subdev(subdev);
-
-	trace_rproc_qcom_event(ssr->info->name, SSR_SUBDEV_NAME, "early notification");
 
 	srcu_notifier_call_chain(&ssr->info->early_notifier_list, QCOM_SSR_BEFORE_SHUTDOWN, NULL);
 }
@@ -644,6 +691,7 @@ static void ssr_notif_timeout_handler(struct timer_list *t)
 	else
 		WARN(1, ssr_timeout_msg, ssr->info->name,
 		     subdevice_state_string[ssr->notification]);
+
 }
 
 /**
@@ -661,6 +709,21 @@ int qcom_unregister_ssr_notifier(void *notify, struct notifier_block *nb)
 	return srcu_notifier_chain_unregister(notify, nb);
 }
 EXPORT_SYMBOL_GPL(qcom_unregister_ssr_notifier);
+
+int qcom_notify_ssr_clients(struct qcom_ssr_subsystem *info, int state,
+			struct qcom_ssr_notify_data *data)
+{
+	struct qcom_ssr_subsystem *subsys = info;
+
+	if (!subsys)
+		return -EINVAL;
+
+	if (state < 0)
+		return -EINVAL;
+
+	return srcu_notifier_call_chain(&info->notifier_list, state, data);
+}
+EXPORT_SYMBOL_GPL(qcom_notify_ssr_clients);
 
 static inline void notify_ssr_clients(struct qcom_rproc_ssr *ssr, struct qcom_ssr_notify_data *data)
 {
@@ -754,7 +817,6 @@ void qcom_add_ssr_subdev(struct rproc *rproc, struct qcom_rproc_ssr *ssr,
 	timer_setup(&ssr->timer, ssr_notif_timeout_handler, 0);
 
 	ssr->info = info;
-	ssr->is_notified = false;
 	ssr->subdev.prepare = ssr_notify_prepare;
 	ssr->subdev.start = ssr_notify_start;
 	ssr->subdev.stop = ssr_notify_stop;
@@ -776,6 +838,92 @@ void qcom_remove_ssr_subdev(struct rproc *rproc, struct qcom_rproc_ssr *ssr)
 }
 EXPORT_SYMBOL_GPL(qcom_remove_ssr_subdev);
 
+static void pdm_dev_release(struct device *dev)
+{
+	struct auxiliary_device *adev = to_auxiliary_dev(dev);
+
+	kfree(adev);
+}
+
+static int pdm_notify_prepare(struct rproc_subdev *subdev)
+{
+	struct qcom_rproc_pdm *pdm = to_pdm_subdev(subdev);
+	struct auxiliary_device *adev;
+	int ret;
+
+	adev = kzalloc(sizeof(*adev), GFP_KERNEL);
+	if (!adev)
+		return -ENOMEM;
+
+	adev->dev.parent = pdm->dev;
+	adev->dev.release = pdm_dev_release;
+	adev->name = "pd-mapper";
+	adev->id = pdm->index;
+
+	ret = auxiliary_device_init(adev);
+	if (ret) {
+		kfree(adev);
+		return ret;
+	}
+
+	ret = auxiliary_device_add(adev);
+	if (ret) {
+		auxiliary_device_uninit(adev);
+		return ret;
+	}
+
+	pdm->adev = adev;
+
+	return 0;
+}
+
+
+static void pdm_notify_unprepare(struct rproc_subdev *subdev)
+{
+	struct qcom_rproc_pdm *pdm = to_pdm_subdev(subdev);
+
+	if (!pdm->adev)
+		return;
+
+	auxiliary_device_delete(pdm->adev);
+	auxiliary_device_uninit(pdm->adev);
+	pdm->adev = NULL;
+}
+
+/**
+ * qcom_add_pdm_subdev() - register PD Mapper subdevice
+ * @rproc:	rproc handle
+ * @pdm:	PDM subdevice handle
+ *
+ * Register @pdm so that Protection Device mapper service is started when the
+ * DSP is started too.
+ */
+void qcom_add_pdm_subdev(struct rproc *rproc, struct qcom_rproc_pdm *pdm)
+{
+	pdm->dev = &rproc->dev;
+	pdm->index = rproc->index;
+
+	pdm->subdev.prepare = pdm_notify_prepare;
+	pdm->subdev.unprepare = pdm_notify_unprepare;
+
+	rproc_add_subdev(rproc, &pdm->subdev);
+}
+EXPORT_SYMBOL_GPL(qcom_add_pdm_subdev);
+
+/**
+ * qcom_remove_pdm_subdev() - remove PD Mapper subdevice
+ * @rproc:	rproc handle
+ * @pdm:	PDM subdevice handle
+ *
+ * Remove the PD Mapper subdevice.
+ */
+void qcom_remove_pdm_subdev(struct rproc *rproc, struct qcom_rproc_pdm *pdm)
+{
+	rproc_remove_subdev(rproc, &pdm->subdev);
+}
+EXPORT_SYMBOL_GPL(qcom_remove_pdm_subdev);
+
+#ifdef CONFIG_ANDROID_VENDOR_HOOKS
 static void qcom_check_ssr_status(void *data, struct rproc *rproc)
 {
 	if (!atomic_read(&rproc->power) ||
@@ -793,11 +941,17 @@ static void rproc_recovery_notifier(void *data, struct rproc *rproc)
 {
 	const char *recovery = rproc->recovery_disabled ? "disabled" : "enabled";
 
-	trace_rproc_qcom_event(rproc->name, "recovery", recovery);
 	pr_info("qcom rproc: %s: recovery %s\n", rproc->name, recovery);
-}
 
-static int __init qcom_common_init(void)
+	if (strnstr(rproc->name, "spss", strlen(rproc->name)))
+		return;
+
+	if (rproc_recovery_set_fn)
+		(rproc_recovery_set_fn)(rproc);
+}
+#endif
+
+int qcom_common_init(void)
 {
 	int ret = 0;
 
@@ -814,11 +968,17 @@ static int __init qcom_common_init(void)
 		pr_err("qcom rproc: failed to create sysfs file\n");
 		goto remove_kobject;
 	}
+	ret = sysfs_create_file(sysfs_kobject, &both_coredumps_attr.attr);
+	if (ret) {
+		pr_err("qcom rproc: failed to create both_coredumps sysfs file\n");
+		goto remove_shutdown_sysfs;
+	}
 
+#ifdef CONFIG_ANDROID_VENDOR_HOOKS
 	ret = register_trace_android_vh_rproc_recovery(qcom_check_ssr_status, NULL);
 	if (ret) {
 		pr_err("qcom rproc: failed to register trace hooks\n");
-		goto remove_sysfs;
+		goto remove_coredump_sysfs;
 	}
 
 	ret = register_trace_android_vh_rproc_recovery_set(rproc_recovery_notifier, NULL);
@@ -826,12 +986,17 @@ static int __init qcom_common_init(void)
 		pr_err("qcom rproc: failed to register recovery_set vendor hook\n");
 		goto unregister_rproc_recovery_vh;
 	}
-
+#endif
 	return 0;
 
+#ifdef CONFIG_ANDROID_VENDOR_HOOKS
 unregister_rproc_recovery_vh:
 	unregister_trace_android_vh_rproc_recovery(qcom_check_ssr_status, NULL);
-remove_sysfs:
+remove_coredump_sysfs:
+	sysfs_remove_file(sysfs_kobject, &both_coredumps_attr.attr);
+#endif
+
+remove_shutdown_sysfs:
 	sysfs_remove_file(sysfs_kobject, &shutdown_requested_attr.attr);
 remove_kobject:
 	kobject_put(sysfs_kobject);
@@ -840,12 +1005,14 @@ remove_kobject:
 }
 module_init(qcom_common_init);
 
-static void __exit qcom_common_exit(void)
+void qcom_common_exit(void)
 {
-	unregister_trace_android_vh_rproc_recovery_set(rproc_recovery_notifier, NULL);
+	sysfs_remove_file(sysfs_kobject, &both_coredumps_attr.attr);
 	sysfs_remove_file(sysfs_kobject, &shutdown_requested_attr.attr);
 	kobject_put(sysfs_kobject);
+#ifdef CONFIG_ANDROID_VENDOR_HOOKS
 	unregister_trace_android_vh_rproc_recovery(qcom_check_ssr_status, NULL);
+#endif
 }
 module_exit(qcom_common_exit);
 

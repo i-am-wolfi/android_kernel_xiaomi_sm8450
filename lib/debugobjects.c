@@ -1,11 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Generic infrastructure for lifetime debugging of objects.
  *
- * Started by Thomas Gleixner
- *
  * Copyright (C) 2008, Thomas Gleixner <tglx@linutronix.de>
- *
- * For licencing details see kernel-base/COPYING
  */
 
 #define pr_fmt(fmt) "ODEBUG: " fmt
@@ -73,32 +70,33 @@ static HLIST_HEAD(obj_to_free);
  * made at debug_stats_show(). Both obj_pool_min_free and obj_pool_max_used
  * can be off.
  */
-static int			obj_pool_min_free = ODEBUG_POOL_SIZE;
-static int			obj_pool_free = ODEBUG_POOL_SIZE;
+static int __data_racy		obj_pool_min_free = ODEBUG_POOL_SIZE;
+static int __data_racy		obj_pool_free = ODEBUG_POOL_SIZE;
 static int			obj_pool_used;
-static int			obj_pool_max_used;
+static int __data_racy		obj_pool_max_used;
 static bool			obj_freeing;
 /* The number of objs on the global free list */
 static int			obj_nr_tofree;
 
-static int			debug_objects_maxchain __read_mostly;
-static int __maybe_unused	debug_objects_maxchecked __read_mostly;
-static int			debug_objects_fixups __read_mostly;
-static int			debug_objects_warnings __read_mostly;
-static int			debug_objects_enabled __read_mostly
-				= CONFIG_DEBUG_OBJECTS_ENABLE_DEFAULT;
-static int			debug_objects_pool_size __read_mostly
-				= ODEBUG_POOL_SIZE;
-static int			debug_objects_pool_min_level __read_mostly
-				= ODEBUG_POOL_MIN_LEVEL;
+static int __data_racy			debug_objects_maxchain __read_mostly;
+static int __data_racy __maybe_unused	debug_objects_maxchecked __read_mostly;
+static int __data_racy			debug_objects_fixups __read_mostly;
+static int __data_racy			debug_objects_warnings __read_mostly;
+static int __data_racy			debug_objects_enabled __read_mostly
+					= CONFIG_DEBUG_OBJECTS_ENABLE_DEFAULT;
+static int				debug_objects_pool_size __ro_after_init
+					= ODEBUG_POOL_SIZE;
+static int				debug_objects_pool_min_level __ro_after_init
+					= ODEBUG_POOL_MIN_LEVEL;
+
 static const struct debug_obj_descr *descr_test  __read_mostly;
-static struct kmem_cache	*obj_cache __read_mostly;
+static struct kmem_cache	*obj_cache __ro_after_init;
 
 /*
  * Track numbers of kmem_cache_alloc()/free() calls done.
  */
-static int			debug_objects_allocated;
-static int			debug_objects_freed;
+static int __data_racy		debug_objects_allocated;
+static int __data_racy		debug_objects_freed;
 
 static void free_obj_work(struct work_struct *work);
 static DECLARE_DELAYED_WORK(debug_obj_work, free_obj_work);
@@ -137,15 +135,13 @@ static void fill_pool(void)
 		return;
 
 	/*
-	 * Reuse objs from the global free list; they will be reinitialized
-	 * when allocating.
+	 * Reuse objs from the global obj_to_free list; they will be
+	 * reinitialized when allocating.
 	 *
-	 * Both obj_nr_tofree and obj_pool_free are checked locklessly; the
-	 * READ_ONCE()s pair with the WRITE_ONCE()s in pool_lock critical
-	 * sections.
+	 * obj_nr_tofree is checked locklessly; the READ_ONCE() pairs with
+	 * the WRITE_ONCE() in pool_lock critical sections.
 	 */
-	while (READ_ONCE(obj_nr_tofree) &&
-	       READ_ONCE(obj_pool_free) < debug_objects_pool_min_level) {
+	if (READ_ONCE(obj_nr_tofree)) {
 		raw_spin_lock_irqsave(&pool_lock, flags);
 		/*
 		 * Recheck with the lock held as the worker thread might have
@@ -516,9 +512,9 @@ static void debug_print_object(struct debug_obj *obj, char *msg)
 			descr->debug_hint(obj->object) : NULL;
 		limit++;
 		WARN(1, KERN_ERR "ODEBUG: %s %s (active state %u) "
-				 "object type: %s hint: %pS\n",
+				 "object: %p object type: %s hint: %pS\n",
 			msg, obj_states[obj->state], obj->astate,
-			descr->name, hint);
+			obj->object, descr->name, hint);
 	}
 	debug_objects_warnings++;
 }
@@ -604,10 +600,21 @@ static void debug_objects_fill_pool(void)
 {
 	/*
 	 * On RT enabled kernels the pool refill must happen in preemptible
-	 * context:
+	 * context -- for !RT kernels we rely on the fact that spinlock_t and
+	 * raw_spinlock_t are basically the same type and this lock-type
+	 * inversion works just fine.
 	 */
-	if (!IS_ENABLED(CONFIG_PREEMPT_RT) || preemptible())
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT) || preemptible()) {
+		/*
+		 * Annotate away the spinlock_t inside raw_spinlock_t warning
+		 * by temporarily raising the wait-type to WAIT_SLEEP, matching
+		 * the preemptible() condition above.
+		 */
+		static DEFINE_WAIT_OVERRIDE_MAP(fill_pool_map, LD_WAIT_SLEEP);
+		lock_map_acquire_try(&fill_pool_map);
 		fill_pool();
+		lock_map_release(&fill_pool_map);
+	}
 }
 
 static void
@@ -722,14 +729,6 @@ int debug_object_activate(void *addr, const struct debug_obj_descr *descr)
 	}
 
 	raw_spin_unlock_irqrestore(&db->lock, flags);
-
-	/*
-	 * lookup_object_or_alloc() might have raced with a concurrent
-	 * allocation failure which disabled debug objects.
-	 */
-	if (!debug_objects_enabled)
-		return 0;
-
 	debug_print_object(&o, "activate");
 
 	switch (o.state) {
@@ -907,15 +906,6 @@ void debug_object_assert_init(void *addr, const struct debug_obj_descr *descr)
 		return;
 	}
 
-	/*
-	 * lookup_object_or_alloc() might have raced with a concurrent
-	 * allocation failure which disabled debug objects. Don't run the fixup
-	 * as it might turn a valid object useless. See for example
-	 * hrtimer_fixup_assert_init().
-	 */
-	if (!debug_objects_enabled)
-		return;
-
 	/* Object is neither tracked nor static. It's not initialized. */
 	debug_print_object(&o, "assert_init");
 	debug_object_fixup(descr->fixup_assert_init, addr, ODEBUG_STATE_NOTAVAILABLE);
@@ -1085,7 +1075,7 @@ struct self_test {
 
 static __initconst const struct debug_obj_descr descr_type_test;
 
-static __noipa bool __init is_static_object(void *addr)
+static bool __init is_static_object(void *addr)
 {
 	struct self_test *obj = addr;
 

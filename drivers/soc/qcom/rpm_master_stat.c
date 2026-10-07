@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 /*
- * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/debugfs.h>
@@ -36,6 +37,16 @@
 	 prvdata->master_names[a])
 
 #define GET_FIELD(a) ((strnstr(#a, ".", 80) + 1))
+
+#ifdef CONFIG_ARM
+#undef readq_relaxed
+#define readq_relaxed(a) ({			\
+	u64 val = readl_relaxed((a) + 4);	\
+	val <<= 32;				\
+	val |=  readl_relaxed((a));		\
+	val;					\
+})
+#endif
 
 struct msm_rpm_master_stats_platform_data {
 	phys_addr_t phys_addr_base;
@@ -345,7 +356,7 @@ static const struct file_operations msm_rpm_master_stats_fops = {
 	.open	  = msm_rpm_master_stats_file_open,
 	.read	  = msm_rpm_master_stats_file_read,
 	.release  = msm_rpm_master_stats_file_close,
-	.llseek   = no_llseek,
+	.llseek   = noop_llseek,
 };
 
 static struct msm_rpm_master_stats_platform_data
@@ -427,24 +438,23 @@ static  int msm_rpm_master_stats_probe(struct platform_device *pdev)
 	dent = debugfs_create_file("rpm_master_stats", 0444, NULL,
 					pdata, &msm_rpm_master_stats_fops);
 
-	if (!dent) {
+	if (IS_ERR(dent)) {
 		dev_err(&pdev->dev, "%s: ERROR debugfs_create_file failed\n",
 								__func__);
-		return -ENOMEM;
+		return PTR_ERR(dent);
 	}
 
 	platform_set_drvdata(pdev, dent);
 	return 0;
 }
 
-static int msm_rpm_master_stats_remove(struct platform_device *pdev)
+static void msm_rpm_master_stats_remove(struct platform_device *pdev)
 {
 	struct dentry *dent;
 
 	dent = platform_get_drvdata(pdev);
 	debugfs_remove(dent);
 	platform_set_drvdata(pdev, NULL);
-	return 0;
 }
 
 static const struct of_device_id rpm_master_table[] = {
@@ -454,7 +464,7 @@ static const struct of_device_id rpm_master_table[] = {
 
 static struct platform_driver msm_rpm_master_stats_driver = {
 	.probe	= msm_rpm_master_stats_probe,
-	.remove = msm_rpm_master_stats_remove,
+	.remove_new = msm_rpm_master_stats_remove,
 	.driver = {
 		.name = "msm_rpm_master_stats",
 		.of_match_table = rpm_master_table,
@@ -474,6 +484,6 @@ static void __exit msm_rpm_master_stats_exit(void)
 module_init(msm_rpm_master_stats_init);
 module_exit(msm_rpm_master_stats_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("MSM RPM Master Statistics driver");
 MODULE_ALIAS("platform:msm_master_stat_log");

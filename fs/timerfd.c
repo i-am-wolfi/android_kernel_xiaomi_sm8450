@@ -28,6 +28,8 @@
 #include <linux/rcupdate.h>
 #include <linux/time_namespace.h>
 
+#include <trace/hooks/fs.h>
+
 struct timerfd_ctx {
 	union {
 		struct hrtimer tmr;
@@ -45,8 +47,6 @@ struct timerfd_ctx {
 	spinlock_t cancel_lock;
 	bool might_cancel;
 };
-
-static atomic_t instance_count = ATOMIC_INIT(0);
 
 static LIST_HEAD(cancel_list);
 static DEFINE_SPINLOCK(cancel_lock);
@@ -115,6 +115,22 @@ void timerfd_clock_was_set(void)
 		spin_unlock_irqrestore(&ctx->wqh.lock, flags);
 	}
 	rcu_read_unlock();
+}
+
+static void timerfd_resume_work(struct work_struct *work)
+{
+	timerfd_clock_was_set();
+}
+
+static DECLARE_WORK(timerfd_work, timerfd_resume_work);
+
+/*
+ * Invoked from timekeeping_resume(). Defer the actual update to work so
+ * timerfd_clock_was_set() runs in task context.
+ */
+void timerfd_resume(void)
+{
+	schedule_work(&timerfd_work);
 }
 
 static void __timerfd_remove_cancel(struct timerfd_ctx *ctx)
@@ -248,17 +264,18 @@ static __poll_t timerfd_poll(struct file *file, poll_table *wait)
 	return events;
 }
 
-static ssize_t timerfd_read(struct file *file, char __user *buf, size_t count,
-			    loff_t *ppos)
+static ssize_t timerfd_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct timerfd_ctx *ctx = file->private_data;
 	ssize_t res;
 	u64 ticks = 0;
 
-	if (count < sizeof(ticks))
+	if (iov_iter_count(to) < sizeof(ticks))
 		return -EINVAL;
+
 	spin_lock_irq(&ctx->wqh.lock);
-	if (file->f_flags & O_NONBLOCK)
+	if (file->f_flags & O_NONBLOCK || iocb->ki_flags & IOCB_NOWAIT)
 		res = -EAGAIN;
 	else
 		res = wait_event_interruptible_locked_irq(ctx->wqh, ctx->ticks);
@@ -298,8 +315,11 @@ static ssize_t timerfd_read(struct file *file, char __user *buf, size_t count,
 		ctx->ticks = 0;
 	}
 	spin_unlock_irq(&ctx->wqh.lock);
-	if (ticks)
-		res = put_user(ticks, (u64 __user *) buf) ? -EFAULT: sizeof(ticks);
+	if (ticks) {
+		res = copy_to_iter(&ticks, sizeof(ticks), to);
+		if (!res)
+			res = -EFAULT;
+	}
 	return res;
 }
 
@@ -370,7 +390,7 @@ static long timerfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 static const struct file_operations timerfd_fops = {
 	.release	= timerfd_release,
 	.poll		= timerfd_poll,
-	.read		= timerfd_read,
+	.read_iter	= timerfd_read_iter,
 	.llseek		= noop_llseek,
 	.show_fdinfo	= timerfd_show,
 	.unlocked_ioctl	= timerfd_ioctl,
@@ -379,9 +399,9 @@ static const struct file_operations timerfd_fops = {
 static int timerfd_fget(int fd, struct fd *p)
 {
 	struct fd f = fdget(fd);
-	if (!f.file)
+	if (!fd_file(f))
 		return -EBADF;
-	if (f.file->f_op != &timerfd_fops) {
+	if (fd_file(f)->f_op != &timerfd_fops) {
 		fdput(f);
 		return -EINVAL;
 	}
@@ -393,9 +413,8 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
 {
 	int ufd;
 	struct timerfd_ctx *ctx;
-	char task_comm_buf[TASK_COMM_LEN];
+	struct file *file;
 	char file_name_buf[32];
-	int instance;
 
 	/* Check the TFD_* constants for consistency.  */
 	BUILD_BUG_ON(TFD_CLOEXEC != O_CLOEXEC);
@@ -432,16 +451,25 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
 
 	ctx->moffs = ktime_mono_to_real(0);
 
-	instance = atomic_inc_return(&instance_count);
-	get_task_comm(task_comm_buf, current);
-	snprintf(file_name_buf, sizeof(file_name_buf), "[timerfd%d_%.*s]",
-		 instance, (int)sizeof(task_comm_buf), task_comm_buf);
-
-	ufd = anon_inode_getfd(file_name_buf, &timerfd_fops, ctx,
-			       O_RDWR | (flags & TFD_SHARED_FCNTL_FLAGS));
-	if (ufd < 0)
+	ufd = get_unused_fd_flags(flags & TFD_SHARED_FCNTL_FLAGS);
+	if (ufd < 0) {
 		kfree(ctx);
+		return ufd;
+	}
 
+	strscpy(file_name_buf, "[timerfd]", sizeof(file_name_buf));
+	trace_android_vh_timerfd_create(file_name_buf, sizeof(file_name_buf));
+
+	file = anon_inode_getfile(file_name_buf, &timerfd_fops, ctx,
+				    O_RDWR | (flags & TFD_SHARED_FCNTL_FLAGS));
+	if (IS_ERR(file)) {
+		put_unused_fd(ufd);
+		kfree(ctx);
+		return PTR_ERR(file);
+	}
+
+	file->f_mode |= FMODE_NOWAIT;
+	fd_install(ufd, file);
 	return ufd;
 }
 
@@ -460,7 +488,7 @@ static int do_timerfd_settime(int ufd, int flags,
 	ret = timerfd_fget(ufd, &f);
 	if (ret)
 		return ret;
-	ctx = f.file->private_data;
+	ctx = fd_file(f)->private_data;
 
 	if (isalarm(ctx) && !capable(CAP_WAKE_ALARM)) {
 		fdput(f);
@@ -524,7 +552,7 @@ static int do_timerfd_gettime(int ufd, struct itimerspec64 *t)
 	int ret = timerfd_fget(ufd, &f);
 	if (ret)
 		return ret;
-	ctx = f.file->private_data;
+	ctx = fd_file(f)->private_data;
 
 	spin_lock_irq(&ctx->wqh.lock);
 	if (ctx->expired && ctx->tintv) {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/cpu.h>
@@ -23,7 +23,7 @@ static ssize_t cluster_idle_set(struct kobject *kobj,
 	bool disable;
 	int ret;
 
-	ret = strtobool(buf, &disable);
+	ret = kstrtobool(buf, &disable);
 	if (ret)
 		return -EINVAL;
 
@@ -183,7 +183,7 @@ static ssize_t cpu_latency_factor_show(struct kobject *kobj,
 				struct kobj_attribute *attr,
 				char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%u\n", cur_div);
+	return scnprintf(buf, PAGE_SIZE, "%llu\n", cur_div);
 }
 
 static ssize_t cluster_latency_factor_store(struct kobject *kobj,
@@ -221,7 +221,7 @@ static ssize_t cluster_latency_factor_show(struct kobject *kobj,
 				struct kobj_attribute *attr,
 				char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%u\n", cluster_cur_div);
+	return scnprintf(buf, PAGE_SIZE, "%llu\n", cluster_cur_div);
 }
 
 static struct kobj_attribute attr_simple_sleep_disabled = __ATTR_RW(simple_sleep_disabled);
@@ -248,7 +248,13 @@ void remove_simple_gov_global_sysfs_nodes(void)
 
 int create_simple_gov_global_sysfs_nodes(void)
 {
-	struct kobject *cpuidle_kobj = &cpu_subsys.dev_root->kobj;
+	struct kobject *cpuidle_kobj;
+	struct device *dev_root = bus_get_dev_root(&cpu_subsys);
+
+	if (!dev_root)
+		return -EINVAL;
+
+	cpuidle_kobj = &dev_root->kobj;
 
 	qcom_lpm_simple_kobj = kobject_create_and_add("qcom_simple_lpm", cpuidle_kobj);
 	if (!qcom_lpm_simple_kobj)

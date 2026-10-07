@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #define pr_fmt(fmt)	"io-pgtable-fast: " fmt
@@ -14,10 +15,11 @@
 #include <linux/io-pgtable.h>
 #include <linux/io-pgtable-fast.h>
 #include <linux/mm.h>
-#include <linux/qcom-io-pgtable.h>
-#include <asm/cacheflush.h>
 #include <linux/vmalloc.h>
 #include <linux/dma-mapping.h>
+#include <linux/qcom-iommu-util.h>
+#include <linux/qcom-io-pgtable.h>
+#include "drivers/iommu/iommu-pages.h"
 
 #define AV8L_FAST_MAX_ADDR_BITS		48
 
@@ -147,18 +149,15 @@ static inline dma_addr_t av8l_dma_addr(void *addr)
 static void __av8l_clean_range(struct device *dev, void *start, void *end)
 {
 	size_t size;
-	void *region_end;
-	unsigned long page_end;
 
 	if (is_vmalloc_addr(start)) {
 		while (start < end) {
-			page_end = round_down((unsigned long)start + PAGE_SIZE,
-					      PAGE_SIZE);
-			region_end = min_t(void *, end, (void *)page_end);
-			size = region_end - start;
+			unsigned long offset = offset_in_page(start);
+
+			size = min_t(size_t, end - start, PAGE_SIZE - offset);
 			dma_sync_single_for_device(dev, av8l_dma_addr(start),
 						   size, DMA_TO_DEVICE);
-			start = region_end;
+			start += size;
 		}
 	} else {
 		size = end - start;
@@ -176,7 +175,6 @@ static void av8l_clean_range(struct io_pgtable_cfg *cfg, av8l_fast_iopte *start,
 
 #ifdef CONFIG_IOMMU_IO_PGTABLE_FAST_PROVE_TLB
 
-#include <asm/cacheflush.h>
 #include <linux/notifier.h>
 
 static ATOMIC_NOTIFIER_HEAD(av8l_notifier_list);
@@ -249,7 +247,6 @@ av8l_fast_prot_to_pte(struct av8l_fast_io_pgtable *data, int prot)
 	else if (prot & IOMMU_SYS_CACHE)
 		pte |= (AV8L_FAST_MAIR_ATTR_IDX_UPSTREAM
 			<< AV8L_FAST_PTE_ATTRINDX_SHIFT);
-
 	if (!(prot & IOMMU_WRITE))
 		pte |= AV8L_FAST_PTE_AP_RO;
 	else
@@ -290,9 +287,9 @@ int av8l_fast_map_public(struct io_pgtable_ops *ops, unsigned long iova,
 	return av8l_fast_map(ops, iova, paddr, size, prot, GFP_ATOMIC);
 }
 
-static int av8l_fast_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
-			       phys_addr_t paddr, size_t pgsize, size_t pgcount,
-			       int prot, gfp_t gfp, size_t *mapped)
+static int av8l_fast_map_pages(struct io_pgtable_ops *ops, unsigned long iova, phys_addr_t paddr,
+			       size_t pgsize, size_t pgcount, int prot, gfp_t gfp,
+			       size_t *mapped)
 {
 	int ret = av8l_fast_map(ops, iova, paddr, pgsize * pgcount, prot, gfp);
 
@@ -338,20 +335,14 @@ size_t av8l_fast_unmap_public(struct io_pgtable_ops *ops, unsigned long iova,
 	return __av8l_fast_unmap(ops, iova, size, true);
 }
 
-static size_t av8l_fast_unmap(struct io_pgtable_ops *ops, unsigned long iova,
-			      size_t size, struct iommu_iotlb_gather *gather)
-{
-	return __av8l_fast_unmap(ops, iova, size, false);
-}
-
-static size_t av8l_fast_unmap_pages(struct io_pgtable_ops *ops, unsigned long iova,
-				    size_t pgsize, size_t pgcount,
-				    struct iommu_iotlb_gather *gather)
+static size_t av8l_fast_unmap_pages(struct io_pgtable_ops *ops, unsigned long iova, size_t pgsize,
+				    size_t pgcount, struct iommu_iotlb_gather *gather)
 {
 	return __av8l_fast_unmap(ops, iova, pgsize * pgcount, false);
 }
 
-static int av8l_fast_map_sg(struct io_pgtable_ops *ops,
+/* TODO: Add this back in android-mainline */
+static int __maybe_unused av8l_fast_map_sg(struct io_pgtable_ops *ops,
 			unsigned long iova, struct scatterlist *sgl,
 			unsigned int nents, int prot, gfp_t gfp, size_t *mapped)
 {
@@ -455,10 +446,7 @@ av8l_fast_alloc_pgtable_data(struct io_pgtable_cfg *cfg)
 		return NULL;
 
 	data->iop.ops = (struct io_pgtable_ops) {
-		.map		= av8l_fast_map,
 		.map_pages	= av8l_fast_map_pages,
-		.map_sg		= av8l_fast_map_sg,
-		.unmap		= av8l_fast_unmap,
 		.unmap_pages	= av8l_fast_unmap_pages,
 		.iova_to_phys	= av8l_fast_iova_to_phys,
 	};
@@ -519,7 +507,7 @@ av8l_fast_prepopulate_pgtables(struct av8l_fast_io_pgtable *data,
 	if (!pages)
 		return -ENOMEM;
 
-	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	page = __iommu_alloc_pages((GFP_KERNEL | __GFP_ZERO), 0);
 	if (!page)
 		goto err_free_pages_arr;
 	pages[pg++] = page;
@@ -533,7 +521,7 @@ av8l_fast_prepopulate_pgtables(struct av8l_fast_io_pgtable *data,
 			++i, pud = pud_next(pud, end)) {
 		av8l_fast_iopte pte, *ptep;
 
-		page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		page = __iommu_alloc_pages((GFP_KERNEL | __GFP_ZERO), 0);
 		if (!page)
 			goto err_free_pages;
 		pages[pg++] = page;
@@ -557,7 +545,7 @@ av8l_fast_prepopulate_pgtables(struct av8l_fast_io_pgtable *data,
 			av8l_fast_iopte pte, *pudp;
 			void *addr;
 
-			page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+			page = __iommu_alloc_pages((GFP_KERNEL | __GFP_ZERO), 0);
 			if (!page)
 				goto err_free_pages;
 			pages[pg++] = page;
@@ -591,7 +579,7 @@ av8l_fast_prepopulate_pgtables(struct av8l_fast_io_pgtable *data,
 
 err_free_pages:
 	for (i = 0; i < pg; ++i)
-		__free_page(pages[i]);
+		__iommu_free_pages(pages[i], 0);
 err_free_pages_arr:
 	kvfree(pages);
 	return -ENOMEM;
@@ -613,19 +601,22 @@ av8l_fast_alloc_pgtable(struct io_pgtable_cfg *cfg, void *cookie)
 	cfg->pgsize_bitmap = SZ_4K;
 
 	/* TCR */
-	if (cfg->quirks & IO_PGTABLE_QUIRK_QCOM_USE_UPSTREAM_HINT) {
-		tcr->sh = AV8L_FAST_TCR_SH_OS;
-		tcr->irgn = AV8L_FAST_TCR_RGN_NC;
-		tcr->orgn = AV8L_FAST_TCR_RGN_WBWA;
-	} else if (cfg->coherent_walk) {
-		/* Changed from SH_OS to SH_IS per io-pgtable-arm.c */
+	if (cfg->coherent_walk) {
 		tcr->sh = AV8L_FAST_TCR_SH_IS;
-		tcr->irgn = AV8L_FAST_TCR_RGN_WBWA;
+		if (cfg->quirks & IO_PGTABLE_QUIRK_QCOM_TCR_IRGN_NC)
+			tcr->irgn = AV8L_FAST_TCR_RGN_NC;
+		else
+			tcr->irgn = AV8L_FAST_TCR_RGN_WBWA;
 		tcr->orgn = AV8L_FAST_TCR_RGN_WBWA;
+		if (WARN_ON(cfg->quirks & IO_PGTABLE_QUIRK_ARM_OUTER_WBWA))
+			goto out_free_data;
 	} else {
 		tcr->sh = AV8L_FAST_TCR_SH_OS;
 		tcr->irgn = AV8L_FAST_TCR_RGN_NC;
-		tcr->orgn = AV8L_FAST_TCR_RGN_NC;
+		if (!(cfg->quirks & IO_PGTABLE_QUIRK_ARM_OUTER_WBWA))
+			tcr->orgn = AV8L_FAST_TCR_RGN_NC;
+		else
+			tcr->orgn = AV8L_FAST_TCR_RGN_WBWA;
 	}
 
 	tcr->tg = AV8L_FAST_TCR_TG0_4K;
@@ -687,7 +678,7 @@ static void av8l_fast_free_pgtable(struct io_pgtable *iop)
 
 	vunmap(data->pmds);
 	for (i = 0; i < data->nr_pages; ++i)
-		__free_page(data->pages[i]);
+		__iommu_free_pages(data->pages[i], 0);
 	kvfree(data->pages);
 	kfree(data);
 }

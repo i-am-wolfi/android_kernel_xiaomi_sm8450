@@ -28,12 +28,14 @@
 #include <linux/module.h>
 #include <linux/debugfs.h>
 #include <linux/kthread.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 #include <net/bluetooth/l2cap.h>
 #include <net/bluetooth/rfcomm.h>
+
+#include <trace/events/sock.h>
 
 #define VERSION "1.11"
 
@@ -186,6 +188,8 @@ static void rfcomm_l2state_change(struct sock *sk)
 
 static void rfcomm_l2data_ready(struct sock *sk)
 {
+	trace_sk_data_ready(sk);
+
 	BT_DBG("%p", sk);
 	rfcomm_schedule();
 }
@@ -1027,23 +1031,6 @@ int rfcomm_send_rpn(struct rfcomm_session *s, int cr, u8 dlci,
 	return rfcomm_send_frame(s, buf, ptr - buf);
 }
 
-int rfcomm_dlc_send_rpn(struct rfcomm_dlc *d, u8 bit_rate, u8 data_bits,
-			u8 stop_bits, u8 parity, u8 flow_ctrl_settings,
-			u8 xon_char, u8 xoff_char, u16 param_mask)
-{
-	int err = -ENOTCONN;
-
-	rfcomm_lock();
-	if (d->session)
-		err = rfcomm_send_rpn(d->session, 1, d->dlci, bit_rate,
-				      data_bits, stop_bits, parity,
-				      flow_ctrl_settings, xon_char, xoff_char,
-				      param_mask);
-	rfcomm_unlock();
-
-	return err;
-}
-
 static int rfcomm_send_rls(struct rfcomm_session *s, int cr, u8 dlci, u8 status)
 {
 	struct rfcomm_hdr *hdr;
@@ -1330,10 +1317,7 @@ static struct rfcomm_session *rfcomm_recv_disc(struct rfcomm_session *s,
 	return s;
 }
 
-/* Must be called with rfcomm_mutex held, so that the session cannot be
- * unlinked from under us.
- */
-static void __rfcomm_dlc_accept(struct rfcomm_dlc *d)
+void rfcomm_dlc_accept(struct rfcomm_dlc *d)
 {
 	struct sock *sk = d->session->sock->sk;
 	struct l2cap_conn *conn = l2cap_pi(sk)->chan->conn;
@@ -1355,21 +1339,6 @@ static void __rfcomm_dlc_accept(struct rfcomm_dlc *d)
 	rfcomm_send_msc(d->session, 1, d->dlci, d->v24_sig);
 }
 
-void rfcomm_dlc_accept(struct rfcomm_dlc *d)
-{
-	rfcomm_lock();
-
-	/* rfcomm_recv_disc() sets the dlc state to BT_CLOSED before calling
-	 * __rfcomm_dlc_close(), so the RFCOMM_DEFER_SETUP handshake there is
-	 * skipped and the session can already be unlinked by the time the
-	 * deferred accept runs from rfcomm_sock_recvmsg().
-	 */
-	if (d->session)
-		__rfcomm_dlc_accept(d);
-
-	rfcomm_unlock();
-}
-
 static void rfcomm_check_accept(struct rfcomm_dlc *d)
 {
 	if (rfcomm_check_security(d)) {
@@ -1382,7 +1351,7 @@ static void rfcomm_check_accept(struct rfcomm_dlc *d)
 			d->state_change(d, 0);
 			rfcomm_dlc_unlock(d);
 		} else
-			__rfcomm_dlc_accept(d);
+			rfcomm_dlc_accept(d);
 	} else {
 		set_bit(RFCOMM_AUTH_PENDING, &d->flags);
 		rfcomm_dlc_set_timer(d, RFCOMM_AUTH_TIMEOUT);
@@ -1936,7 +1905,7 @@ static void rfcomm_process_dlcs(struct rfcomm_session *s)
 					d->state_change(d, 0);
 					rfcomm_dlc_unlock(d);
 				} else
-					__rfcomm_dlc_accept(d);
+					rfcomm_dlc_accept(d);
 			}
 			continue;
 		} else if (test_and_clear_bit(RFCOMM_AUTH_REJECT, &d->flags)) {

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
-
 #define pr_fmt(fmt) "VendorHooks: " fmt
 
 #include <linux/init.h>
@@ -25,7 +23,8 @@
 #include <trace/hooks/debug.h>
 #include <trace/hooks/printk.h>
 #include <trace/hooks/timer.h>
-#include <trace/hooks/traps.h>
+
+#include "debug_symbol.h"
 
 static DEFINE_PER_CPU(struct pt_regs, regs_before_stop);
 static DEFINE_RAW_SPINLOCK(stop_lock);
@@ -41,6 +40,8 @@ static void trace_ipi_stop(void *unused, struct pt_regs *regs)
 	unsigned long flags;
 
 	per_cpu(regs_before_stop, cpu) = *regs;
+	if (!oops_in_progress)
+		return;
 	raw_spin_lock_irqsave(&stop_lock, flags);
 	pr_crit("CPU%u: stopping\n", cpu);
 	show_regs(regs);
@@ -53,87 +54,8 @@ static void timer_recalc_index(void *unused,
 	*expires -= 1;
 }
 
-/* In line with aarch64_insn_read from arch/arm64/kernel/insn.c */
-static int instruction_read(void *addr, u32 *insnp)
-{
-	int ret;
-	__le32 val;
-
-	ret = copy_from_kernel_nofault(&val, addr, AARCH64_INSN_SIZE);
-	if (!ret)
-		*insnp = le32_to_cpu(val);
-
-	return ret;
-}
-
-/* In line with dump_kernel_instr from arch/arm64/kernel/traps.c */
-static void dump_instr(const char *rname, u64 instr)
-{
-	char str[sizeof("00000000 ") * 5 + 2 + 1], *p = str;
-	int i;
-
-	for (i = -4; i < 1; i++) {
-		unsigned int val, bad;
-
-		bad = instruction_read(&((u32 *)instr)[i], &val);
-
-		if (!bad)
-			p += scnprintf(p, sizeof(str) - (p - str),
-								i == 0 ? "(%08x) " : "%08x ", val);
-		else {
-			p += scnprintf(p, sizeof(str) - (p - str), "bad value");
-			break;
-		}
-	}
-
-	printk(KERN_EMERG "%s Code: %s\n", rname, str);
-}
-
-/* In line with __show_regs from arch/arm64/kernel/process.c */
-void show_regs_min(struct pt_regs *regs)
-{
-	int i = 29;
-
-	printk(KERN_EMERG "pc : %016llx\n", regs->pc);
-	printk(KERN_EMERG "lr : %016llx\n", regs->regs[30]);
-	printk(KERN_EMERG "sp : %016llx\n", regs->sp);
-
-	while (i >= 0) {
-		printk(KERN_EMERG "x%-2d: %016llx ", i, regs->regs[i]);
-		i--;
-
-		if (i % 2 == 0) {
-			pr_cont("x%-2d: %016llx ", i, regs->regs[i]);
-			i--;
-		}
-
-		pr_cont("\n");
-	}
-}
-
-static void print_undefinstr(void *unused,
-			struct pt_regs *regs, bool user)
-{
-	if (!user) {
-		dump_instr("PC", regs->pc);
-		dump_instr("LR", ptrauth_strip_insn_pac(regs->regs[30]));
-		show_regs_min(regs);
-	}
-}
-
-static void print_ptrauth_fault(void *unused, struct pt_regs *regs,
-			unsigned int esr, bool user)
-{
-	if (!user) {
-		dump_instr("PC", regs->pc);
-		dump_instr("LR", ptrauth_strip_insn_pac(regs->regs[30]));
-		printk(KERN_EMERG "ESR value: 0x%08x", esr);
-		show_regs_min(regs);
-	}
-}
-
 #if IS_ENABLED(CONFIG_DEBUG_SPINLOCK) && \
-   (IS_ENABLED(CONFIG_DEBUG_SPINLOCK_BITE_ON_BUG) || IS_ENABLED(CONFIG_DEBUG_SPINLOCK_PANIC_ON_BUG))
+	(IS_ENABLED(CONFIG_DEBUG_SPINLOCK_BITE_ON_BUG) || IS_ENABLED(CONFIG_DEBUG_SPINLOCK_PANIC_ON_BUG))
 static int entry_spin_bug(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	raw_spinlock_t *lock = (raw_spinlock_t *)regs->regs[0];
@@ -210,18 +132,19 @@ static void store_kaslr_offset(void)
 		return;
 
 	__raw_writel(0xdead4ead, mem);
-	__raw_writel((kimage_vaddr - KIMAGE_VADDR) & KASLR_OFFSET_MASK,
+	__raw_writel(((u64)DEBUG_SYMBOL_LOOKUP(_text) - KIMAGE_VADDR) & KASLR_OFFSET_MASK,
 		     mem + 4);
-	__raw_writel(((kimage_vaddr - KIMAGE_VADDR) >> 32) & KASLR_OFFSET_MASK,
+	__raw_writel((((u64)DEBUG_SYMBOL_LOOKUP(_text) - KIMAGE_VADDR) >> 32) & KASLR_OFFSET_MASK,
 		     mem + 8);
 
 	iounmap(mem);
 }
+
 #else
 static void store_kaslr_offset(void) {}
 #endif /* CONFIG_RANDOMIZE_BASE */
 
-#ifdef CONFIG_HIBERNATION
+#if defined(CONFIG_HIBERNATION)
 static struct syscore_ops kaslr_offset_restore_syscore_ops = {
 	.resume = store_kaslr_offset,
 };
@@ -230,6 +153,9 @@ static struct syscore_ops kaslr_offset_restore_syscore_ops = {
 static int cpu_vendor_hooks_driver_probe(struct platform_device *pdev)
 {
 	int ret;
+
+	if (!debug_symbol_available())
+		return -EPROBE_DEFER;
 
 	store_kaslr_offset();
 #ifdef CONFIG_HIBERNATION
@@ -257,26 +183,17 @@ static int cpu_vendor_hooks_driver_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = register_trace_android_rvh_do_undefinstr(print_undefinstr, NULL);
-	if (ret)
-		dev_err(&pdev->dev, "Failed to android_rvh_do_undefinstr hook\n");
-
-	ret = register_trace_android_rvh_do_ptrauth_fault(print_ptrauth_fault, NULL);
-	if (ret)
-		dev_err(&pdev->dev, "Failed to android_rvh_do_ptrauth_fault hook\n");
-
 	register_spinlock_bug_hook(pdev);
 
 	return ret;
 }
 
-static int cpu_vendor_hooks_driver_remove(struct platform_device *pdev)
+static void cpu_vendor_hooks_driver_remove(struct platform_device *pdev)
 {
 	/* Reset all initialized global variables and unregister callbacks. */
 	unregister_trace_android_vh_ipi_stop(trace_ipi_stop, NULL);
 	unregister_trace_android_vh_printk_hotplug(printk_hotplug, NULL);
 	unregister_trace_android_vh_timer_calc_index(timer_recalc_index, NULL);
-	return 0;
 }
 
 static const struct of_device_id cpu_vendor_hooks_of_match[] = {
@@ -311,4 +228,4 @@ static void __exit qcom_vendor_hook_driver_exit(void)
 module_exit(qcom_vendor_hook_driver_exit);
 
 MODULE_DESCRIPTION("QCOM CPU Vendor Hooks Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

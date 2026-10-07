@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2015-2016, 2018 The Linux Foundation. All rights reserved.
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2015-2016, 2018, 2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/module.h>
@@ -11,7 +11,7 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 #include <linux/slab.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/platform_device.h>
 
 /* pmu event max value */
@@ -95,7 +95,7 @@ static const struct sysfs_ops core_sysfs_ops = {
 	.store	= attr_store,
 };
 
-static struct kobj_type core_ktype = {
+static const struct kobj_type core_ktype = {
 	.sysfs_ops	= &core_sysfs_ops,
 };
 
@@ -256,9 +256,10 @@ static int msm_hang_detect_probe(struct platform_device *pdev)
 {
 	struct device_node *node = pdev->dev.of_node;
 	struct hang_detect *hang_det = NULL;
-	int ret;
+	int ret, cluster_cpu_count = 0;
 	int cpu, num_cpu, entry, num_chd_entry;
 	const char *name;
+	u32 fw_cluster_id;
 	struct of_phandle_args chd_entry;
 
 	if (!pdev->dev.of_node || !enable)
@@ -274,6 +275,27 @@ static int msm_hang_detect_probe(struct platform_device *pdev)
 	if (!name) {
 		pr_err("%s: Can't get label property\n", __func__);
 		return -EINVAL;
+	}
+
+	ret = of_property_read_u32(node, "cluster-id", &fw_cluster_id);
+	if (ret) {
+		pr_err("%s: Missing cluster-id.\n", __func__);
+	} else {
+
+		for_each_possible_cpu(cpu) {
+			if (topology_physical_package_id(cpu)
+					== fw_cluster_id) {
+				cluster_cpu_count++;
+				break;
+			}
+		}
+
+		if (cluster_cpu_count == 0) {
+			pr_err("%s: Unable to find any CPU for cluster:%d\n",
+					__func__, fw_cluster_id);
+			return -EINVAL;
+		}
+
 	}
 
 	num_chd_entry =
@@ -311,7 +333,7 @@ static int msm_hang_detect_probe(struct platform_device *pdev)
 	}
 
 	ret = kobject_init_and_add(&hang_det->kobj, &core_ktype,
-			&cpu_subsys.dev_root->kobj, "%s_%s",
+			&pdev->dev.kobj, "%s_%s",
 			"hang_detect", name);
 	if (ret) {
 		pr_err("%s: Error in creation kobject_add\n", __func__);
@@ -335,7 +357,7 @@ out_put_kobj:
 	return ret;
 }
 
-static int msm_hang_detect_remove(struct platform_device *pdev)
+static void msm_hang_detect_remove(struct platform_device *pdev)
 {
 	struct hang_detect *hang_det = platform_get_drvdata(pdev);
 
@@ -343,7 +365,6 @@ static int msm_hang_detect_remove(struct platform_device *pdev)
 	sysfs_remove_group(&hang_det->kobj, &hang_attr_group);
 	kobject_del(&hang_det->kobj);
 	kobject_put(&hang_det->kobj);
-	return 0;
 }
 
 static struct platform_driver msm_hang_detect_driver = {
@@ -358,4 +379,4 @@ static struct platform_driver msm_hang_detect_driver = {
 module_platform_driver(msm_hang_detect_driver);
 
 MODULE_DESCRIPTION("MSM Core Hang Detect Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

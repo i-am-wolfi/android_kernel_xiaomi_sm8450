@@ -1,26 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
+#include <linux/usb/typec_altmode.h>
+#include <linux/usb/typec_mux.h>
 #include <linux/module.h>
+#include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/i2c.h>
 #include <linux/mutex.h>
 #include <linux/usb/typec.h>
-#include <linux/usb/ucsi_glink.h>
 #include <linux/soc/qcom/fsa4480-i2c.h>
+#include <linux/iio/consumer.h>
 #include <linux/qti-regmap-debugfs.h>
-#include <linux/mmhardware_sysfs.h>
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-#include <linux/battmngr/xm_battmngr_iio.h>
-#include <linux/battmngr/battmngr_notifier.h>
-#include <linux/gpio/consumer.h>
-#include <linux/of_device.h>
-#include <linux/of_gpio.h>
-#include <linux/gpio.h>
-#include <linux/err.h>
-#endif
 
 #define FSA4480_I2C_NAME	"fsa4480-driver"
 
@@ -37,27 +31,22 @@
 #define FSA4480_DELAY_L_SENSE   0x0F
 #define FSA4480_DELAY_L_AGND    0x10
 #define FSA4480_RESET           0x1E
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-#define ET7480_ID               0x00
-#define ET7480_ID_VALUE         0x88
-#define DIO4480_ID_VALUE        0xF1
-#endif
 
 struct fsa4480_priv {
 	struct regmap *regmap;
 	struct device *dev;
+	struct typec_mux_dev *mux;
+
+	/* PMIC + power_supply + IIO path */
+	struct power_supply *usb_psy;
 	struct notifier_block nb;
+	struct iio_channel *iio_ch;
+	u32 use_powersupply;
+
 	atomic_t usbc_mode;
 	struct work_struct usbc_analog_work;
 	struct blocking_notifier_head fsa4480_notifier;
 	struct mutex notification_lock;
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	struct power_supply *usb_psy;
-	u32 use_powersupply;
-	int switch_control;
-	bool dio4480;
-	struct gpio_desc *typec_gpio;
-#endif
 };
 
 struct fsa4480_reg_val {
@@ -84,21 +73,6 @@ static const struct fsa4480_reg_val fsa_reg_i2c_defaults[] = {
 	{FSA4480_SWITCH_SETTINGS, 0x98},
 };
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-static int fsa4480_check_usb_psy(struct fsa4480_priv *fsa_priv)
-{
-	if (!fsa_priv->usb_psy) {
-		fsa_priv->usb_psy = power_supply_get_by_name("usb");
-		if (!fsa_priv->usb_psy) {
-			pr_err("usb psy not found!\n");
-			return false;
-		}
-	}
-
-	return true;
-}
-#endif
-
 static void fsa4480_usbc_update_settings(struct fsa4480_priv *fsa_priv,
 		u32 switch_control, u32 switch_enable)
 {
@@ -123,49 +97,10 @@ static void fsa4480_usbc_update_settings(struct fsa4480_priv *fsa_priv,
 	regmap_write(fsa_priv->regmap, FSA4480_SWITCH_SETTINGS, switch_enable);
 }
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-static int fsa4480_usbc_event_changed_battmngr(struct fsa4480_priv *fsa_priv,
-                                       struct battmngr_notify *data)
-{
-	struct device *dev = NULL;
-
-	if (!fsa_priv)
-		return -EINVAL;
-
-	dev = fsa_priv->dev;
-	if (!dev)
-		return -EINVAL;
-
-	dev_dbg(dev, "%s: USB change event received, audio switch %d, supply mode %d, usbc mode %ld, expected %d\n",
-			__func__, fsa_priv->dio4480, data->pd_msg.accessory_mode, fsa_priv->usbc_mode.counter,
-			TYPEC_ACCESSORY_AUDIO);
-
-	switch (data->pd_msg.accessory_mode) {
-	case TYPEC_ACCESSORY_AUDIO:
-	case TYPEC_ACCESSORY_NONE:
-		if (atomic_read(&(fsa_priv->usbc_mode)) == data->pd_msg.accessory_mode)
-			break; /* filter notifications received before */
-		atomic_set(&(fsa_priv->usbc_mode), data->pd_msg.accessory_mode);
-
-		dev_dbg(dev, "%s: queueing usbc_analog_work\n",
-				__func__);
-		pm_stay_awake(fsa_priv->dev);
-		queue_work(system_freezable_wq, &fsa_priv->usbc_analog_work);
-		break;
-	default:
-		break;
-	}
-
-	return 0;
-}
-
 static int fsa4480_usbc_event_changed_psupply(struct fsa4480_priv *fsa_priv,
 				      unsigned long evt, void *ptr)
 {
 	struct device *dev = NULL;
-	struct power_supply *psy = ptr;
-	union power_supply_propval mode;
-	int rc = 0;
 
 	if (!fsa_priv)
 		return -EINVAL;
@@ -173,77 +108,10 @@ static int fsa4480_usbc_event_changed_psupply(struct fsa4480_priv *fsa_priv,
 	dev = fsa_priv->dev;
 	if (!dev)
 		return -EINVAL;
-
-	if (fsa4480_check_usb_psy(fsa_priv)) {
-		if (psy != fsa_priv->usb_psy) {
-			dev_dbg(dev, "%s: this event is not usb psy\n", __func__);
-			return 0;
-		}
-	}
-
-	rc = xm_battmngr_read_iio_prop(g_battmngr_iio, PD_PHY,
-			PD_TYPEC_ACCESSORY_MODE, &mode.intval);
-	if (rc < 0) {
-		dev_err(dev, "%s: Unable to read USB TYPEC_MODE: %d\n",
-			__func__, rc);
-		return 0;
-	}
-
-	dev_dbg(dev, "%s: USB change event received, audio switch %d, supply mode %d, usbc mode %ld, expected %d\n",
-			__func__, fsa_priv->dio4480, mode.intval, fsa_priv->usbc_mode.counter,
-			TYPEC_ACCESSORY_AUDIO);
-
-	switch (mode.intval) {
-	case TYPEC_ACCESSORY_AUDIO:
-	case TYPEC_ACCESSORY_NONE:
-		if (atomic_read(&(fsa_priv->usbc_mode)) == mode.intval)
-			break; /* filter notifications received before */
-		atomic_set(&(fsa_priv->usbc_mode), mode.intval);
-
-		dev_dbg(dev, "%s: queueing usbc_analog_work\n",
-			__func__);
-		pm_stay_awake(fsa_priv->dev);
-		queue_work(system_freezable_wq, &fsa_priv->usbc_analog_work);
-		break;
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-static int fsa4480_usbc_event_changed_ucsi(struct fsa4480_priv *fsa_priv,
-				      unsigned long evt, void *ptr)
-{
-	struct device *dev;
-	enum typec_accessory acc = ((struct ucsi_glink_constat_info *)ptr)->acc;
-
-	if (!fsa_priv)
-		return -EINVAL;
-
-	dev = fsa_priv->dev;
-	if (!dev)
-		return -EINVAL;
-
-	dev_dbg(dev, "%s: USB change event received, audio switch %d, supply mode %d, usbc mode %ld, expected %d\n",
-			__func__, fsa_priv->dio4480, acc, fsa_priv->usbc_mode.counter,
-			TYPEC_ACCESSORY_AUDIO);
-
-	switch (acc) {
-	case TYPEC_ACCESSORY_AUDIO:
-	case TYPEC_ACCESSORY_NONE:
-		if (atomic_read(&(fsa_priv->usbc_mode)) == acc)
-			break; /* filter notifications received before */
-		atomic_set(&(fsa_priv->usbc_mode), acc);
-
-		dev_dbg(dev, "%s: queueing usbc_analog_work\n",
-			__func__);
-		pm_stay_awake(fsa_priv->dev);
-		queue_work(system_freezable_wq, &fsa_priv->usbc_analog_work);
-		break;
-	default:
-		break;
-	}
+	dev_dbg(dev, "%s: queueing usbc_analog_work\n",
+		__func__);
+	pm_stay_awake(fsa_priv->dev);
+	queue_work(system_freezable_wq, &fsa_priv->usbc_analog_work);
 
 	return 0;
 }
@@ -254,7 +122,6 @@ static int fsa4480_usbc_event_changed(struct notifier_block *nb_ptr,
 	struct fsa4480_priv *fsa_priv =
 			container_of(nb_ptr, struct fsa4480_priv, nb);
 	struct device *dev;
-	struct battmngr_notify *data = ptr;
 
 	if (!fsa_priv)
 		return -EINVAL;
@@ -262,67 +129,53 @@ static int fsa4480_usbc_event_changed(struct notifier_block *nb_ptr,
 	dev = fsa_priv->dev;
 	if (!dev)
 		return -EINVAL;
-
-
-	if (fsa_priv->use_powersupply == 2) {
-		if ((evt == BATTMNGR_EVENT_PD) && (data->pd_msg.msg_type == BATTMNGR_MSG_PD_AUDIO))
-			return fsa4480_usbc_event_changed_battmngr(fsa_priv, data);
-	} else if (fsa_priv->use_powersupply == 1) {
-		return fsa4480_usbc_event_changed_psupply(fsa_priv, evt, ptr);
-	} else {
-		return fsa4480_usbc_event_changed_ucsi(fsa_priv, evt, ptr);
-	}
-
-	return 0;
+	return fsa4480_usbc_event_changed_psupply(fsa_priv, evt, ptr);
 }
 
-#else
 
-static int fsa4480_usbc_event_changed(struct notifier_block *nb,
-				      unsigned long evt, void *ptr)
+
+static int fsa4480_usbc_mux_set(struct typec_mux_dev *mux,
+				 struct typec_mux_state *state)
 {
-	struct fsa4480_priv *fsa_priv =
-			container_of(nb, struct fsa4480_priv, nb);
-	struct device *dev;
-	enum typec_accessory acc = ((struct ucsi_glink_constat_info *)ptr)->acc;
+	struct fsa4480_priv *fsa_priv = typec_mux_get_drvdata(mux);
+	enum typec_accessory acc;
 
 	if (!fsa_priv)
 		return -EINVAL;
 
-	dev = fsa_priv->dev;
-	if (!dev)
+	if (!fsa_priv->dev)
 		return -EINVAL;
 
-	dev_dbg(dev, "%s: USB change event received, supply mode %d, usbc mode %ld, expected %d\n",
+	if (state->mode == TYPEC_MODE_AUDIO)
+		acc = TYPEC_ACCESSORY_AUDIO;
+	else if (state->mode == TYPEC_MODE_DEBUG)
+		acc = TYPEC_ACCESSORY_DEBUG;
+	else
+		acc = TYPEC_ACCESSORY_NONE;
+
+	dev_dbg(fsa_priv->dev, "%s: USB change event received, supply mode %d, usbc mode %d, expected %d\n",
 			__func__, acc, fsa_priv->usbc_mode.counter,
 			TYPEC_ACCESSORY_AUDIO);
 
-	switch (acc) {
-	case TYPEC_ACCESSORY_AUDIO:
-	case TYPEC_ACCESSORY_NONE:
-		if (atomic_read(&(fsa_priv->usbc_mode)) == acc)
-			break; /* filter notifications received before */
-		atomic_set(&(fsa_priv->usbc_mode), acc);
+	if (acc == TYPEC_ACCESSORY_DEBUG)
+		return 0;
 
-		dev_dbg(dev, "%s: queueing usbc_analog_work\n",
-			__func__);
+	if (atomic_read(&(fsa_priv->usbc_mode)) != acc) {
+		atomic_set(&(fsa_priv->usbc_mode), acc);
+		dev_dbg(fsa_priv->dev, "%s: queueing usbc_analog_work\n", __func__);
+
 		pm_stay_awake(fsa_priv->dev);
 		queue_work(system_freezable_wq, &fsa_priv->usbc_analog_work);
-		break;
-	default:
-		break;
 	}
 
 	return 0;
 }
-#endif
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-static int fsa4480_usbc_analog_setup_switches_battmngr(
-						struct fsa4480_priv *fsa_priv)
+static int fsa4480_usbc_analog_setup_switches(struct fsa4480_priv *fsa_priv)
 {
 	int rc = 0;
 	int mode;
+	union power_supply_propval iio_val;
 	struct device *dev;
 
 	if (!fsa_priv)
@@ -331,111 +184,15 @@ static int fsa4480_usbc_analog_setup_switches_battmngr(
 	if (!dev)
 		return -EINVAL;
 
-	mutex_lock(&fsa_priv->notification_lock);
-	/* get latest mode again within locked context */
-	mode = atomic_read(&(fsa_priv->usbc_mode));
-
-	dev_dbg(dev, "%s: setting GPIOs active = %d rcvd supply mode = %d\n",
-		__func__, mode != TYPEC_ACCESSORY_NONE, mode);
-
-	switch (mode) {
-	/* add all modes FSA should notify for in here */
-	case TYPEC_ACCESSORY_AUDIO:
-		if (fsa_priv->typec_gpio)
-			gpiod_set_value_cansleep(fsa_priv->typec_gpio, 1);
-
-		/* activate switches */
-		fsa4480_usbc_update_settings(fsa_priv, 0x00, 0x9F);
-
-		/* notify call chain on event */
-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
-		mode, NULL);
-		break;
-	case TYPEC_ACCESSORY_NONE:
-		if (fsa_priv->typec_gpio)
-			gpiod_set_value_cansleep(fsa_priv->typec_gpio, 0);
-
-		/* notify call chain on event */
-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
-				TYPEC_ACCESSORY_NONE, NULL);
-
-		/* deactivate switches */
-		fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
-		break;
-	default:
-		/* ignore other usb connection modes */
-		break;
+	if (fsa_priv->iio_ch) {
+		rc = iio_read_channel_processed(fsa_priv->iio_ch, &iio_val.intval);
+		if (rc < 0) {
+			dev_err(dev, "%s: Unable to read USB TYPEC_MODE: %d\n",
+			__func__, rc);
+			return rc;
+		}
+		atomic_set(&(fsa_priv->usbc_mode), iio_val.intval);
 	}
-
-	mutex_unlock(&fsa_priv->notification_lock);
-	return rc;
-}
-
-static int fsa4480_usbc_analog_setup_switches_psupply(
-						struct fsa4480_priv *fsa_priv)
-{
-	int rc = 0;
-	int mode;
-	struct device *dev;
-
-	if (!fsa_priv)
-		return -EINVAL;
-	dev = fsa_priv->dev;
-	if (!dev)
-		return -EINVAL;
-
-	mutex_lock(&fsa_priv->notification_lock);
-	/* get latest mode again within locked context */
-	mode = atomic_read(&(fsa_priv->usbc_mode));
-
-	dev_dbg(dev, "%s: setting GPIOs active = %d rcvd supply mode = %d\n",
-		__func__, mode != TYPEC_ACCESSORY_NONE, mode);
-
-	switch (mode) {
-	/* add all modes FSA should notify for in here */
-	case TYPEC_ACCESSORY_AUDIO:
-		if (fsa_priv->typec_gpio)
-			gpiod_set_value_cansleep(fsa_priv->typec_gpio, 1);
-
-		/* activate switches */
-		fsa4480_usbc_update_settings(fsa_priv, 0x00, 0x9F);
-
-		/* notify call chain on event */
-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
-		mode, NULL);
-		break;
-	case TYPEC_ACCESSORY_NONE:
-		if (fsa_priv->typec_gpio)
-			gpiod_set_value_cansleep(fsa_priv->typec_gpio, 0);
-
-		/* notify call chain on event */
-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
-				TYPEC_ACCESSORY_NONE, NULL);
-
-		/* deactivate switches */
-		fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
-		break;
-	default:
-		/* ignore other usb connection modes */
-		break;
-	}
-
-	mutex_unlock(&fsa_priv->notification_lock);
-	return rc;
-}
-
-static int fsa4480_usbc_analog_setup_switches_ucsi(
-						struct fsa4480_priv *fsa_priv)
-{
-	int rc = 0;
-	int mode;
-	struct device *dev;
-
-	if (!fsa_priv)
-		return -EINVAL;
-	dev = fsa_priv->dev;
-	if (!dev)
-		return -EINVAL;
 
 	mutex_lock(&fsa_priv->notification_lock);
 	/* get latest mode again within locked context */
@@ -466,69 +223,9 @@ static int fsa4480_usbc_analog_setup_switches_ucsi(
 		/* ignore other usb connection modes */
 		break;
 	}
-
 	mutex_unlock(&fsa_priv->notification_lock);
 	return rc;
 }
-
-static int fsa4480_usbc_analog_setup_switches(struct fsa4480_priv *fsa_priv)
-{
-	if (fsa_priv->use_powersupply == 2)
-		return fsa4480_usbc_analog_setup_switches_battmngr(fsa_priv);
-	else if (fsa_priv->use_powersupply == 1)
-		return fsa4480_usbc_analog_setup_switches_psupply(fsa_priv);
-	else
-		return fsa4480_usbc_analog_setup_switches_ucsi(fsa_priv);
-}
-
-#else
-
-static int fsa4480_usbc_analog_setup_switches(struct fsa4480_priv *fsa_priv)
-{
-	int rc = 0;
-	int mode;
-	struct device *dev;
-
-	if (!fsa_priv)
-		return -EINVAL;
-	dev = fsa_priv->dev;
-	if (!dev)
-		return -EINVAL;
-
-	mutex_lock(&fsa_priv->notification_lock);
-	/* get latest mode again within locked context */
-	mode = atomic_read(&(fsa_priv->usbc_mode));
-
-	dev_dbg(dev, "%s: setting GPIOs active = %d\n",
-		__func__, mode != TYPEC_ACCESSORY_NONE);
-
-	switch (mode) {
-	/* add all modes FSA should notify for in here */
-	case TYPEC_ACCESSORY_AUDIO:
-		/* activate switches */
-		fsa4480_usbc_update_settings(fsa_priv, 0x00, 0x9F);
-
-		/* notify call chain on event */
-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
-					     mode, NULL);
-		break;
-	case TYPEC_ACCESSORY_NONE:
-		/* notify call chain on event */
-		blocking_notifier_call_chain(&fsa_priv->fsa4480_notifier,
-				TYPEC_ACCESSORY_NONE, NULL);
-
-		/* deactivate switches */
-		fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
-		break;
-	default:
-		/* ignore other usb connection modes */
-		break;
-	}
-
-	mutex_unlock(&fsa_priv->notification_lock);
-	return rc;
-}
-#endif
 
 /*
  * fsa4480_reg_notifier - register notifier block with fsa driver
@@ -564,21 +261,22 @@ int fsa4480_reg_notifier(struct notifier_block *nb,
 	 * as part of the init sequence check if there is a connected
 	 * USB C analog adapter
 	 */
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	rc = fsa4480_usbc_analog_setup_switches(fsa_priv);
-	regmap_update_bits(fsa_priv->regmap, FSA4480_SWITCH_CONTROL, 0x07,
-					   fsa_priv->switch_control);
-#else
-	if (atomic_read(&(fsa_priv->usbc_mode)) == TYPEC_ACCESSORY_AUDIO) {
+	if (fsa_priv->use_powersupply) {
+	       /*
+		* reset the cached usbc mode when power supply is used,
+		* to bypass the event filtering logic.
+		*/
+		atomic_set(&(fsa_priv->usbc_mode), TYPEC_ACCESSORY_NONE);
+		fsa4480_usbc_analog_setup_switches(fsa_priv);
+	} else if (atomic_read(&(fsa_priv->usbc_mode)) == TYPEC_ACCESSORY_AUDIO) {
 		dev_dbg(fsa_priv->dev, "%s: analog adapter already inserted\n",
 			__func__);
 		rc = fsa4480_usbc_analog_setup_switches(fsa_priv);
 	}
-#endif
 
 	return rc;
 }
-EXPORT_SYMBOL(fsa4480_reg_notifier);
+EXPORT_SYMBOL_GPL(fsa4480_reg_notifier);
 
 /*
  * fsa4480_unreg_notifier - unregister notifier block with fsa driver
@@ -591,7 +289,6 @@ EXPORT_SYMBOL(fsa4480_reg_notifier);
 int fsa4480_unreg_notifier(struct notifier_block *nb,
 			     struct device_node *node)
 {
-	int rc = 0;
 	struct i2c_client *client = of_find_i2c_device_by_node(node);
 	struct fsa4480_priv *fsa_priv;
 
@@ -602,21 +299,11 @@ int fsa4480_unreg_notifier(struct notifier_block *nb,
 	if (!fsa_priv)
 		return -EINVAL;
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	mutex_lock(&fsa_priv->notification_lock);
-#endif
-
 	fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
-	rc = blocking_notifier_chain_unregister
+	return blocking_notifier_chain_unregister
 					(&fsa_priv->fsa4480_notifier, nb);
-
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	mutex_unlock(&fsa_priv->notification_lock);
-#endif
-
-	return rc;
 }
-EXPORT_SYMBOL(fsa4480_unreg_notifier);
+EXPORT_SYMBOL_GPL(fsa4480_unreg_notifier);
 
 static int fsa4480_validate_display_port_settings(struct fsa4480_priv *fsa_priv)
 {
@@ -643,13 +330,7 @@ static int fsa4480_validate_display_port_settings(struct fsa4480_priv *fsa_priv)
 int fsa4480_switch_event(struct device_node *node,
 			 enum fsa_function event)
 {
-
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	int *switch_control;
-#else
-	int switch_control_real = 0;
-	int *switch_control = &switch_control_real;
-#endif
+	int switch_control = 0;
 	struct i2c_client *client = of_find_i2c_device_by_node(node);
 	struct fsa4480_priv *fsa_priv;
 
@@ -662,19 +343,15 @@ int fsa4480_switch_event(struct device_node *node,
 	if (!fsa_priv->regmap)
 		return -EINVAL;
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	switch_control = &fsa_priv->switch_control;
-#endif
-
 	switch (event) {
 	case FSA_MIC_GND_SWAP:
 		regmap_read(fsa_priv->regmap, FSA4480_SWITCH_CONTROL,
-				switch_control);
-		if ((*switch_control & 0x07) == 0x07)
-			*switch_control = 0x0;
+				&switch_control);
+		if ((switch_control & 0x07) == 0x07)
+			switch_control = 0x0;
 		else
-			*switch_control = 0x7;
-		fsa4480_usbc_update_settings(fsa_priv, *switch_control, 0x9F);
+			switch_control = 0x7;
+		fsa4480_usbc_update_settings(fsa_priv, switch_control, 0x9F);
 		break;
 	case FSA_USBC_ORIENTATION_CC1:
 		fsa4480_usbc_update_settings(fsa_priv, 0x18, 0xF8);
@@ -691,7 +368,7 @@ int fsa4480_switch_event(struct device_node *node,
 
 	return 0;
 }
-EXPORT_SYMBOL(fsa4480_switch_event);
+EXPORT_SYMBOL_GPL(fsa4480_switch_event);
 
 static void fsa4480_usbc_analog_work_fn(struct work_struct *work)
 {
@@ -715,22 +392,19 @@ static void fsa4480_update_reg_defaults(struct regmap *regmap)
 				   fsa_reg_i2c_defaults[i].val);
 }
 
-static int fsa4480_probe(struct i2c_client *i2c,
-			 const struct i2c_device_id *id)
+static int fsa4480_probe(struct i2c_client *i2c)
 {
+	struct typec_mux_desc mux_desc = { };
 	struct fsa4480_priv *fsa_priv;
-	int rc = 0;
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
 	u32 use_powersupply = 0;
-	int reg_val = 0;
-	int ret;
-#endif
+	int rc = 0;
 
 	fsa_priv = devm_kzalloc(&i2c->dev, sizeof(*fsa_priv),
 				GFP_KERNEL);
 	if (!fsa_priv)
 		return -ENOMEM;
 
+	memset(fsa_priv, 0, sizeof(struct fsa4480_priv));
 	fsa_priv->dev = &i2c->dev;
 
 	fsa_priv->regmap = devm_regmap_init_i2c(i2c, &fsa4480_regmap_config);
@@ -746,32 +420,44 @@ static int fsa4480_probe(struct i2c_client *i2c,
 	}
 
 	fsa4480_update_reg_defaults(fsa_priv->regmap);
-
 	devm_regmap_qti_debugfs_register(fsa_priv->dev, fsa_priv->regmap);
-	fsa_priv->nb.notifier_call = fsa4480_usbc_event_changed;
-	fsa_priv->nb.priority = 0;
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
+	// On legacy targets that use PMIC charger path,check use_powersupply prop
 	rc = of_property_read_u32(fsa_priv->dev->of_node,
 			"qcom,use-power-supply", &use_powersupply);
-	if (rc || use_powersupply == 2) {
-		fsa_priv->use_powersupply = 2;
-		rc = battmngr_notifier_register(&fsa_priv->nb);
-		if (rc) {
-			dev_err(fsa_priv->dev,
-			  "%s: battmngr notifier registration failed: %d\n",
-			  __func__, rc);
+	if (rc || use_powersupply == 0) {
+		fsa_priv->use_powersupply = 0;
+		mux_desc.drvdata = fsa_priv;
+		mux_desc.fwnode = dev_fwnode(fsa_priv->dev);
+		mux_desc.set = fsa4480_usbc_mux_set;
+
+		fsa_priv->mux = typec_mux_register(fsa_priv->dev, &mux_desc);
+		if (IS_ERR(fsa_priv->mux)) {
+			rc = dev_err_probe(fsa_priv->dev, PTR_ERR(fsa_priv->mux),
+				"failed to register typec mux\n");
 			goto err_data;
 		}
-	} else if (rc || use_powersupply == 1) {
+	} else {
 		fsa_priv->use_powersupply = 1;
+		fsa_priv->nb.notifier_call = fsa4480_usbc_event_changed;
+		fsa_priv->nb.priority = 0;
 		fsa_priv->usb_psy = power_supply_get_by_name("usb");
 		if (!fsa_priv->usb_psy) {
-			dev_dbg(fsa_priv->dev,
+			rc = -EPROBE_DEFER;
+			dev_err(fsa_priv->dev,
 				"%s: could not get USB psy info: %d\n",
 				__func__, rc);
+			goto err_data;
 		}
 
+		fsa_priv->iio_ch = iio_channel_get(fsa_priv->dev, "typec_mode");
+		if (IS_ERR(fsa_priv->iio_ch)) {
+			rc = PTR_ERR(fsa_priv->iio_ch);
+			dev_err(fsa_priv->dev,
+				"%s: iio_channel_get failed for typec_mode\n",
+				__func__);
+			goto err_supply;
+		}
 		rc = power_supply_reg_notifier(&fsa_priv->nb);
 		if (rc) {
 			dev_err(fsa_priv->dev,
@@ -779,108 +465,43 @@ static int fsa4480_probe(struct i2c_client *i2c,
 			__func__, rc);
 			goto err_supply;
 		}
-	} else {
-		dev_dbg(fsa_priv->dev,
-			"%s: Looking up %s property failed or disabled\n",
-			__func__, "qcom,use-power-supply");
-
-		fsa_priv->use_powersupply = 0;
-		rc = register_ucsi_glink_notifier(&fsa_priv->nb);
-		if (rc) {
-			dev_err(fsa_priv->dev,
-			  "%s: ucsi glink notifier registration failed: %d\n",
-			  __func__, rc);
-			goto err_data;
-		}
 	}
-#else
-	rc = register_ucsi_glink_notifier(&fsa_priv->nb);
-	if (rc) {
-		dev_err(fsa_priv->dev, "%s: ucsi glink notifier registration failed: %d\n",
-			__func__, rc);
-		goto err_data;
-	}
-#endif
 
 	mutex_init(&fsa_priv->notification_lock);
 	i2c_set_clientdata(i2c, fsa_priv);
-
-#if IS_ENABLED(CONFIG_MMHARDWARE_DETECTION)
-	register_kobj_under_mmsysfs(MM_HW_AS, "audioswitch");
-#endif
 
 	INIT_WORK(&fsa_priv->usbc_analog_work,
 		  fsa4480_usbc_analog_work_fn);
 
 	BLOCKING_INIT_NOTIFIER_HEAD(&fsa_priv->fsa4480_notifier);
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	regmap_read(fsa_priv->regmap, ET7480_ID, &reg_val);
-	if (reg_val == DIO4480_ID_VALUE) {
-		fsa_priv->dio4480 = true;
-		pr_debug("%s audio switch use dio4480 reg_val is %x", __func__, reg_val);
-	} else {
-		fsa_priv->dio4480 = false;
-		pr_debug("%s audio switch use et7480 reg_val is %x", __func__, reg_val);
-	}
-
-	fsa_priv->typec_gpio = devm_gpiod_get_optional(fsa_priv->dev, "fsatypec",
-							GPIOD_OUT_LOW);
-	if (IS_ERR(fsa_priv->typec_gpio)) {
-		ret = PTR_ERR(fsa_priv->typec_gpio);
-		fsa_priv->typec_gpio = NULL;
-		if (ret == -EBUSY) {
-			dev_info(fsa_priv->dev,
-				 "line busy\n");
-		} else {
-			dev_err(fsa_priv->dev,
-				"Failed to get GPIO: %d\n", ret);
-			goto err_data;
-		}
-	}
-	if (fsa_priv->typec_gpio)
-		gpiod_set_value_cansleep(fsa_priv->typec_gpio, 0);
-#endif
-
 	return 0;
 
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
 err_supply:
 	power_supply_put(fsa_priv->usb_psy);
-#endif
 err_data:
-	devm_kfree(&i2c->dev, fsa_priv);
 	return rc;
 }
 
-static int fsa4480_remove(struct i2c_client *i2c)
+static void fsa4480_remove(struct i2c_client *i2c)
 {
 	struct fsa4480_priv *fsa_priv =
 			(struct fsa4480_priv *)i2c_get_clientdata(i2c);
 
 	if (!fsa_priv)
-		return -EINVAL;
-
-#if IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
-	if (fsa_priv->use_powersupply == 2) {
-		battmngr_notifier_unregister(&fsa_priv->nb);
-	} else if (fsa_priv->use_powersupply == 1) {
+		return;
+	if (fsa_priv->use_powersupply) {
 		/* deregister from PMI */
 		power_supply_unreg_notifier(&fsa_priv->nb);
 		power_supply_put(fsa_priv->usb_psy);
 	} else {
-		unregister_ucsi_glink_notifier(&fsa_priv->nb);
+		typec_mux_unregister(fsa_priv->mux);
 	}
-#else
-	unregister_ucsi_glink_notifier(&fsa_priv->nb);
-#endif
 	fsa4480_usbc_update_settings(fsa_priv, 0x18, 0x98);
 	cancel_work_sync(&fsa_priv->usbc_analog_work);
 	pm_relax(fsa_priv->dev);
 	mutex_destroy(&fsa_priv->notification_lock);
 	dev_set_drvdata(&i2c->dev, NULL);
-
-	return 0;
 }
 
 static const struct of_device_id fsa4480_i2c_dt_match[] = {
@@ -894,9 +515,7 @@ static struct i2c_driver fsa4480_i2c_driver = {
 	.driver = {
 		.name = FSA4480_I2C_NAME,
 		.of_match_table = fsa4480_i2c_dt_match,
-#if !IS_ENABLED(CONFIG_XM_POWER_SUPPLY)
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
-#endif
 	},
 	.probe = fsa4480_probe,
 	.remove = fsa4480_remove,
@@ -921,4 +540,4 @@ static void __exit fsa4480_exit(void)
 module_exit(fsa4480_exit);
 
 MODULE_DESCRIPTION("FSA4480 I2C driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

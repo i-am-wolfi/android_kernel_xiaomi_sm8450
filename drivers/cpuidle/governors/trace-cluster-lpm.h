@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #if !defined(_TRACE_CLUSTER_LPM_H) || defined(TRACE_HEADER_MULTI_READ)
@@ -13,42 +14,41 @@
 
 TRACE_EVENT(cluster_pred_select,
 
-	TP_PROTO(int index, u32 sleep_us,
-				u32 latency, int pred, u32 pred_us),
+	TP_PROTO(int index, s64 next_wakeup, int restrict_idx, int pred, s64 pred_ns),
 
-	TP_ARGS(index, sleep_us, latency, pred, pred_us),
+	TP_ARGS(index, next_wakeup, restrict_idx, pred, pred_ns),
 
 	TP_STRUCT__entry(
 		__field(int, index)
-		__field(u32, sleep_us)
-		__field(u32, latency)
+		__field(s64, next_wakeup)
+		__field(int, restrict_idx)
 		__field(int, pred)
-		__field(u32, pred_us)
+		__field(s64, pred_ns)
 	),
 
 	TP_fast_assign(
 		__entry->index = index;
-		__entry->sleep_us = sleep_us;
-		__entry->latency = latency;
+		__entry->next_wakeup = next_wakeup;
+		__entry->restrict_idx = restrict_idx;
 		__entry->pred = pred;
-		__entry->pred_us = pred_us;
+		__entry->pred_ns = pred_ns;
 	),
 
-	TP_printk("idx:%d sleep_time:%u latency:%u pred:%d pred_us:%u",
-		 __entry->index, __entry->sleep_us,
-		__entry->latency, __entry->pred, __entry->pred_us)
+	TP_printk("state:%d next-wakeup:%lld restrict-idx:%d pred:%d time:%lld",
+		   __entry->index, __entry->next_wakeup, __entry->restrict_idx,
+		   __entry->pred, __entry->pred_ns)
 );
 
 TRACE_EVENT(cluster_pred_hist,
 
-	TP_PROTO(int idx, u32 resi, u32 sample, u32 tmr),
+	TP_PROTO(int idx, s64 resi, int sample, u32 tmr),
 
 	TP_ARGS(idx, resi, sample, tmr),
 
 	TP_STRUCT__entry(
 		__field(int, idx)
-		__field(u32, resi)
-		__field(u32, sample)
+		__field(s64, resi)
+		__field(int, sample)
 		__field(u32, tmr)
 	),
 
@@ -59,9 +59,8 @@ TRACE_EVENT(cluster_pred_hist,
 		__entry->tmr = tmr;
 	),
 
-	TP_printk("idx:%d resi:%u sample:%u tmr:%u",
-		 __entry->idx, __entry->resi,
-		__entry->sample, __entry->tmr)
+	TP_printk("idx:%d resi:%lld sample:%d tmr:%u",  __entry->idx,
+		  __entry->resi, __entry->sample, __entry->tmr)
 );
 
 TRACE_EVENT(cluster_exit,

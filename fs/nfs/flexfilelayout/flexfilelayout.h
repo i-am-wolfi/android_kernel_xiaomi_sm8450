@@ -99,11 +99,8 @@ struct nfs4_ff_layout_segment {
 	u64				stripe_unit;
 	u32				flags;
 	u32				mirror_array_cnt;
-	struct nfs4_ff_layout_mirror	*mirror_array[];
+	struct nfs4_ff_layout_mirror	*mirror_array[] __counted_by(mirror_array_cnt);
 };
-
-/* nfs4_flexfile_layout::flags bit indices */
-#define NFS4_FF_HDR_NO_IO_THRU_MDS  0   /* any lseg has had FF_FLAGS_NO_IO_THRU_MDS */
 
 struct nfs4_flexfile_layout {
 	struct pnfs_layout_hdr generic_hdr;
@@ -111,7 +108,6 @@ struct nfs4_flexfile_layout {
 	struct list_head	mirrors;
 	struct list_head	error_list; /* nfs4_ff_layout_ds_err */
 	ktime_t			last_report_time; /* Layoutstat report times */
-	unsigned long		flags;
 };
 
 struct nfs4_flexfile_layoutreturn_args {
@@ -176,18 +172,6 @@ static inline bool
 ff_layout_no_fallback_to_mds(struct pnfs_layout_segment *lseg)
 {
 	return FF_LAYOUT_LSEG(lseg)->flags & FF_FLAGS_NO_IO_THRU_MDS;
-}
-
-/*
- * Sticky hdr-level mirror of FF_FLAGS_NO_IO_THRU_MDS so callers that have
- * no current lseg (e.g. between LAYOUTRETURN and the next LAYOUTGET) can
- * still honor the no-MDS-fallback policy.
- */
-static inline bool
-ff_layout_hdr_no_fallback_to_mds(struct pnfs_layout_hdr *lo)
-{
-	return test_bit(NFS4_FF_HDR_NO_IO_THRU_MDS,
-			&FF_LAYOUT_FROM_HDR(lo)->flags);
 }
 
 static inline bool

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "%s:%s " fmt, KBUILD_MODNAME, __func__
@@ -18,6 +19,7 @@
 
 #include "thermal_sensor_service_v02.h"
 #include "qmi_sensors.h"
+#include "thermal_zone_internal.h"
 
 #define QMI_SENS_DRIVER		"qmi-therm-sensors-v2"
 #define QMI_TS_RESP_TOUT	msecs_to_jiffies(100)
@@ -193,7 +195,7 @@ static int qmi_ts_request(struct qmi_sensor *qmi_sens,
 	memset(&req, 0, sizeof(req));
 	memset(&resp, 0, sizeof(resp));
 
-	strlcpy(req.sensor_id.sensor_id, qmi_sens->qmi_name,
+	strscpy(req.sensor_id.sensor_id, qmi_sens->qmi_name,
 		QMI_TS_SENSOR_ID_LENGTH_MAX_V02);
 	req.seq_num = 0;
 	if (send_current_temp_report) {
@@ -225,9 +227,9 @@ static int qmi_ts_request(struct qmi_sensor *qmi_sens,
 	return ret;
 }
 
-static int qmi_sensor_read(void *data, int *temp)
+static int qmi_sensor_read(struct thermal_zone_device *tz, int *temp)
 {
-	struct qmi_sensor *qmi_sens = (struct qmi_sensor *)data;
+	struct qmi_sensor *qmi_sens = (struct qmi_sensor *)tz->devdata;
 
 	if (qmi_sens->connection_active && !atomic_read(&in_suspend))
 		qmi_ts_request(qmi_sens, true);
@@ -236,9 +238,9 @@ static int qmi_sensor_read(void *data, int *temp)
 	return 0;
 }
 
-static int qmi_sensor_set_trips(void *data, int low, int high)
+static int qmi_sensor_set_trips(struct thermal_zone_device *tz, int low, int high)
 {
-	struct qmi_sensor *qmi_sens = (struct qmi_sensor *)data;
+	struct qmi_sensor *qmi_sens = (struct qmi_sensor *)tz->devdata;
 	int ret = 0;
 
 	if (qmi_sens->high_thresh == high &&
@@ -259,9 +261,11 @@ static int qmi_sensor_set_trips(void *data, int low, int high)
 	return ret;
 }
 
-static struct thermal_zone_of_device_ops qmi_sensor_ops = {
+static struct thermal_zone_device_ops qmi_sensor_ops = {
 	.get_temp = qmi_sensor_read,
 	.set_trips = qmi_sensor_set_trips,
+	.change_mode = qti_tz_change_mode,
+	.get_trend = qti_tz_get_trend,
 };
 
 static struct qmi_msg_handler handlers[] = {
@@ -279,7 +283,7 @@ static int qmi_register_sensor_device(struct qmi_sensor *qmi_sens)
 {
 	int ret = 0;
 
-	qmi_sens->tz_dev = thermal_zone_of_sensor_register(
+	qmi_sens->tz_dev = devm_thermal_of_zone_register(
 				qmi_sens->dev,
 				qmi_sens->sens_type + qmi_sens->ts->inst_id,
 				qmi_sens, &qmi_sensor_ops);
@@ -291,8 +295,8 @@ static int qmi_register_sensor_device(struct qmi_sensor *qmi_sens)
 		qmi_sens->tz_dev = NULL;
 		return ret;
 	}
-	pr_debug("Sensor register success for %s\n", qmi_sens->qmi_name);
 
+	pr_debug("Sensor register success for %s\n", qmi_sens->qmi_name);
 	return 0;
 }
 
@@ -468,11 +472,6 @@ static void qmi_ts_cleanup(void)
 		list_for_each_entry_safe(qmi_sens, c_next,
 			&ts->ts_sensor_list, ts_node) {
 			qmi_sens->connection_active = false;
-			if (qmi_sens->tz_dev) {
-				thermal_zone_of_sensor_unregister(
-				qmi_sens->dev, qmi_sens->tz_dev);
-				qmi_sens->tz_dev = NULL;
-			}
 
 			list_del(&qmi_sens->ts_node);
 		}
@@ -541,7 +540,7 @@ static int of_get_qmi_ts_platform_data(struct device *dev)
 			of_property_read_string_index(subsys_np,
 					"qcom,qmi-sensor-names", sens_idx,
 					&qmi_name);
-			strlcpy(qmi_sens->qmi_name, qmi_name,
+			strscpy(qmi_sens->qmi_name, qmi_name,
 						QMI_CLIENT_NAME_LENGTH);
 			/* Check for supported qmi sensors */
 			for (i = 0; i < QMI_TS_MAX_NR; i++) {
@@ -627,12 +626,10 @@ probe_err:
 	return ret;
 }
 
-static int qmi_sens_device_remove(struct platform_device *pdev)
+static void qmi_sens_device_remove(struct platform_device *pdev)
 {
 	qmi_ts_cleanup();
 	unregister_pm_notifier(&qmi_sensor_pm_nb);
-
-	return 0;
 }
 
 static const struct of_device_id qmi_sens_device_match[] = {
@@ -650,4 +647,4 @@ static struct platform_driver qmi_sens_device_driver = {
 };
 
 module_platform_driver(qmi_sens_device_driver);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

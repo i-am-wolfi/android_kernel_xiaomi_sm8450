@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #ifndef _LINUX_MEM_SHARE_H
@@ -16,6 +18,12 @@
 #define CHECK	0
 #define FREE	1
 #define MEMSHARE_GUARD_BYTES	(4*1024)
+
+struct memshare_hyp_mapping {
+	u32 num_vmids;
+	u32 vmids[2];
+	u32 perms[2];
+};
 
 struct mem_blocks {
 	/* Client Id information */
@@ -36,10 +44,14 @@ struct mem_blocks {
 	uint32_t client_request;
 	/* Guard band around the allotted region*/
 	uint32_t guard_band;
+	/* mapping to be assigned to memory region */
+	struct memshare_hyp_mapping hyp_map_info;
 	/* Size required for client */
 	uint32_t size;
 	/* Available memory size for client */
 	uint32_t init_size;
+	/* Configurable Max Dynamic size*/
+	uint32_t dynamic_size_max;
 	/*
 	 * start address of the memory block reserved by server memory
 	 * subsystem to client
@@ -51,9 +63,10 @@ struct mem_blocks {
 	uint8_t free_memory;
 	/* Need Hypervisor mapping*/
 	uint8_t hyp_mapping;
-	/* Status flag which checks if ramdump file is created*/
-	int file_created;
-
+	/* To collect ramdump during SSR*/
+	bool ssr_ramdump;
+	/* Name associated with client*/
+	struct device *subdev;
 };
 
 int memshare_alloc(struct device *dev,

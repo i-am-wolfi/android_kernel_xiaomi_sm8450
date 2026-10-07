@@ -244,6 +244,12 @@ static void reserve_release_intr_bandwidth(struct ehci_hcd *ehci,
 
 	/* FS/LS bus bandwidth */
 	if (tt_usecs) {
+		/*
+		 * find_tt() will not return any error here as we have
+		 * already called find_tt() before calling this function
+		 * and checked for any error return. The previous call
+		 * would have created the data structure.
+		 */
 		tt = find_tt(qh->ps.udev);
 		if (sign > 0)
 			list_add_tail(&qh->ps.ps_list, &tt->ps_list);
@@ -484,13 +490,14 @@ static int tt_no_collision(
 static void enable_periodic(struct ehci_hcd *ehci)
 {
 	if (ehci->periodic_count++)
-		return;
+		goto out;
 
 	/* Stop waiting to turn off the periodic schedule */
 	ehci->enabled_hrtimer_events &= ~BIT(EHCI_HRTIMER_DISABLE_PERIODIC);
 
 	/* Don't start the schedule until PSS is 0 */
 	ehci_poll_PSS(ehci);
+out:
 	turn_on_io_watchdog(ehci);
 }
 
@@ -1159,10 +1166,8 @@ static struct ehci_iso_sched *
 iso_sched_alloc(unsigned packets, gfp_t mem_flags)
 {
 	struct ehci_iso_sched	*iso_sched;
-	int			size = sizeof(*iso_sched);
 
-	size += packets * sizeof(struct ehci_iso_packet);
-	iso_sched = kzalloc(size, mem_flags);
+	iso_sched = kzalloc(struct_size(iso_sched, packet, packets), mem_flags);
 	if (likely(iso_sched != NULL))
 		INIT_LIST_HEAD(&iso_sched->td_list);
 
@@ -1337,6 +1342,12 @@ static void reserve_release_iso_bandwidth(struct ehci_hcd *ehci,
 			}
 		}
 
+		/*
+		 * find_tt() will not return any error here as we have
+		 * already called find_tt() before calling this function
+		 * and checked for any error return. The previous call
+		 * would have created the data structure.
+		 */
 		tt = find_tt(stream->ps.udev);
 		if (sign > 0)
 			list_add_tail(&stream->ps.ps_list, &tt->ps_list);
@@ -1613,7 +1624,6 @@ iso_stream_schedule(
 			status = 1;	/* and give it back immediately */
 			iso_sched_free(stream, sched);
 			sched = NULL;
-			urb->hcpriv = NULL;
 		}
 	}
 	urb->error_count = skip / period;
@@ -1644,6 +1654,8 @@ iso_stream_schedule(
 	return status;
 
  fail:
+	iso_sched_free(stream, sched);
+	urb->hcpriv = NULL;
 	return status;
 }
 
@@ -1955,10 +1967,6 @@ static int itd_submit(struct ehci_hcd *ehci, struct urb *urb,
 		usb_hcd_unlink_urb_from_ep(ehci_to_hcd(ehci), urb);
 	}
  done_not_linked:
-	if (status < 0) {
-		iso_sched_free(stream, urb->hcpriv);
-		urb->hcpriv = NULL;
-	}
 	spin_unlock_irqrestore(&ehci->lock, flags);
  done:
 	return status;
@@ -2336,10 +2344,6 @@ static int sitd_submit(struct ehci_hcd *ehci, struct urb *urb,
 		usb_hcd_unlink_urb_from_ep(ehci_to_hcd(ehci), urb);
 	}
  done_not_linked:
-	if (status < 0) {
-		iso_sched_free(stream, urb->hcpriv);
-		urb->hcpriv = NULL;
-	}
 	spin_unlock_irqrestore(&ehci->lock, flags);
  done:
 	return status;

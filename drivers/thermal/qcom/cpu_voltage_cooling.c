@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #define pr_fmt(fmt) "%s:%s " fmt, KBUILD_MODNAME, __func__
 
@@ -46,6 +46,7 @@ static int cc_set_cur_state(struct thermal_cooling_device *cdev,
 {
 	struct cc_limits_data *cc_cdev = cdev->devdata;
 	int idx = 0, ret = 0;
+
 	if (state > cc_cdev->map_freq_ct)
 		return -EINVAL;
 
@@ -54,7 +55,10 @@ static int cc_set_cur_state(struct thermal_cooling_device *cdev,
 
 	cc_cdev->thermal_state = state;
 
-	for (idx = 0; (idx < CPU_MAP_CT) && (cc_cdev->cpu_map[idx] != -1) ; idx++) {
+	for (idx = 0; idx < CPU_MAP_CT; idx++) {
+		if (cc_cdev->cpu_map[idx] == -1)
+			break;
+
 		pr_debug("Mitigate CPU:%d to freq:%lu\n", cc_cdev->cpu_map[idx],
 				cc_cdev->map_freq[state].frequency[idx]);
 		ret = freq_qos_update_request(&cc_cdev->cc_qos_req[idx],
@@ -166,7 +170,7 @@ static int build_unified_table(struct cc_limits_data *cc_cdev,
 		if (idy < 0)
 			idy = 0;
 		freq_map[idz].frequency[1] = table[min_idx][idy].frequency;
-		pr_info("freq1:%u freq2:%u\n", freq_map[idz].frequency[0],
+		pr_info("freq1:%lu freq2:%lu\n", freq_map[idz].frequency[0],
 				freq_map[idz].frequency[1]);
 	}
 
@@ -178,8 +182,7 @@ static struct cc_limits_data *opp_init(int *cpus)
 {
 	int cpu1, cpu2;
 	struct device *cpu1_dev, *cpu2_dev;
-	struct limits_freq_table *cpu1_freq_table = NULL;
-	struct limits_freq_table *cpu2_freq_table = NULL;
+	struct limits_freq_table *cpu1_freq_table, *cpu2_freq_table;
 	struct limits_freq_table *cpu_freq_table[CPU_MAP_CT];
 	int table_ct[CPU_MAP_CT], ret = 0;
 	struct cc_limits_data *cc_cdev = NULL;
@@ -198,15 +201,15 @@ static struct cc_limits_data *opp_init(int *cpus)
 	}
 	table_ct[0] = fetch_opp_table(cpu1_dev, &cpu1_freq_table);
 	if (table_ct[0] <= 0)
-		goto opp_err_exit;
+		return ERR_PTR(-ENOMEM);
 
 	table_ct[1] = fetch_opp_table(cpu2_dev, &cpu2_freq_table);
 	if (table_ct[1] <= 0)
-		goto opp_err_exit;
+		goto opp_err_cpu1_exit;
 
 	cc_cdev = kzalloc(sizeof(*cc_cdev), GFP_KERNEL);
 	if (!cc_cdev)
-		goto opp_err_exit;
+		goto opp_err_cpu2_exit;
 	cpu_freq_table[0] = cpu1_freq_table;
 	cpu_freq_table[1] = cpu2_freq_table;
 	ret = build_unified_table(cc_cdev, cpu_freq_table, table_ct, cpus,
@@ -218,17 +221,19 @@ static struct cc_limits_data *opp_init(int *cpus)
 	kfree(cpu2_freq_table);
 	return cc_cdev;
 opp_err_exit:
-	kfree(cpu1_freq_table);
-	kfree(cpu2_freq_table);
 	if (cc_cdev) {
 		kfree(cc_cdev->map_freq);
 		kfree(cc_cdev);
 	}
+opp_err_cpu2_exit:
+	kfree(cpu2_freq_table);
+opp_err_cpu1_exit:
+	kfree(cpu1_freq_table);
 
 	return ERR_PTR(-EPROBE_DEFER);
 }
 
-static int cc_init(struct device_node *np, int *cpus)
+static int cc_init(struct device *dev, struct device_node *np, int *cpus)
 {
 	struct cc_limits_data *cc_cdev;
 	int idx = 0, ret = 0;
@@ -281,13 +286,14 @@ static int cc_init(struct device_node *np, int *cpus)
 			goto cc_err_exit;
 		}
 	}
-	snprintf(cc_cdev->cdev_name, THERMAL_NAME_LENGTH,
-			np->name);
-	cc_cdev->cdev = thermal_of_cooling_device_register(
-					np, cc_cdev->cdev_name, cc_cdev,
+	scnprintf(cc_cdev->cdev_name, THERMAL_NAME_LENGTH, np->name);
+	cc_cdev->cdev = devm_thermal_of_cooling_device_register(
+					dev, np,
+					cc_cdev->cdev_name, cc_cdev,
 					&cc_cooling_ops);
 	list_add(&cc_cdev->node, &cc_cdev_list);
 	mutex_unlock(&cc_list_lock);
+
 	return 0;
 cc_err_exit:
 	mutex_unlock(&cc_list_lock);
@@ -299,38 +305,43 @@ cc_err_exit:
 	return ret;
 }
 
-static int cc_init_single_cluster(struct device_node *np, int cpu)
+static int cc_init_single_cluster(struct device *dev, struct device_node *np, int cpu)
 {
 	struct cc_limits_data *cc_cdev;
-	int ret = 0;
 	struct cpufreq_policy *policy;
-	int freq_count = 0, i;
 	struct limits_freq_map *freq_map = NULL;
+	int freq_count = 0, ret = 0, i;
 
 	policy = cpufreq_cpu_get(cpu);
 	if (!policy) {
-		pr_err("No policy for CPU:%d. Defer.\n", cpu);
+		pr_err("No policy for CPU:%d. Defer\n", cpu);
 		return -EPROBE_DEFER;
 	}
 
 	cc_cdev = kzalloc(sizeof(*cc_cdev), GFP_KERNEL);
-	if (!cc_cdev)
-		goto cc_err_exit;
+	if (!cc_cdev) {
+		cpufreq_cpu_put(policy);
+		return -ENOMEM;
+	}
 
 	freq_count = cpufreq_table_count_valid_entries(policy);
 	if (!freq_count) {
-		pr_debug("CPU%d freq policy table count error%d\n",
-			cpu, freq_count);
+		pr_err("CPU%d freq table not found or has no valid entries\n",
+			cpu);
 		goto cc_err_exit;
 	}
 
 	freq_map = kcalloc(freq_count, sizeof(*freq_map), GFP_KERNEL);
+	if (!freq_map) {
+		cpufreq_cpu_put(policy);
+		kfree(cc_cdev);
+		return -ENOMEM;
+	}
 
 	for (i = 0; i < freq_count; i++) {
-		if (policy->freq_table_sorted ==
-				CPUFREQ_TABLE_SORTED_ASCENDING)
+		if (policy->freq_table_sorted == CPUFREQ_TABLE_SORTED_ASCENDING)
 			freq_map[i].frequency[0] =
-			policy->freq_table[freq_count - i - 1].frequency;
+				policy->freq_table[freq_count - i - 1].frequency;
 		else
 			freq_map[i].frequency[0] =
 				policy->freq_table[i].frequency;
@@ -344,26 +355,33 @@ static int cc_init_single_cluster(struct device_node *np, int cpu)
 	ret = freq_qos_add_request(&policy->constraints,
 			   &cc_cdev->cc_qos_req[0], FREQ_QOS_MAX,
 			   cc_cdev->map_freq[0].frequency[0]);
-	cpufreq_cpu_put(policy);
+
+
 	if (ret < 0) {
 		pr_err("CPU%d Failed to add freq constraint (%d)\n",
 				cc_cdev->cpu_map[0], ret);
-		goto cc_err_exit;
+		goto rem_qos_req;
 	}
 
-	snprintf(cc_cdev->cdev_name, THERMAL_NAME_LENGTH,
-			np->name);
-	cc_cdev->cdev = thermal_of_cooling_device_register(
-					np, cc_cdev->cdev_name, cc_cdev,
+	cpufreq_cpu_put(policy);
+	scnprintf(cc_cdev->cdev_name, THERMAL_NAME_LENGTH, np->name);
+	cc_cdev->cdev = devm_thermal_of_cooling_device_register(
+					dev, np,
+					cc_cdev->cdev_name, cc_cdev,
 					&cc_cooling_ops);
-	if (!IS_ERR(cc_cdev->cdev))
-		list_add(&cc_cdev->node, &cc_cdev_list);
+
+	if (IS_ERR(cc_cdev->cdev))
+		return PTR_ERR(cc_cdev->cdev);
+
+	list_add(&cc_cdev->node, &cc_cdev_list);
+
 	return 0;
 
-cc_err_exit:;
+rem_qos_req:
+	freq_qos_remove_request(&cc_cdev->cc_qos_req[0]);
+cc_err_exit:
 	if (policy)
 		cpufreq_cpu_put(policy);
-	freq_qos_remove_request(&cc_cdev->cc_qos_req[0]);
 	kfree(cc_cdev->map_freq);
 	kfree(cc_cdev);
 
@@ -374,7 +392,7 @@ static int cc_cooling_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
-	struct device_node *dev_phandle, *subsys_np = NULL;
+	struct device_node *dev_phandle = NULL, *subsys_np = NULL;
 	struct device *cpu_dev;
 	int ret = 0, idx = 0, count = 0, cpu;
 	int cpu_count = 0, first_cluster = 0;
@@ -396,8 +414,14 @@ static int cc_cooling_probe(struct platform_device *pdev)
 					break;
 				}
 			}
+
 			if (first_cluster == 1)
 				break;
+		}
+
+		if (dev_phandle) {
+			of_node_put(dev_phandle);
+			dev_phandle = NULL;
 		}
 
 		cpu_count = of_count_phandle_with_args(subsys_np, "qcom,cluster1",
@@ -414,32 +438,36 @@ static int cc_cooling_probe(struct platform_device *pdev)
 					break;
 				}
 			}
-			if ((first_cluster && count == 2) ||
-				(!first_cluster && (count == 1)))
+
+			if ((first_cluster && count == CPU_MAP_CT) ||
+			    (!first_cluster && (count == 1)))
 				break;
 		}
+
+		if (dev_phandle)
+			of_node_put(dev_phandle);
+
 		if (count == 0) {
-			dev_err(dev, "No cluster avaliable\n");
+			dev_err(dev, "No cluster available\n");
 			return -EINVAL;
-		} else if (count == 2)
-			ret = cc_init(subsys_np, cpu_map);
+		}
+
+		if (count == CPU_MAP_CT)
+			ret = cc_init(dev, subsys_np, cpu_map);
 		else
-			ret = cc_init_single_cluster(subsys_np, cpu_map[0]);
+			ret = cc_init_single_cluster(dev, subsys_np, cpu_map[0]);
 	}
 
 	return ret;
 }
 
-static int cc_cooling_remove(struct platform_device *pdev)
+static void cc_cooling_remove(struct platform_device *pdev)
 {
 	struct cc_limits_data *cc_cdev, *cc_next;
 	int idx = 0;
 
 	mutex_lock(&cc_list_lock);
 	list_for_each_entry_safe(cc_cdev, cc_next, &cc_cdev_list, node) {
-		if (cc_cdev->cdev)
-			thermal_cooling_device_unregister(cc_cdev->cdev);
-
 		list_del(&cc_cdev->node);
 		for (idx = 0; idx < CPU_MAP_CT; idx++)
 			freq_qos_remove_request(&cc_cdev->cc_qos_req[idx]);
@@ -447,7 +475,6 @@ static int cc_cooling_remove(struct platform_device *pdev)
 		kfree(cc_cdev);
 	}
 	mutex_unlock(&cc_list_lock);
-	return 0;
 }
 
 static const struct of_device_id cc_cooling_device_match[] = {
@@ -466,4 +493,4 @@ static struct platform_driver cc_cooling_driver = {
 
 module_platform_driver(cc_cooling_driver);
 MODULE_DESCRIPTION("CPU Voltage cooling device driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

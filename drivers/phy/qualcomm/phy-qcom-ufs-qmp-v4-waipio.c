@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include "phy-qcom-ufs-qmp-v4-waipio.h"
 
 #define UFS_PHY_NAME "ufs_phy_qmp_v4_waipio"
 
-static inline void ufs_qcom_phy_qmp_v4_start_serdes(struct ufs_qcom_phy *phy);
+static void ufs_qcom_phy_qmp_v4_start_serdes(struct ufs_qcom_phy *phy);
 static int ufs_qcom_phy_qmp_v4_is_pcs_ready(struct ufs_qcom_phy *phy_common);
 
 static int ufs_qcom_phy_qmp_v4_phy_calibrate(struct phy *generic_phy)
@@ -201,7 +202,7 @@ void ufs_qcom_phy_qmp_v4_ctrl_rx_linecfg(struct ufs_qcom_phy *phy, bool ctrl)
 	mb();
 }
 
-static inline void ufs_qcom_phy_qmp_v4_start_serdes(struct ufs_qcom_phy *phy)
+static void ufs_qcom_phy_qmp_v4_start_serdes(struct ufs_qcom_phy *phy)
 {
 	u32 tmp;
 
@@ -229,7 +230,6 @@ static int ufs_qcom_phy_qmp_v4_is_pcs_ready(struct ufs_qcom_phy *phy_common)
 out:
 	return err;
 }
-
 
 static void ufs_qcom_phy_qmp_v4_dbg_register_dump(struct ufs_qcom_phy *phy)
 {
@@ -293,7 +293,7 @@ static int ufs_qcom_phy_qmp_v4_probe(struct platform_device *pdev)
 
 	phy_set_drvdata(generic_phy, phy);
 
-	strlcpy(phy->common_cfg.name, UFS_PHY_NAME,
+	strscpy(phy->common_cfg.name, UFS_PHY_NAME,
 		sizeof(phy->common_cfg.name));
 
 out:
@@ -302,7 +302,7 @@ out:
 
 static const struct of_device_id ufs_qcom_phy_qmp_v4_of_match[] = {
 	{.compatible = "qcom,ufs-phy-qmp-v4-waipio"},
-	{},
+	{}
 };
 MODULE_DEVICE_TABLE(of, ufs_qcom_phy_qmp_v4_of_match);
 
@@ -317,4 +317,4 @@ static struct platform_driver ufs_qcom_phy_qmp_v4_driver = {
 module_platform_driver(ufs_qcom_phy_qmp_v4_driver);
 
 MODULE_DESCRIPTION("Universal Flash Storage (UFS) QCOM PHY QMP v4 WAIPIO");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

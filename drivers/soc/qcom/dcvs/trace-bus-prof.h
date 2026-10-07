@@ -113,7 +113,6 @@ TRACE_EVENT(memory_lat_last_sample,
 		__entry->bin6,
 		__entry->bin7)
 );
-
 #endif /* _TRACE_BUS_PROF_H */
 
 #undef TRACE_INCLUDE_PATH

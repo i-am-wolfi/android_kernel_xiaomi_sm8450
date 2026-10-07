@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ *  Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _MEM_BUF_H
@@ -13,122 +14,10 @@
 #include <linux/dma-buf.h>
 #include <uapi/linux/mem-buf.h>
 
-/**
- * Private definitions; they are just here since the tracepoint logic needs
- * these definitions. Drivers should not use these.
- */
-
-/**
- * enum mem_buf_msg_type: Message types used by the membuf driver for
- * communication.
- * @MEM_BUF_ALLOC_REQ: The message is an allocation request from another VM to
- * the receiving VM
- * @MEM_BUF_ALLOC_RESP: The message is a response from a remote VM to an
- * allocation request issued by the receiving VM
- * @MEM_BUF_ALLOC_RELINQUISH: The message is a notification from another VM
- * that the receiving VM can reclaim the memory.
- * @MEM_BUF_ALLOC_RELINQUISH_RESP: Indicates completion of MEM_BUF_ALLOC_RELINQUISH.
- */
-enum mem_buf_msg_type {
-	MEM_BUF_ALLOC_REQ,
-	MEM_BUF_ALLOC_RESP,
-	MEM_BUF_ALLOC_RELINQUISH,
-	MEM_BUF_ALLOC_RELINQUISH_RESP,
-	MEM_BUF_ALLOC_REQ_MAX,
-};
-
-/**
- * struct mem_buf_msg_hdr: The header for all membuf messages
- * @txn_id: The transaction ID for the message. This field is only meaningful
- * for request/response type of messages.
- * @msg_type: The type of message.
- */
-struct mem_buf_msg_hdr {
-	u32 txn_id;
-	u32 msg_type;
-} __packed;
-
-/**
- * struct mem_buf_alloc_req: The message format for a memory allocation request
- * to another VM.
- * @hdr: Message header
- * @size: The size of the memory allocation to be performed on the remote VM.
- * @src_mem_type: The type of memory that the remote VM should allocate.
- * @acl_desc: A GH ACL descriptor that describes the VMIDs that will be
- * accessing the memory, as well as what permissions each VMID will have.
- *
- * NOTE: Certain memory types require additional information for the remote VM
- * to interpret. That information should be concatenated with this structure
- * prior to sending the allocation request to the remote VM. For example,
- * with memory type ION, the allocation request message will consist of this
- * structure, as well as the mem_buf_ion_alloc_data structure.
- */
-struct mem_buf_alloc_req {
-	struct mem_buf_msg_hdr hdr;
-	u64 size;
-	u32 src_mem_type;
-	struct gh_acl_desc acl_desc;
-} __packed;
-
-/**
- * struct mem_buf_ion_alloc_data: Represents the data needed to perform
- * an ION allocation on a remote VM.
- * @heap_id: The ID of the heap to allocate from
- */
-struct mem_buf_ion_alloc_data {
-	u32 heap_id;
-} __packed;
-
-/**
- * struct mem_buf_alloc_resp: The message format for a memory allocation
- * request response.
- * @hdr: Message header
- * @ret: Return code from remote VM
- * @hdl: The memparcel handle associated with the memory allocated to the
- * receiving VM. This field is only meaningful if the allocation on the remote
- * VM was carried out successfully, as denoted by @ret.
- */
-struct mem_buf_alloc_resp {
-	struct mem_buf_msg_hdr hdr;
-	s32 ret;
-	u32 hdl;
-	int obj_id;
-	int gh_rm_trans_type;
-} __packed;
-
-/**
- * struct mem_buf_alloc_relinquish: The message format for a notification
- * that the current VM has relinquished access to the memory lent to it by
- * another VM.
- * @hdr: Message header
- * @hdl: The memparcel handle associated with the memory.
- * @obj_id: Unique identifier for the memory object associated with handle.
- */
-struct mem_buf_alloc_relinquish {
-	struct mem_buf_msg_hdr hdr;
-	u32 hdl;
-	int obj_id;
-} __packed;
-
-/* Public definitions */
-
-/* Used to obtain the underlying vmperm struct of a DMA-BUF */
-struct mem_buf_vmperm *to_mem_buf_vmperm(struct dma_buf *dmabuf);
-
-/* Returns true if the local VM has exclusive access and is the owner */
-bool mem_buf_dma_buf_exclusive_owner(struct dma_buf *dmabuf);
-
-/*
- * Returns a copy of the Virtual Machine vmids & permissions of the dmabuf.
- * The caller must kfree() when finished.
- */
-int mem_buf_dma_buf_copy_vmperm(struct dma_buf *dmabuf, int **vmids, int **perms,
-		int *nr_acl_entries);
+/* For in-kernel use only, not allowed for userspace ioctl */
+#define MEM_BUF_BUDDY_MEM_TYPE (MEM_BUF_ION_MEM_TYPE + 2)
 
 typedef int (*mem_buf_dma_buf_destructor)(void *dtor_data);
-int mem_buf_dma_buf_set_destructor(struct dma_buf *dmabuf,
-				   mem_buf_dma_buf_destructor dtor,
-				   void *dtor_data);
 
 /**
  * struct mem_buf_allocation_data - Data structure that contains information
@@ -137,6 +26,8 @@ int mem_buf_dma_buf_set_destructor(struct dma_buf *dmabuf,
  * @nr_acl_entries: The number of ACL entries in @acl_list
  * @acl_list: A list of VMID and permission pairs that describe what VMIDs will
  * have access to the memory, and with what permissions
+ * @trans_type: One of GH_RM_TRANS_TYPE_DONATE/LEND/SHARE
+ * @sgl_desc: Optional. Requests a specific set of IPA addresses.
  * @src_mem_type: The type of memory that the remote VM should allocate
  * (e.g. ION memory)
  * @src_data: A pointer to memory type specific data that the remote VM may need
@@ -151,6 +42,8 @@ struct mem_buf_allocation_data {
 	unsigned int nr_acl_entries;
 	int *vmids;
 	int *perms;
+	u32 trans_type;
+	struct gh_sgl_desc *sgl_desc;
 	enum mem_buf_mem_type src_mem_type;
 	void *src_data;
 	enum mem_buf_mem_type dst_mem_type;
@@ -166,8 +59,58 @@ struct mem_buf_lend_kernel_arg {
 	u64 label;
 };
 
+
+struct mem_buf_retrieve_kernel_arg {
+	int sender_vmid;
+	unsigned int nr_acl_entries;
+	int *vmids;
+	int *perms;
+	gh_memparcel_handle_t memparcel_hdl;
+	int fd_flags;
+};
+
+#if IS_ENABLED(CONFIG_QCOM_MEM_BUF_GH)
+
+void *mem_buf_alloc(struct mem_buf_allocation_data *alloc_data);
+void mem_buf_free(void *membuf);
+struct gh_sgl_desc *mem_buf_get_sgl(void *membuf);
+struct dma_buf *mem_buf_retrieve(struct mem_buf_retrieve_kernel_arg *arg);
+
+#else
+
+static inline void *mem_buf_alloc(struct mem_buf_allocation_data *alloc_data)
+{
+	return ERR_PTR(-ENODEV);
+}
+
+static inline void mem_buf_free(void *membuf) {}
+
+static inline struct gh_sgl_desc *mem_buf_get_sgl(void *membuf)
+{
+	return ERR_PTR(-EINVAL);
+}
+
+static inline struct dma_buf *mem_buf_retrieve(struct mem_buf_retrieve_kernel_arg *arg)
+{
+	return ERR_PTR(-EINVAL);
+}
+
+#endif /* CONFIG_QCOM_MEM_BUF_GH */
+
+#if IS_ENABLED(CONFIG_QCOM_MEM_BUF_DEV)
+
+int mem_buf_current_vmid(void);
+/*
+ * Returns a copy of the Virtual Machine vmids & permissions of the dmabuf.
+ * The caller must kfree() when finished.
+ */
+int mem_buf_dma_buf_copy_vmperm(struct dma_buf *dmabuf, int **vmids, int **perms,
+		int *nr_acl_entries);
+
 int mem_buf_lend(struct dma_buf *dmabuf,
 		struct mem_buf_lend_kernel_arg *arg);
+
+int mem_buf_reclaim(struct dma_buf *dmabuf);
 
 /*
  * mem_buf_share
@@ -179,40 +122,93 @@ int mem_buf_share(struct dma_buf *dmabuf,
 		struct mem_buf_lend_kernel_arg *arg);
 
 
-struct mem_buf_retrieve_kernel_arg {
-	u32 sender_vmid;
-	unsigned int nr_acl_entries;
-	int *vmids;
-	int *perms;
-	gh_memparcel_handle_t memparcel_hdl;
-	int fd_flags;
-};
-struct dma_buf *mem_buf_retrieve(struct mem_buf_retrieve_kernel_arg *arg);
-int mem_buf_reclaim(struct dma_buf *dmabuf);
+/* Used to obtain the underlying vmperm struct of a DMA-BUF */
+struct mem_buf_vmperm *to_mem_buf_vmperm(struct dma_buf *dmabuf);
 
-#if IS_ENABLED(CONFIG_QCOM_MEM_BUF)
+/* Returns true if the dmabuf has mem-buf extension */
+bool is_mem_buf_dma_buf(struct dma_buf *dmabuf);
 
-int mem_buf_get_fd(void *membuf_desc);
+/* Returns true if the local VM has exclusive access and is the owner */
+bool mem_buf_dma_buf_exclusive_owner(struct dma_buf *dmabuf);
 
-void mem_buf_put(void *membuf_desc);
+/*
+ * Returns the Virtual Machine vmids & permissions of the dmabuf. Can't be
+ * modified.
+ */
+int mem_buf_dma_buf_get_vmperm(struct dma_buf *dmabuf, const int **vmids,
+		const int **perms, int *nr_acl_entries);
+/*
+ * Returns 0 if @dmabuf has a valid memparcel handle and stores it in
+ * memparcel_hdl
+ */
+int mem_buf_dma_buf_get_memparcel_hdl(struct dma_buf *dmabuf,
+				      gh_memparcel_handle_t *memparcel_hdl);
 
-void *mem_buf_get(int fd);
+int mem_buf_dma_buf_set_destructor(struct dma_buf *dmabuf,
+				   mem_buf_dma_buf_destructor dtor,
+				   void *dtor_data);
 
 #else
 
-static inline int mem_buf_get_fd(void *membuf_desc)
+static inline int mem_buf_current_vmid(void)
 {
-	return -ENODEV;
+	return -EINVAL;
 }
 
-static inline void mem_buf_put(void *membuf_desc)
+static inline int mem_buf_dma_buf_copy_vmperm(struct dma_buf *dmabuf, int **vmids, int **perms,
+				int *nr_acl_entries)
 {
+	return -EINVAL;
 }
 
-static inline void *mem_buf_get(int fd)
+static inline int mem_buf_lend(struct dma_buf *dmabuf, struct mem_buf_lend_kernel_arg *arg)
 {
-	return ERR_PTR(-ENODEV);
+	return -EINVAL;
 }
 
-#endif /* CONFIG_QCOM_MEM_BUF */
+static inline int mem_buf_reclaim(struct dma_buf *dmabuf)
+{
+	return -EINVAL;
+}
+
+static inline int mem_buf_share(struct dma_buf *dmabuf, struct mem_buf_lend_kernel_arg *arg)
+{
+	return -EINVAL;
+}
+
+static inline struct mem_buf_vmperm *to_mem_buf_vmperm(struct dma_buf *dmabuf)
+{
+	return ERR_PTR(-EINVAL);
+}
+
+static inline bool is_mem_buf_dma_buf(struct dma_buf *dmabuf)
+{
+	return false;
+}
+
+static inline bool mem_buf_dma_buf_exclusive_owner(struct dma_buf *dmabuf)
+{
+	return false;
+}
+
+static inline int mem_buf_dma_buf_get_vmperm(struct dma_buf *dmabuf, const int **vmids,
+				const int **perms, int *nr_acl_entries)
+{
+	return -EINVAL;
+}
+
+static inline int mem_buf_dma_buf_get_memparcel_hdl(struct dma_buf *dmabuf,
+					gh_memparcel_handle_t *memparcel_hdl)
+{
+	return -EINVAL;
+}
+
+static inline int mem_buf_dma_buf_set_destructor(struct dma_buf *dmabuf,
+				   mem_buf_dma_buf_destructor dtor,
+				   void *dtor_data)
+{
+	return -EINVAL;
+}
+
+#endif /* CONFIG_QCOM_MEM_BUF_DEV */
 #endif /* _MEM_BUF_H */

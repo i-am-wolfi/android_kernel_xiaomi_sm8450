@@ -31,18 +31,26 @@ EXPORT_SYMBOL_GPL(nf_osf_fingers);
 static inline int nf_osf_ttl(const struct sk_buff *skb,
 			     int ttl_check, unsigned char f_ttl)
 {
+	struct in_device *in_dev = __in_dev_get_rcu(skb->dev);
 	const struct iphdr *ip = ip_hdr(skb);
+	const struct in_ifaddr *ifa;
+	int ret = 0;
 
-	switch (ttl_check) {
-	case NF_OSF_TTL_TRUE:
+	if (ttl_check == NF_OSF_TTL_TRUE)
 		return ip->ttl == f_ttl;
-		break;
-	case NF_OSF_TTL_NOCHECK:
+	if (ttl_check == NF_OSF_TTL_NOCHECK)
 		return 1;
-	case NF_OSF_TTL_LESS:
-	default:
-		return ip->ttl <= f_ttl;
+	else if (ip->ttl <= f_ttl)
+		return 1;
+
+	in_dev_for_each_ifa_rcu(ifa, in_dev) {
+		if (inet_ifa_match(ip->saddr, ifa)) {
+			ret = (ip->ttl == f_ttl);
+			break;
+		}
 	}
+
+	return ret;
 }
 
 struct nf_osf_hdr_ctx {
@@ -56,9 +64,9 @@ struct nf_osf_hdr_ctx {
 static bool nf_osf_match_one(const struct sk_buff *skb,
 			     const struct nf_osf_user_finger *f,
 			     int ttl_check,
-			     const struct nf_osf_hdr_ctx *ctx)
+			     struct nf_osf_hdr_ctx *ctx)
 {
-	const __u8 *optp = ctx->optp;
+	const __u8 *optpinit = ctx->optp;
 	unsigned int check_WSS = 0;
 	int fmatch = FMATCH_WRONG;
 	int foptsize, optnum;
@@ -87,21 +95,25 @@ static bool nf_osf_match_one(const struct sk_buff *skb,
 	check_WSS = f->wss.wc;
 
 	for (optnum = 0; optnum < f->opt_num; ++optnum) {
-		if (f->opt[optnum].kind == *optp) {
+		if (f->opt[optnum].kind == *ctx->optp) {
 			__u32 len = f->opt[optnum].length;
-			const __u8 *optend = optp + len;
+			const __u8 *optend = ctx->optp + len;
 
 			fmatch = FMATCH_OK;
 
-			switch (*optp) {
+			switch (*ctx->optp) {
 			case OSFOPT_MSS:
-				mss = get_unaligned_be16(&optp[2]);
+				mss = ctx->optp[3];
+				mss <<= 8;
+				mss |= ctx->optp[2];
+
+				mss = ntohs((__force __be16)mss);
 				break;
 			case OSFOPT_TS:
 				break;
 			}
 
-			optp = optend;
+			ctx->optp = optend;
 		} else
 			fmatch = FMATCH_OPT_WRONG;
 
@@ -143,6 +155,9 @@ static bool nf_osf_match_one(const struct sk_buff *skb,
 			break;
 		}
 	}
+
+	if (fmatch != FMATCH_OK)
+		ctx->optp = optpinit;
 
 	return fmatch == FMATCH_OK;
 }
@@ -281,10 +296,9 @@ static const struct nla_policy nfnl_osf_policy[OSF_ATTR_MAX + 1] = {
 	[OSF_ATTR_FINGER]	= { .len = sizeof(struct nf_osf_user_finger) },
 };
 
-static int nfnl_osf_add_callback(struct net *net, struct sock *ctnl,
-				 struct sk_buff *skb, const struct nlmsghdr *nlh,
-				 const struct nlattr * const osf_attrs[],
-				 struct netlink_ext_ack *extack)
+static int nfnl_osf_add_callback(struct sk_buff *skb,
+				 const struct nfnl_info *info,
+				 const struct nlattr * const osf_attrs[])
 {
 	struct nf_osf_user_finger *f;
 	struct nf_osf_finger *kf = NULL, *sf;
@@ -298,16 +312,12 @@ static int nfnl_osf_add_callback(struct net *net, struct sock *ctnl,
 	if (!osf_attrs[OSF_ATTR_FINGER])
 		return -EINVAL;
 
-	if (!(nlh->nlmsg_flags & NLM_F_CREATE))
+	if (!(info->nlh->nlmsg_flags & NLM_F_CREATE))
 		return -EINVAL;
 
 	f = nla_data(osf_attrs[OSF_ATTR_FINGER]);
 
 	if (f->opt_num > ARRAY_SIZE(f->opt))
-		return -EINVAL;
-
-	if (f->wss.wc >= OSF_WSS_MAX ||
-	    (f->wss.wc == OSF_WSS_MODULO && f->wss.val == 0))
 		return -EINVAL;
 
 	for (i = 0; i < f->opt_num; i++) {
@@ -339,7 +349,7 @@ static int nfnl_osf_add_callback(struct net *net, struct sock *ctnl,
 		kfree(kf);
 		kf = NULL;
 
-		if (nlh->nlmsg_flags & NLM_F_EXCL)
+		if (info->nlh->nlmsg_flags & NLM_F_EXCL)
 			err = -EEXIST;
 		break;
 	}
@@ -353,11 +363,9 @@ static int nfnl_osf_add_callback(struct net *net, struct sock *ctnl,
 	return err;
 }
 
-static int nfnl_osf_remove_callback(struct net *net, struct sock *ctnl,
-				    struct sk_buff *skb,
-				    const struct nlmsghdr *nlh,
-				    const struct nlattr * const osf_attrs[],
-				    struct netlink_ext_ack *extack)
+static int nfnl_osf_remove_callback(struct sk_buff *skb,
+				    const struct nfnl_info *info,
+				    const struct nlattr * const osf_attrs[])
 {
 	struct nf_osf_user_finger *f;
 	struct nf_osf_finger *sf;
@@ -391,11 +399,13 @@ static int nfnl_osf_remove_callback(struct net *net, struct sock *ctnl,
 static const struct nfnl_callback nfnl_osf_callbacks[OSF_MSG_MAX] = {
 	[OSF_MSG_ADD]	= {
 		.call		= nfnl_osf_add_callback,
+		.type		= NFNL_CB_MUTEX,
 		.attr_count	= OSF_ATTR_MAX,
 		.policy		= nfnl_osf_policy,
 	},
 	[OSF_MSG_REMOVE]	= {
 		.call		= nfnl_osf_remove_callback,
+		.type		= NFNL_CB_MUTEX,
 		.attr_count	= OSF_ATTR_MAX,
 		.policy		= nfnl_osf_policy,
 	},
@@ -450,4 +460,5 @@ module_init(nfnl_osf_init);
 module_exit(nfnl_osf_fini);
 
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Passive OS fingerprint matching");
 MODULE_ALIAS_NFNL_SUBSYS(NFNL_SUBSYS_OSF);

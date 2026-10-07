@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  */
 
@@ -15,8 +16,10 @@ typedef u32 gh_rm_msgid_t;
 typedef u32 gh_virq_handle_t;
 typedef u32 gh_label_t;
 typedef u32 gh_memparcel_handle_t;
+typedef u32 gh_dev_handle_t;
 typedef u64 gh_capid_t;
 typedef u64 gh_dbl_flags_t;
+typedef u32 gh_heap_handle_t;
 
 struct gh_vminfo {
 	u8 *guid;
@@ -28,6 +31,7 @@ struct gh_vminfo {
 /* Common Gunyah macros */
 #define GH_CAPID_INVAL	U64_MAX
 #define GH_VMID_INVAL	U16_MAX
+#define GH_SELF_VMID	0
 
 enum gh_vm_names {
 	/*

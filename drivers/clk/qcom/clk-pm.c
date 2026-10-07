@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/clk.h>
@@ -29,6 +29,8 @@ static int clock_pm_restore_early(struct device *dev)
 
 	clk_restore_critical_clocks(dev);
 
+	gdsc_genpd_pm_restore(dev);
+
 	if (pm_runtime_enabled(dev))
 		pm_runtime_put_sync(dev);
 
@@ -38,8 +40,7 @@ static int clock_pm_restore_early(struct device *dev)
 /* Restores the clocks configuration while coming out of DeepSleep */
 static int clock_pm_resume_early(struct device *dev)
 {
-#ifdef CONFIG_DEEPSLEEP
-	if (pm_suspend_via_firmware()) {
+	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
 		if (pm_runtime_enabled(dev)) {
 			int ret;
 
@@ -52,10 +53,11 @@ static int clock_pm_resume_early(struct device *dev)
 
 		clk_restore_critical_clocks(dev);
 
+		gdsc_genpd_pm_restore(dev);
+
 		if (pm_runtime_enabled(dev))
 			pm_runtime_put_sync(dev);
 	}
-#endif
 	return 0;
 }
 

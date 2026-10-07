@@ -58,7 +58,6 @@
  * @skb: request message to be (repeatedly) sent
  * @timer: timer governing period between requests
  * @timer_intv: current interval between requests (in ms)
- * @rcu: RCU head for deferred freeing
  */
 struct tipc_discoverer {
 	u32 bearer_id;
@@ -70,12 +69,12 @@ struct tipc_discoverer {
 	struct sk_buff *skb;
 	struct timer_list timer;
 	unsigned long timer_intv;
-	struct rcu_head rcu;
 };
 
 /**
  * tipc_disc_init_msg - initialize a link setup message
  * @net: the applicable net namespace
+ * @skb: buffer containing message
  * @mtyp: message type (request or response)
  * @b: ptr to bearer issuing message
  */
@@ -346,7 +345,7 @@ exit:
  * @dest: destination address for request messages
  * @skb: pointer to created frame
  *
- * Returns 0 if successful, otherwise -errno.
+ * Return: 0 if successful, otherwise -errno.
  */
 int tipc_disc_create(struct net *net, struct tipc_bearer *b,
 		     struct tipc_media_addr *dest, struct sk_buff **skb)
@@ -383,23 +382,15 @@ int tipc_disc_create(struct net *net, struct tipc_bearer *b,
 	return 0;
 }
 
-static void tipc_disc_free_rcu(struct rcu_head *rp)
-{
-	struct tipc_discoverer *d = container_of(rp, struct tipc_discoverer,
-						 rcu);
-
-	kfree_skb(d->skb);
-	kfree(d);
-}
-
 /**
  * tipc_disc_delete - destroy object sending periodic link setup requests
- * @d: ptr to link duest structure
+ * @d: ptr to link dest structure
  */
 void tipc_disc_delete(struct tipc_discoverer *d)
 {
-	del_timer_sync(&d->timer);
-	call_rcu(&d->rcu, tipc_disc_free_rcu);
+	timer_shutdown_sync(&d->timer);
+	kfree_skb(d->skb);
+	kfree(d);
 }
 
 /**

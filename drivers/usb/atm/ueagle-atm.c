@@ -9,7 +9,7 @@
  * HISTORY : some part of the code was base on ueagle 1.3 BSD driver,
  * Damien Bergamini agree to put his code under a DUAL GPL/BSD license.
  *
- * The rest of the code was was rewritten from scratch.
+ * The rest of the code was rewritten from scratch.
  */
 
 #include <linux/module.h>
@@ -25,7 +25,7 @@
 #include <linux/slab.h>
 #include <linux/kernel.h>
 
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include "usbatm.h"
 
@@ -546,7 +546,7 @@ MODULE_PARM_DESC(annex,
 
 #define uea_wait(sc, cond, timeo) \
 ({ \
-	int _r = wait_event_interruptible_timeout(sc->sync_q, \
+	int _r = wait_event_freezable_timeout(sc->sync_q, \
 			(cond) || kthread_should_stop(), timeo); \
 	if (kthread_should_stop()) \
 		_r = -ENODEV; \
@@ -599,9 +599,7 @@ static int uea_send_modem_cmd(struct usb_device *usb,
 static void uea_upload_pre_firmware(const struct firmware *fw_entry,
 								void *context)
 {
-	struct usb_interface *intf = context;
-	struct usb_device *usb = interface_to_usbdev(intf);
-	struct completion *fw_done = usb_get_intfdata(intf);
+	struct usb_device *usb = context;
 	const u8 *pfw;
 	u8 value;
 	u32 crc = 0;
@@ -672,17 +670,15 @@ err_fw_corrupted:
 err:
 	release_firmware(fw_entry);
 	uea_leaves(usb);
-	complete(fw_done);
 }
 
 /*
  * uea_load_firmware - Load usb firmware for pre-firmware devices.
  */
-static int uea_load_firmware(struct usb_interface *intf, unsigned int ver)
+static int uea_load_firmware(struct usb_device *usb, unsigned int ver)
 {
 	int ret;
 	char *fw_name = EAGLE_FIRMWARE;
-	struct usb_device *usb = interface_to_usbdev(intf);
 
 	uea_enters(usb);
 	uea_info(usb, "pre-firmware device, uploading firmware\n");
@@ -706,7 +702,7 @@ static int uea_load_firmware(struct usb_interface *intf, unsigned int ver)
 	}
 
 	ret = request_firmware_nowait(THIS_MODULE, 1, fw_name, &usb->dev,
-					GFP_KERNEL, intf,
+					GFP_KERNEL, usb,
 					uea_upload_pre_firmware);
 	if (ret)
 		uea_err(usb, "firmware %s is not available\n", fw_name);
@@ -1900,7 +1896,6 @@ static int uea_kthread(void *data)
 			ret = sc->stat(sc);
 		if (ret != -EAGAIN)
 			uea_wait(sc, 0, msecs_to_jiffies(1000));
-		try_to_freeze();
 	}
 	uea_leaves(INS_TO_USBDEV(sc));
 	return ret;
@@ -2256,7 +2251,7 @@ static ssize_t stat_status_show(struct device *dev, struct device_attribute *att
 	sc = dev_to_uea(dev);
 	if (!sc)
 		goto out;
-	ret = snprintf(buf, 10, "%08x\n", sc->stats.phy.state);
+	ret = sysfs_emit(buf, "%08x\n", sc->stats.phy.state);
 out:
 	mutex_unlock(&uea_mutex);
 	return ret;
@@ -2322,19 +2317,19 @@ static ssize_t stat_human_status_show(struct device *dev,
 
 	switch (modem_state) {
 	case 0:
-		ret = sprintf(buf, "Modem is booting\n");
+		ret = sysfs_emit(buf, "Modem is booting\n");
 		break;
 	case 1:
-		ret = sprintf(buf, "Modem is initializing\n");
+		ret = sysfs_emit(buf, "Modem is initializing\n");
 		break;
 	case 2:
-		ret = sprintf(buf, "Modem is operational\n");
+		ret = sysfs_emit(buf, "Modem is operational\n");
 		break;
 	case 3:
-		ret = sprintf(buf, "Modem synchronization failed\n");
+		ret = sysfs_emit(buf, "Modem synchronization failed\n");
 		break;
 	default:
-		ret = sprintf(buf, "Modem state is unknown\n");
+		ret = sysfs_emit(buf, "Modem state is unknown\n");
 		break;
 	}
 out:
@@ -2368,7 +2363,7 @@ static ssize_t stat_delin_show(struct device *dev, struct device_attribute *attr
 			delin = "LOSS";
 	}
 
-	ret = sprintf(buf, "%s\n", delin);
+	ret = sysfs_emit(buf, "%s\n", delin);
 out:
 	mutex_unlock(&uea_mutex);
 	return ret;
@@ -2388,7 +2383,7 @@ static ssize_t stat_##name##_show(struct device *dev,		\
 	sc = dev_to_uea(dev);					\
 	if (!sc)						\
 		goto out;					\
-	ret = snprintf(buf, 10, "%08x\n", sc->stats.phy.name);	\
+	ret = sysfs_emit(buf, "%08x\n", sc->stats.phy.name);	\
 	if (reset)						\
 		sc->stats.phy.name = 0;				\
 out:								\
@@ -2591,7 +2586,6 @@ static struct usbatm_driver uea_usbatm_driver = {
 static int uea_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_device *usb = interface_to_usbdev(intf);
-	bool single_iface = usb->config->desc.bNumInterfaces == 1;
 	int ret;
 
 	uea_enters(usb);
@@ -2601,41 +2595,10 @@ static int uea_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		le16_to_cpu(usb->descriptor.bcdDevice),
 		chip_name[UEA_CHIP_VERSION(id)]);
 
-	/*
-	 * uea_probe() decides between the pre-firmware and post-firmware case
-	 * from the USB id and stores a different object as interface data in
-	 * each case: a struct completion for a pre-firmware device, a struct
-	 * usbatm_data for a post-firmware one. uea_disconnect() instead tells
-	 * the two apart by the number of interfaces (a pre-firmware device
-	 * exposes a single interface, ADI930 has 2 and eagle has 3). A crafted
-	 * device advertising a pre-firmware id together with a multi-interface
-	 * descriptor (or the other way around) makes the two disagree, so that
-	 * usbatm_usb_disconnect() treats the small completion object as a
-	 * struct usbatm_data and reads out of bounds. Reject such inconsistent
-	 * descriptors so both paths make the same decision.
-	 */
-	if (UEA_IS_PREFIRM(id) != single_iface)
-		return -ENODEV;
-
 	usb_reset_device(usb);
 
-	if (UEA_IS_PREFIRM(id)) {
-		struct completion *fw_done;
-
-		/* Wait for the firmware load to be done, in .disconnect() */
-		fw_done = kzalloc(sizeof(*fw_done), GFP_KERNEL);
-		if (!fw_done)
-			return -ENOMEM;
-
-		init_completion(fw_done);
-		usb_set_intfdata(intf, fw_done);
-
-		ret = uea_load_firmware(intf, UEA_CHIP_VERSION(id));
-		if (ret)
-			kfree(fw_done);
-
-		return ret;
-	}
+	if (UEA_IS_PREFIRM(id))
+		return uea_load_firmware(usb, UEA_CHIP_VERSION(id));
 
 	ret = usbatm_usb_probe(intf, id, &uea_usbatm_driver);
 	if (ret == 0) {
@@ -2666,13 +2629,6 @@ static void uea_disconnect(struct usb_interface *intf)
 		usbatm_usb_disconnect(intf);
 		mutex_unlock(&uea_mutex);
 		uea_info(usb, "ADSL device removed\n");
-	} else if (usb->config->desc.bNumInterfaces == 1) {
-		struct completion *fw_done = usb_get_intfdata(intf);
-
-		uea_dbg(usb, "pre-firmware device, waiting firmware upload\n");
-		wait_for_completion(fw_done);
-		uea_dbg(usb, "pre-firmware device, finished waiting\n");
-		kfree(fw_done);
 	}
 
 	uea_leaves(usb);

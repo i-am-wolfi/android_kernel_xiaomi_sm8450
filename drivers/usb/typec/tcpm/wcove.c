@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/**
+/*
  * typec_wcove.c - WhiskeyCove PMIC USB Type-C PHY driver
  *
  * Copyright (C) 2017 Intel Corporation
@@ -444,11 +444,9 @@ static int wcove_start_toggling(struct tcpc_dev *tcpc,
 	return regmap_write(wcove->regmap, USBC_CONTROL1, usbc_ctrl);
 }
 
-static int wcove_read_rx_buffer(struct wcove_typec *wcove,
-				struct pd_message *msg)
+static int wcove_read_rx_buffer(struct wcove_typec *wcove, void *msg)
 {
-	unsigned int info, val, len;
-	u8 *buf = (u8 *)msg;
+	unsigned int info;
 	int ret;
 	int i;
 
@@ -456,13 +454,12 @@ static int wcove_read_rx_buffer(struct wcove_typec *wcove,
 	if (ret)
 		return ret;
 
-	len = min(USBC_RXINFO_RXBYTES(info), sizeof(*msg));
+	/* FIXME: Check that USBC_RXINFO_RXBYTES(info) matches the header */
 
-	for (i = 0; i < len; i++) {
-		ret = regmap_read(wcove->regmap, USBC_RX_DATA + i, &val);
+	for (i = 0; i < USBC_RXINFO_RXBYTES(info); i++) {
+		ret = regmap_read(wcove->regmap, USBC_RX_DATA + i, msg + i);
 		if (ret)
 			return ret;
-		buf[i] = val;
 	}
 
 	return regmap_write(wcove->regmap, USBC_RXSTATUS,
@@ -538,7 +535,7 @@ static irqreturn_t wcove_typec_irq(int irq, void *data)
 				goto err;
 			}
 
-			tcpm_pd_receive(wcove->tcpm, &msg);
+			tcpm_pd_receive(wcove->tcpm, &msg, TCPC_TX_SOP);
 
 			ret = regmap_read(wcove->regmap, USBC_RXSTATUS,
 					  &status);
@@ -670,7 +667,7 @@ static int wcove_typec_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int wcove_typec_remove(struct platform_device *pdev)
+static void wcove_typec_remove(struct platform_device *pdev)
 {
 	struct wcove_typec *wcove = platform_get_drvdata(pdev);
 	unsigned int val;
@@ -683,8 +680,6 @@ static int wcove_typec_remove(struct platform_device *pdev)
 
 	tcpm_unregister_port(wcove->tcpm);
 	fwnode_remove_software_node(wcove->tcpc.fwnode);
-
-	return 0;
 }
 
 static struct platform_driver wcove_typec_driver = {
@@ -692,7 +687,7 @@ static struct platform_driver wcove_typec_driver = {
 		.name		= "bxt_wcove_usbc",
 	},
 	.probe			= wcove_typec_probe,
-	.remove			= wcove_typec_remove,
+	.remove_new		= wcove_typec_remove,
 };
 
 module_platform_driver(wcove_typec_driver);

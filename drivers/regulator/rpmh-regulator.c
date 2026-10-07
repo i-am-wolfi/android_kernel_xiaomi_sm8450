@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2016-2021, The Linux Foundation. All rights reserved. */
-/* Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved. */
-
+/* Copyright (c) 2023-2025, Qualcomm Innovation Center, Inc. All rights reserved. */
 #define pr_fmt(fmt) "%s: " fmt, __func__
 
 #include <linux/bitops.h>
@@ -11,10 +9,10 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/suspend.h>
 #include <linux/regulator/debug-regulator.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
@@ -62,6 +60,10 @@ enum rpmh_regulator_hw_type {
 	RPMH_REGULATOR_HW_TYPE_PMIC5_HFSMPS,
 	RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS,
 	RPMH_REGULATOR_HW_TYPE_PMIC5_BOB,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_LDO,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_HFSMPS,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_FTSMPS,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_BOB,
 	RPMH_REGULATOR_HW_TYPE_MAX,
 };
 
@@ -125,14 +127,14 @@ enum rpmh_regulator_reg_index {
  * This is the maximum number of voltage levels that may be defined for an ARC
  * resource.
  */
-#define RPMH_ARC_MAX_LEVELS		16
+#define RPMH_ARC_MAX_LEVELS		32
 
 #define RPMH_REGULATOR_LEVEL_OFF	0
 
 /* Min and max limits of VRM resource request parameters */
 #define RPMH_VRM_MIN_UV			0
 #define RPMH_VRM_MAX_UV			8191000
-
+#define RPMH_VRM_STEP_UV		1000
 #define RPMH_VRM_HEADROOM_MIN_UV	0
 #define RPMH_VRM_HEADROOM_MAX_UV	511000
 
@@ -247,7 +249,6 @@ struct rpmh_aggr_vreg {
 	bool				always_wait_for_ack;
 	bool				next_wait_for_ack;
 	bool				sleep_request_sent;
-	bool				enable_regulator_deepsleep;
 	struct rpmh_vreg		*vreg;
 	int				vreg_count;
 	struct rpmh_regulator_mode	*mode;
@@ -306,6 +307,7 @@ struct rpmh_vreg {
 #define RPMH_REGULATOR_MODE_PMIC4_BOB_AUTO	2
 #define RPMH_REGULATOR_MODE_PMIC4_BOB_PWM	3
 
+#define RPMH_REGULATOR_MODE_PMIC5_LDO_BYPASS	2
 #define RPMH_REGULATOR_MODE_PMIC5_LDO_RM	3
 #define RPMH_REGULATOR_MODE_PMIC5_LDO_LPM	4
 #define RPMH_REGULATOR_MODE_PMIC5_LDO_HPM	7
@@ -322,6 +324,11 @@ struct rpmh_vreg {
 #define RPMH_REGULATOR_MODE_PMIC5_BOB_PFM	4
 #define RPMH_REGULATOR_MODE_PMIC5_BOB_AUTO	6
 #define RPMH_REGULATOR_MODE_PMIC5_BOB_PWM	7
+
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_RM	3
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_LPM	4
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_OPM	5
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_HPM	7
 
 /*
  * Mappings from RPMh generic modes to VRM accelerator modes and regulator
@@ -385,13 +392,17 @@ rpmh_regulator_mode_map_pmic4_bob[RPMH_REGULATOR_MODE_COUNT] = {
 
 static const struct rpmh_regulator_mode
 rpmh_regulator_mode_map_pmic5_ldo[RPMH_REGULATOR_MODE_COUNT] = {
+	[RPMH_REGULATOR_MODE_PASS] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC5_LDO_BYPASS,
+		.framework_mode = REGULATOR_MODE_STANDBY,
+	},
 	[RPMH_REGULATOR_MODE_RET] = {
 		.pmic_mode = RPMH_REGULATOR_MODE_PMIC5_LDO_RM,
-		.framework_mode = REGULATOR_MODE_STANDBY,
+		.framework_mode = REGULATOR_MODE_IDLE,
 	},
 	[RPMH_REGULATOR_MODE_LPM] = {
 		.pmic_mode = RPMH_REGULATOR_MODE_PMIC5_LDO_LPM,
-		.framework_mode = REGULATOR_MODE_IDLE,
+		.framework_mode = REGULATOR_MODE_NORMAL,
 	},
 	[RPMH_REGULATOR_MODE_HPM] = {
 		.pmic_mode = RPMH_REGULATOR_MODE_PMIC5_LDO_HPM,
@@ -451,6 +462,27 @@ rpmh_regulator_mode_map_pmic5_bob[RPMH_REGULATOR_MODE_COUNT] = {
 	},
 };
 
+/* For PMIC7, only LDOs have a mode control delta vs PMIC5 (i.e. OPM added). */
+static const struct rpmh_regulator_mode
+rpmh_regulator_mode_map_pmic7_ldo[RPMH_REGULATOR_MODE_COUNT] = {
+	[RPMH_REGULATOR_MODE_RET] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_RM,
+		.framework_mode = REGULATOR_MODE_STANDBY,
+	},
+	[RPMH_REGULATOR_MODE_LPM] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_LPM,
+		.framework_mode = REGULATOR_MODE_IDLE,
+	},
+	[RPMH_REGULATOR_MODE_AUTO] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_OPM,
+		.framework_mode = REGULATOR_MODE_NORMAL,
+	},
+	[RPMH_REGULATOR_MODE_HPM] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_HPM,
+		.framework_mode = REGULATOR_MODE_FAST,
+	},
+};
+
 static const struct rpmh_regulator_mode * const
 rpmh_regulator_mode_map[RPMH_REGULATOR_HW_TYPE_MAX] = {
 	[RPMH_REGULATOR_HW_TYPE_PMIC4_LDO]
@@ -468,6 +500,14 @@ rpmh_regulator_mode_map[RPMH_REGULATOR_HW_TYPE_MAX] = {
 	[RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS]
 		= rpmh_regulator_mode_map_pmic5_ftsmps,
 	[RPMH_REGULATOR_HW_TYPE_PMIC5_BOB]
+		= rpmh_regulator_mode_map_pmic5_bob,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_LDO]
+		= rpmh_regulator_mode_map_pmic7_ldo,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_HFSMPS]
+		= rpmh_regulator_mode_map_pmic5_hfsmps,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_FTSMPS]
+		= rpmh_regulator_mode_map_pmic5_ftsmps,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_BOB]
 		= rpmh_regulator_mode_map_pmic5_bob,
 };
 
@@ -940,30 +980,6 @@ rpmh_regulator_send_aggregate_requests(struct rpmh_vreg *vreg)
 	return 0;
 }
 
-static int rpmh_vreg_send_ds_requests(struct rpmh_aggr_vreg *aggr_vreg)
-{
-	int rc;
-
-	if (!aggr_vreg->enable_regulator_deepsleep) {
-		pr_debug("clients are handling regulator votes during deepsleep\n");
-		return 0;
-	}
-
-	mutex_lock(&aggr_vreg->lock);
-
-	aggr_vreg->aggr_req_active.valid = 0;
-	aggr_vreg->aggr_req_sleep.valid = 0;
-
-	rc = rpmh_regulator_send_aggregate_requests(&aggr_vreg->vreg[0]);
-
-	if (rc)
-		aggr_vreg_err(aggr_vreg, "error while re-sending request, rc=%d\n",
-				rc);
-	mutex_unlock(&aggr_vreg->lock);
-
-	return rc;
-}
-
 /**
  * rpmh_regulator_set_reg() - set a register value within the request for an
  *		RPMh regulator and return the previous value
@@ -1417,7 +1433,7 @@ static int rpmh_regulator_arc_get_voltage_sel(struct regulator_dev *rdev)
  * are registered for each ARC rpmh-regulator device.
  *
  * Data ranges:
- * ARC voltage level:      0 - 15 (fixed in hardware)
+ * ARC voltage level:      0 - 31 (fixed in hardware)
  * Consumer voltage level: 1 - 513 (could be expanded to larger values)
  *
  * Return: consumer voltage level
@@ -1442,6 +1458,7 @@ static const struct regulator_ops rpmh_regulator_vrm_ops = {
 	.set_mode		= rpmh_regulator_vrm_set_mode,
 	.get_mode		= rpmh_regulator_vrm_get_mode,
 	.set_load		= rpmh_regulator_vrm_set_load,
+	.list_voltage		= regulator_list_voltage_linear,
 };
 
 static const struct regulator_ops rpmh_regulator_arc_ops = {
@@ -1478,8 +1495,8 @@ static const struct regulator_ops *rpmh_regulator_ops[] = {
  * @aggr_vreg:		Pointer to the aggregated rpmh regulator resource
  *
  * The set of supported RPMH_REGULATOR_LEVEL_* voltage levels (0 - ~512) that
- * map to ARC operating levels (0 - 15) is defined in aux data per ARC resource
- * in the command db SMEM data structure.  It is in a u16 array with 1 to 16
+ * map to ARC operating levels (0 - 31) is defined in aux data per ARC resource
+ * in the command db SMEM data structure.  It is in a u16 array with 1 to 32
  * elements.  Note that the aux data array may be zero padded at the end for
  * data alignment purposes.  Such padding entries are invalid and must be
  * ignored.
@@ -1535,6 +1552,65 @@ rpmh_regulator_load_arc_level_mapping(struct rpmh_aggr_vreg *aggr_vreg)
 }
 
 /**
+ * rpmh_regulator_parse_hw_type() - parse the hardware type for a VRM RPMh
+ *		resource
+ * @aggr_vreg:		Pointer to the aggregated rpmh regulator resource
+ * @type:		String containing regulator type
+ *
+ * This function initializes the regulator_hw_type element of aggr_vreg based
+ * upon the value of a device tree property.
+ *
+ * Return: 0 on success, errno on failure
+ */
+static int rpmh_regulator_parse_hw_type(struct rpmh_aggr_vreg *aggr_vreg,
+					const char *type)
+{
+	if (!strcmp(type, "pmic4-ldo")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_LDO;
+	} else if (!strcmp(type, "pmic4-hfsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_HFSMPS;
+	} else if (!strcmp(type, "pmic4-ftsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_FTSMPS;
+	} else if (!strcmp(type, "pmic4-bob")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_BOB;
+	} else if (!strcmp(type, "pmic5-ldo")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_LDO;
+	} else if (!strcmp(type, "pmic5-hfsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_HFSMPS;
+	} else if (!strcmp(type, "pmic5-ftsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS;
+	} else if (!strcmp(type, "pmic5-bob")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_BOB;
+	} else if (!strcmp(type, "pmic7-ldo")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_LDO;
+	} else if (!strcmp(type, "pmic7-hfsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_HFSMPS;
+	} else if (!strcmp(type, "pmic7-ftsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_FTSMPS;
+	} else if (!strcmp(type, "pmic7-bob")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_BOB;
+	} else {
+		aggr_vreg_err(aggr_vreg, "unknown qcom,regulator-type = %s\n",
+				type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
  * rpmh_regulator_parse_vrm_modes() - parse the supported mode configurations
  *		for a VRM RPMh resource from device tree
  * @aggr_vreg:		Pointer to the aggregated rpmh regulator resource
@@ -1568,35 +1644,9 @@ static int rpmh_regulator_parse_vrm_modes(struct rpmh_aggr_vreg *aggr_vreg)
 		return rc;
 	}
 
-	if (!strcmp(type, "pmic4-ldo")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_LDO;
-	} else if (!strcmp(type, "pmic4-hfsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_HFSMPS;
-	} else if (!strcmp(type, "pmic4-ftsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_FTSMPS;
-	} else if (!strcmp(type, "pmic4-bob")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_BOB;
-	} else if (!strcmp(type, "pmic5-ldo")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_LDO;
-	} else if (!strcmp(type, "pmic5-hfsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_HFSMPS;
-	} else if (!strcmp(type, "pmic5-ftsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS;
-	} else if (!strcmp(type, "pmic5-bob")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_BOB;
-	} else {
-		aggr_vreg_err(aggr_vreg, "unknown %s = %s\n",
-				prop, type);
-		return -EINVAL;
-	}
+	rc = rpmh_regulator_parse_hw_type(aggr_vreg, type);
+	if (rc)
+		return rc;
 
 	map = rpmh_regulator_mode_map[aggr_vreg->regulator_hw_type];
 
@@ -1931,6 +1981,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg)
 	struct regulator_config reg_config = {};
 	struct regulator_init_data *init_data;
 	struct regulator_ops *ops;
+	int min_uV, max_uV;
 	int rc, i;
 	u32 set;
 
@@ -1996,7 +2047,16 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg)
 
 	switch (type) {
 	case RPMH_REGULATOR_TYPE_VRM:
-		vreg->rdesc.n_voltages = 2;
+		min_uV = DIV_ROUND_UP(init_data->constraints.min_uV, RPMH_VRM_STEP_UV)
+			* RPMH_VRM_STEP_UV;
+		max_uV = (init_data->constraints.max_uV / RPMH_VRM_STEP_UV) * RPMH_VRM_STEP_UV;
+		if (!min_uV && !max_uV) {
+			vreg->rdesc.n_voltages = 2;
+			break;
+		}
+		vreg->rdesc.min_uV = min_uV;
+		vreg->rdesc.n_voltages = (max_uV - min_uV) / RPMH_VRM_STEP_UV + 1;
+		vreg->rdesc.uV_step = RPMH_VRM_STEP_UV;
 		break;
 	case RPMH_REGULATOR_TYPE_ARC:
 		vreg->rdesc.n_voltages = vreg->aggr_vreg->level_count;
@@ -2164,9 +2224,6 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	if (of_find_node_by_name(node, "qcom,regulator_deepsleep"))
-		aggr_vreg->enable_regulator_deepsleep = true;
-
 	if (aggr_vreg->regulator_type == RPMH_REGULATOR_TYPE_ARC) {
 		rc = rpmh_regulator_load_arc_level_mapping(aggr_vreg);
 		if (rc) {
@@ -2230,56 +2287,11 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
 	return rc;
 }
 
-static int rpmh_vreg_freeze(struct device *dev)
-{
-	pr_debug("Entering hibernation via Rpmh_regulator freeze\n");
-
-	return 0;
-}
-
-static int rpmh_vreg_restore(struct device *dev)
-{
-	struct rpmh_aggr_vreg *aggr_vreg = dev_get_drvdata(dev);
-
-	pr_debug("Resuming from hibernation via Rpmh_regulator restore\n");
-	rpmh_vreg_send_ds_requests(aggr_vreg);
-
-	return 0;
-}
-
-static int rpmh_vreg_suspend(struct device *dev)
-{
-#ifdef CONFIG_DEEPSLEEP
-	if (pm_suspend_via_firmware())
-		pr_debug("Entering Deepsleep via Rpmh_regulator suspend\n");
-#endif
-	return 0;
-}
-
-static int rpmh_vreg_resume(struct device *dev)
-{
-#ifdef CONFIG_DEEPSLEEP
-	if (pm_suspend_via_firmware()) {
-		pr_debug("Resuming Deepsleep via Rpmh_regulator resume\n");
-		rpmh_vreg_restore(dev);
-	}
-#endif
-	return 0;
-}
-
-static const struct dev_pm_ops rpmh_vreg_pm_ops = {
-	.suspend = rpmh_vreg_suspend,
-	.resume  = rpmh_vreg_resume,
-	.freeze  = rpmh_vreg_freeze,
-	.restore = rpmh_vreg_restore,
-};
-
 static struct platform_driver rpmh_regulator_driver = {
 	.driver = {
 		.name		= "qcom,rpmh-regulator",
 		.of_match_table	= rpmh_regulator_match_table,
 		.sync_state	= regulator_proxy_consumer_sync_state,
-		.pm		= &rpmh_vreg_pm_ops,
 	},
 	.probe = rpmh_regulator_probe,
 };
@@ -2298,7 +2310,7 @@ static void rpmh_regulator_exit(void)
 }
 
 MODULE_DESCRIPTION("RPMh regulator driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 
 arch_initcall(rpmh_regulator_init);
 module_exit(rpmh_regulator_exit);

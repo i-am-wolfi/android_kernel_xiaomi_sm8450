@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2018, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2017-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 /*
@@ -47,6 +47,7 @@
 #include <linux/of_device.h>
 #include <linux/of_iommu.h>
 #include <linux/of_platform.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <asm/local64.h>
@@ -77,13 +78,14 @@
 #define SMMU_PMCG_CR                    0xE04
 #define SMMU_PMCG_CR_ENABLE                   BIT(0)
 #define SMMU_PMCG_CEID0                 0xE20
-#define SMMU_STATS_CFG                 0x84
+#define SMMU_STATS_CFG                 0x584
+#define SMMU_STATS_CB_CFG                 0x690
 
 #define SMMU_COUNTER_RELOAD             BIT(31)
 #define SMMU_DEFAULT_FILTER_STREAM_ID   GENMASK(31, 0)
 
 #define SMMU_MAX_COUNTERS               256
-#define SMMU_MAX_EVENT_ID               32
+#define SMMU_MAX_EVENT_ID               256
 #define SMMU_MAX_CEIDS			2
 
 #define SMMU_PA_SHIFT                   12
@@ -99,8 +101,11 @@
 #define SMMU_PMU_ACCESS			0x10
 #define SMMU_PMU_READ_ACCESS		0x11
 #define SMMU_PMU_WRITE_ACCESS		0x12
+#define SMMU_MAX_PMU_EVENTS		0x20
 
+#define SMMU_REG_BASE_OFFSET		0x1000
 #define SMMU_STATS_START		0x80
+#define SMMU_STATS_NS_OFFSET		0x500
 #define SMMU_STATS_MTLB_LOOKUP_CNTR		0x88
 #define SMMU_STATS_WC1_LOOKUP_CNTR		0x90
 #define SMMU_STATS_WC2_LOOKUP_CNTR		0x94
@@ -138,6 +143,8 @@ struct smmu_pmu {
 	struct platform_device *pdev;
 	void __iomem *reg_base;
 	void __iomem *tcu_base;
+	void __iomem *tcu_base_ns;
+	phys_addr_t tcu_base_start;
 	u64 counter_present_mask;
 	u64 counter_mask;
 	bool reg_size_32;
@@ -283,7 +290,8 @@ static void smmu_pmu_event_update(struct perf_event *event)
 	do {
 		prev = local64_read(&hwc->prev_count);
 		if (event_id >= SMMU_STATS_START)
-			now = readl_relaxed((void *)(smmu_pmu->tcu_base + event_id));
+			now = readl_relaxed((void *)(smmu_pmu->tcu_base_ns + event_id +
+						     SMMU_STATS_NS_OFFSET));
 		else
 			now = smmu_pmu_counter_get_value(smmu_pmu, idx);
 	} while (local64_cmpxchg(&hwc->prev_count, prev, now) != prev);
@@ -311,7 +319,8 @@ static void smmu_pmu_set_period(struct smmu_pmu *smmu_pmu,
 	event_id = get_event(event);
 	new = SMMU_COUNTER_RELOAD;
 	if (event_id >= SMMU_STATS_START) {
-		new = readl_relaxed((void *)(smmu_pmu->tcu_base + event_id));
+		new = readl_relaxed((void *)(smmu_pmu->tcu_base_ns + event_id +
+					     SMMU_STATS_NS_OFFSET));
 		local64_set(&hwc->prev_count, new);
 		return;
 	}
@@ -406,6 +415,12 @@ static int smmu_pmu_event_init(struct perf_event *event)
 
 	/* Verify specified event is supported on this PMU */
 	event_id = get_event(event);
+	if ((event_id <= SMMU_MAX_EVENT_ID &&
+	    (!test_bit(event_id, smmu_pmu->supported_events))) || (event_id > SMMU_MAX_EVENT_ID)) {
+		dev_err(&smmu_pmu->pdev->dev,
+				"Invalid event %d for this PMU\n", event_id);
+		return -EINVAL;
+	}
 
 	/* Don't allow groups with mixed PMUs, except for s/w events */
 	if (event->group_leader->pmu != event->pmu &&
@@ -452,14 +467,34 @@ static void smmu_pmu_event_start(struct perf_event *event, int flags)
 	u32 event_id;
 	u32 filter_stream_id;
 	int counters_per_tbu = (int)(smmu_pmu->num_counters / smmu_pmu->num_countergroups);
+	int ret;
 
 	hwc->state = 0;
 
 	event_id = get_event(event);
 
 	if (event_id >= SMMU_STATS_START) {
-		writel_relaxed(1, (void *)(smmu_pmu->tcu_base + SMMU_STATS_CFG));
-		writel_relaxed(0, (void *)(smmu_pmu->tcu_base + SMMU_STATS_CFG));
+		ret = qcom_scm_io_writel(smmu_pmu->tcu_base_start + SMMU_STATS_CFG, 1);
+		if (ret) {
+			dev_err(&smmu_pmu->pdev->dev,
+				"%s: Failed to write to TCU STATS CFG! rc: %d\n",
+				__func__, ret);
+			return;
+		}
+		ret = qcom_scm_io_writel(smmu_pmu->tcu_base_start + SMMU_STATS_CFG, 0);
+		if (ret) {
+			dev_err(&smmu_pmu->pdev->dev,
+				"%s: Failed to write to TCU STATS CFG! rc: %d\n",
+				__func__, ret);
+			return;
+		}
+		ret = qcom_scm_io_writel(smmu_pmu->tcu_base_start + SMMU_STATS_CB_CFG, 0);
+		if (ret) {
+			dev_err(&smmu_pmu->pdev->dev,
+				"%s: Failed to write to TCU STATS CB CFG! rc: %d\n",
+				__func__, ret);
+			return;
+		}
 		smmu_pmu_set_period(smmu_pmu, hwc);
 		return;
 	}
@@ -485,6 +520,7 @@ static void smmu_pmu_event_stop(struct perf_event *event, int flags)
 	struct hw_perf_event *hwc = &event->hw;
 	int idx = hwc->idx;
 	int counters_per_tbu = (int)(smmu_pmu->num_counters / smmu_pmu->num_countergroups);
+	int ret;
 	u32 event_id;
 
 	if (hwc->state & PERF_HES_STOPPED)
@@ -501,8 +537,22 @@ static void smmu_pmu_event_stop(struct perf_event *event, int flags)
 	if (flags & PERF_EF_UPDATE)
 		smmu_pmu_event_update(event);
 	hwc->state |= PERF_HES_STOPPED | PERF_HES_UPTODATE;
-	if (event_id >= SMMU_STATS_START)
-		writel_relaxed(2, (void *)(smmu_pmu->tcu_base + SMMU_STATS_CFG));
+	if (event_id >= SMMU_STATS_START) {
+		ret = qcom_scm_io_writel(smmu_pmu->tcu_base_start + SMMU_STATS_CFG, 2);
+		if (ret) {
+			dev_err(&smmu_pmu->pdev->dev,
+				"%s: Failed to write to TCU STATS CFG! rc: %d\n",
+				__func__, ret);
+			return;
+		}
+		ret = qcom_scm_io_writel(smmu_pmu->tcu_base_start + SMMU_STATS_CB_CFG, 0x30000);
+		if (ret) {
+			dev_err(&smmu_pmu->pdev->dev,
+				"%s: Failed to write to TCU STATS CB CFG! rc: %d\n",
+				__func__, ret);
+			return;
+		}
+	}
 }
 
 static int smmu_pmu_event_add(struct perf_event *event, int flags)
@@ -518,8 +568,11 @@ static int smmu_pmu_event_add(struct perf_event *event, int flags)
 		idx = smmu_pmu_get_event_idx(smmu_pmu, tbu);
 		if (idx < 0)
 			return idx;
-	} else
+	} else {
 		idx = event_id;
+		if (test_and_set_bit(idx, smmu_pmu->used_counters))
+			return -EAGAIN;
+	}
 
 	hwc->idx = idx;
 	hwc->state = PERF_HES_STOPPED | PERF_HES_UPTODATE;
@@ -635,8 +688,11 @@ static umode_t smmu_pmu_event_is_visible(struct kobject *kobj,
 
 	pmu_attr = container_of(attr, struct perf_pmu_events_attr, attr.attr);
 
-	if (pmu_attr->id >= SMMU_STATS_START)
+	/* Add TCU events to list of supported events */
+	if (pmu_attr->id >= SMMU_STATS_START) {
+		test_and_set_bit(pmu_attr->id, smmu_pmu->supported_events);
 		return attr->mode;
+	}
 
 	if (test_bit(pmu_attr->id, smmu_pmu->supported_events))
 		return attr->mode;
@@ -765,21 +821,24 @@ static int smmu_pmu_probe(struct platform_device *pdev)
 
 	mem_map_1 = devm_ioremap(&pdev->dev, mem_resource_1->start, size);
 	if (!mem_map_1) {
-		dev_err(&pdev->dev, "Can't map SMMU PMU TCU @%pa\n",
+		dev_err(&pdev->dev, "Can't map SMMU PMU TCU NS @%pa\n",
 			&mem_resource_1->start);
 		return PTR_ERR(mem_map_1);
 	}
 
-	dev_err(&pdev->dev, "SMMU PMU TCU @%pa\n", &mem_resource_1->start);
-	smmu_pmu->reg_base = mem_map_0;
-	smmu_pmu->tcu_base = mem_map_1;
+	dev_err(&pdev->dev, "SMMU PMU TCU NS @%pa\n", &mem_resource_1->start);
+
+	smmu_pmu->reg_base = mem_map_0 + SMMU_REG_BASE_OFFSET;
+	smmu_pmu->tcu_base = mem_map_0;
+	smmu_pmu->tcu_base_ns = mem_map_1;
+	smmu_pmu->tcu_base_start = (phys_addr_t)mem_resource_0->start;
 	smmu_pmu->pmu.name =
 		devm_kasprintf(&pdev->dev, GFP_KERNEL, "smmu_0_%llx",
 			       (mem_resource_0->start) >> SMMU_PA_SHIFT);
 
 	ceid_32 = readl_relaxed(smmu_pmu->reg_base + SMMU_PMCG_CEID0);
 	ceid[0] = ceid_32;
-	bitmap_from_arr32(smmu_pmu->supported_events, ceid, SMMU_MAX_EVENT_ID);
+	bitmap_from_arr32(smmu_pmu->supported_events, ceid, SMMU_MAX_PMU_EVENTS);
 
 	smmu_pmu->num_irqs = platform_irq_count(pdev);
 	smmu_pmu->irqs = devm_kzalloc(&pdev->dev,
@@ -805,7 +864,7 @@ static int smmu_pmu_probe(struct platform_device *pdev)
 		smmu_pmu->irqs[i] = irq;
 	}
 	/* Pick one CPU to be the preferred one to use */
-	smmu_pmu->on_cpu = smp_processor_id();
+	smmu_pmu->on_cpu = raw_smp_processor_id();
 
 	for (i = 0; i < smmu_pmu->num_irqs; ++i) {
 		WARN_ON(irq_set_affinity_hint(smmu_pmu->irqs[i],
@@ -847,14 +906,12 @@ out_unregister:
 	return err;
 }
 
-static int smmu_pmu_remove(struct platform_device *pdev)
+static void smmu_pmu_remove(struct platform_device *pdev)
 {
 	struct smmu_pmu *smmu_pmu = platform_get_drvdata(pdev);
 
 	perf_pmu_unregister(&smmu_pmu->pmu);
 	cpuhp_state_remove_instance_nocalls(cpuhp_state_num, &smmu_pmu->node);
-
-	return 0;
 }
 
 static void smmu_pmu_shutdown(struct platform_device *pdev)
@@ -898,4 +955,4 @@ static void __exit arm_smmu_pmu_exit(void)
 }
 
 module_exit(arm_smmu_pmu_exit);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

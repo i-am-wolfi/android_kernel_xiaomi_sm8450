@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #undef TRACE_SYSTEM
@@ -26,7 +27,7 @@ TRACE_EVENT(i2c_log_info,
 		),
 
 		TP_fast_assign(
-			__assign_str(name, name);
+			__assign_str(name);
 			WARN_ON_ONCE(vsnprintf(__get_dynamic_array(msg),
 									MAX_MSG_LEN, vaf->fmt,
 									*vaf->va) >= MAX_MSG_LEN);
@@ -42,5 +43,4 @@ TRACE_EVENT(i2c_log_info,
 #define TRACE_INCLUDE_PATH .
 #define TRACE_INCLUDE_FILE i2c-qup-trace
 #include <trace/define_trace.h>
-
 

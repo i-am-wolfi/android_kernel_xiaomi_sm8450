@@ -18,7 +18,6 @@
 
 /**
  * struct sensor_hub_data - Hold a instance data for a HID hub device
- * @hsdev:		Stored hid instance for current hub device.
  * @mutex:		Mutex to serialize synchronous request.
  * @lock:		Spin lock to protect pending request structure.
  * @dyn_callback_list:	Holds callback function
@@ -34,7 +33,6 @@ struct sensor_hub_data {
 	spinlock_t dyn_callback_lock;
 	struct mfd_cell *hid_sensor_hub_client_devs;
 	int hid_sensor_client_cnt;
-	unsigned long quirks;
 	int ref_cnt;
 };
 
@@ -42,6 +40,7 @@ struct sensor_hub_data {
  * struct hid_sensor_hub_callbacks_list - Stores callback list
  * @list:		list head.
  * @usage_id:		usage id for a physical device.
+ * @hsdev:		Stored hid instance for current hub device.
  * @usage_callback:	Stores registered callback functions.
  * @priv:		Private data for a physical device.
  */
@@ -287,54 +286,6 @@ done_proc:
 }
 EXPORT_SYMBOL_GPL(sensor_hub_get_feature);
 
-int sensor_hub_input_attr_read_values(struct hid_sensor_hub_device *hsdev,
-				      u32 usage_id, u32 attr_usage_id,
-				      u32 report_id,
-				      enum sensor_hub_read_flags flag,
-				      u32 buffer_size, u8 *buffer)
-{
-	struct sensor_hub_data *data = hid_get_drvdata(hsdev->hdev);
-	struct hid_report *report;
-	unsigned long flags;
-	long cycles;
-	int ret;
-
-	report = sensor_hub_report(report_id, hsdev->hdev, HID_INPUT_REPORT);
-	if (!report)
-		return -EINVAL;
-
-	mutex_lock(hsdev->mutex_ptr);
-	if (flag == SENSOR_HUB_SYNC) {
-		memset(&hsdev->pending, 0, sizeof(hsdev->pending));
-		init_completion(&hsdev->pending.ready);
-		hsdev->pending.usage_id = usage_id;
-		hsdev->pending.attr_usage_id = attr_usage_id;
-		hsdev->pending.max_raw_size = buffer_size;
-		hsdev->pending.raw_data = buffer;
-
-		spin_lock_irqsave(&data->lock, flags);
-		hsdev->pending.status = true;
-		spin_unlock_irqrestore(&data->lock, flags);
-	}
-	mutex_lock(&data->mutex);
-	hid_hw_request(hsdev->hdev, report, HID_REQ_GET_REPORT);
-	mutex_unlock(&data->mutex);
-	ret = 0;
-	if (flag == SENSOR_HUB_SYNC) {
-		cycles = wait_for_completion_interruptible_timeout(&hsdev->pending.ready,
-								   HZ * 5);
-		if (cycles == 0)
-			ret = -ETIMEDOUT;
-		else if (cycles < 0)
-			ret = cycles;
-
-		hsdev->pending.status = false;
-	}
-	mutex_unlock(hsdev->mutex_ptr);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(sensor_hub_input_attr_read_values);
 
 int sensor_hub_input_attr_get_raw_value(struct hid_sensor_hub_device *hsdev,
 					u32 usage_id,
@@ -446,7 +397,8 @@ int sensor_hub_input_get_attribute_info(struct hid_sensor_hub_device *hsdev,
 		for (i = 0; i < report->maxfield; ++i) {
 			field = report->field[i];
 			if (field->maxusage) {
-				if (field->physical == usage_id &&
+				if ((field->physical == usage_id ||
+				     field->application == usage_id) &&
 					(field->logical == attr_usage_id ||
 					field->usage[0].hid ==
 							attr_usage_id) &&
@@ -528,8 +480,6 @@ static int sensor_hub_raw_event(struct hid_device *hdev,
 	struct hid_collection *collection = NULL;
 	void *priv = NULL;
 	struct hid_sensor_hub_device *hsdev = NULL;
-	u32 copy_size;
-	u32 avail;
 
 	hid_dbg(hdev, "sensor_hub_raw_event report id:0x%x size:%d type:%d\n",
 			 report->id, size, report->type);
@@ -557,7 +507,8 @@ static int sensor_hub_raw_event(struct hid_device *hdev,
 					collection->usage);
 
 		callback = sensor_hub_get_callback(hdev,
-				report->field[i]->physical,
+				report->field[i]->physical ? report->field[i]->physical :
+							     report->field[i]->application,
 				report->field[i]->usage[0].collection_index,
 				&hsdev, &priv);
 		if (!callback) {
@@ -569,27 +520,12 @@ static int sensor_hub_raw_event(struct hid_device *hdev,
 					      hsdev->pending.attr_usage_id ==
 					      report->field[i]->logical)) {
 			hid_dbg(hdev, "data was pending ...\n");
-			if (hsdev->pending.max_raw_size) {
-				if (hsdev->pending.index < hsdev->pending.max_raw_size) {
-					avail = hsdev->pending.max_raw_size - hsdev->pending.index;
-					copy_size = clamp(sz, 0U, avail);
-
-					memcpy(hsdev->pending.raw_data + hsdev->pending.index,
-					       ptr, copy_size);
-					hsdev->pending.index += copy_size;
-					if (hsdev->pending.index >= hsdev->pending.max_raw_size) {
-						hsdev->pending.raw_size = hsdev->pending.index;
-						complete(&hsdev->pending.ready);
-					}
-				}
-			} else {
-				hsdev->pending.raw_data = kmemdup(ptr, sz, GFP_ATOMIC);
-				if (hsdev->pending.raw_data)
-					hsdev->pending.raw_size = sz;
-				else
-					hsdev->pending.raw_size = 0;
-				complete(&hsdev->pending.ready);
-			}
+			hsdev->pending.raw_data = kmemdup(ptr, sz, GFP_ATOMIC);
+			if (hsdev->pending.raw_data)
+				hsdev->pending.raw_size = sz;
+			else
+				hsdev->pending.raw_size = 0;
+			complete(&hsdev->pending.ready);
 		}
 		if (callback->capture_sample) {
 			if (report->field[i]->logical)
@@ -644,7 +580,7 @@ void sensor_hub_device_close(struct hid_sensor_hub_device *hsdev)
 }
 EXPORT_SYMBOL_GPL(sensor_hub_device_close);
 
-static __u8 *sensor_hub_report_fixup(struct hid_device *hdev, __u8 *rdesc,
+static const __u8 *sensor_hub_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 		unsigned int *rsize)
 {
 	/*
@@ -685,7 +621,6 @@ static int sensor_hub_probe(struct hid_device *hdev,
 	}
 
 	hid_set_drvdata(hdev, sd);
-	sd->quirks = id->driver_data;
 
 	spin_lock_init(&sd->lock);
 	spin_lock_init(&sd->dyn_callback_lock);
@@ -697,7 +632,7 @@ static int sensor_hub_probe(struct hid_device *hdev,
 	}
 	INIT_LIST_HEAD(&hdev->inputs);
 
-	ret = hid_hw_start(hdev, 0);
+	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT | HID_CONNECT_DRIVER);
 	if (ret) {
 		hid_err(hdev, "hw start failed\n");
 		return ret;

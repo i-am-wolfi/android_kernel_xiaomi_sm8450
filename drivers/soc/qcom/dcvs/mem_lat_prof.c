@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/debugfs.h>
@@ -11,17 +11,16 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
-#include <linux/qcom_scm.h>
+#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/qtee_shmbridge.h>
 #include <linux/slab.h>
-#include <soc/qcom/smci_object.h>
-#include <linux/smcinvoke.h>
-#include <soc/qcom/smci_clientenv.h>
+#include <linux/firmware/qcom/si_object.h>
 #include "smci_mem_lat.h"
 #include "trace-bus-prof.h"
 
 #define SAMPLE_MS	10
 #define MAGIC (0x01CB)
+#define DEFAULT_MAX_MASTERS 3
 
 #ifndef UINT32_C
 #define UINT32_C(x) ((uint32_t)(x))
@@ -34,13 +33,6 @@ enum cmd {
 	MEM_LAT_LAST_ID = 0x7FFFFFFF
 };
 
-#define CPU_BIT_SHIFT 0
-#define GPU_BIT_SHIFT 1
-#define NSP_BIT_SHIFT 2
-
-#define CPU_PROFILING_ENABLED	BIT(CPU_BIT_SHIFT)
-#define GPU_PROFILING_ENABLED	BIT(GPU_BIT_SHIFT)
-#define NSP_PROFILING_ENABLED	BIT(NPU_BIT_SHIFT)
 #define MEM_LATENCY_FEATURE_ID 2106
 
 enum error {
@@ -60,14 +52,15 @@ enum bus_lat_masters {
 	CPU = 0,
 	GPU,
 	NSP,
-	MAX_MASTER,
+	PCIE,
+	MAX_MASTERS,
 };
 
 struct mem_lat_data {
 	u64	qtime;
 	enum	error	err;
 	u16	magic;
-	u32	histbin[MAX_MASTER][8];
+	u32	histbin[MAX_MASTERS][8];
 } __packed;
 
 
@@ -99,7 +92,7 @@ union mem_lat_req {
 	struct mem_lat_stop_req stop_req;
 } __packed;
 
-struct mem_lat_cmd_buf {
+struct mem_cmd_buf {
 	union		mem_lat_req lat_req;
 	struct		mem_lat_rsp lat_resp;
 	u32		req_size;
@@ -127,12 +120,13 @@ struct bus_lat_dev_data {
 	u32			available_masters;
 	struct mutex		lock;
 	struct mem_lat_data	*data;
-	struct master_data	mdata[MAX_MASTER];
+	struct master_data	mdata[MAX_MASTERS];
 };
 
 static struct dentry *bus_lat_dir;
-static char *master_names[MAX_MASTER] = {"CPU", "GPU", "NSP"};
+static char *master_names[MAX_MASTERS] = {"CPU", "GPU", "NSP", "PCIE"};
 static struct bus_lat_dev_data *bus_lat;
+static u32 max_masters = DEFAULT_MAX_MASTERS;
 
 static ssize_t get_last_samples(struct file *file, char __user *user_buf,
 			     size_t count, loff_t *ppos)
@@ -147,7 +141,7 @@ static ssize_t get_last_samples(struct file *file, char __user *user_buf,
 	}
 
 	master_name = file->private_data;
-	for (m_idx = 0; m_idx < MAX_MASTER; m_idx++) {
+	for (m_idx = 0; m_idx < max_masters; m_idx++) {
 		if (!strcasecmp(master_names[m_idx], master_name))
 			break;
 	}
@@ -194,9 +188,9 @@ static int memory_lat_profiling_command(const void *req)
 
 	if (!req)
 		return -EINVAL;
-	rsp = &((struct mem_lat_cmd_buf *)req)->lat_resp;
+	rsp = &((struct mem_cmd_buf *)req)->lat_resp;
 	rsp_size = sizeof(struct mem_lat_rsp);
-	req_size = ((struct mem_lat_cmd_buf *)req)->req_size;
+	req_size = ((struct mem_cmd_buf *)req)->req_size;
 	qseos_cmd_id = *(u32 *)req;
 	ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(req_size + rsp_size), &shm);
 
@@ -209,9 +203,9 @@ static int memory_lat_profiling_command(const void *req)
 	memcpy(shm.vaddr, req, req_size);
 	qtee_shmbridge_flush_shm_buf(&shm);
 	switch (qseos_cmd_id) {
-	case MEM_LAT_START_PROFILING:
-	case MEM_LAT_GET_DATA:
-	case MEM_LAT_STOP_PROFILING:
+	case	MEM_LAT_START_PROFILING:
+	case	MEM_LAT_GET_DATA:
+	case	MEM_LAT_STOP_PROFILING:
 		/* Send the command to TZ */
 		ret = qcom_scm_memory_lat_profiler(shm.paddr, req_size,
 						shm.paddr + req_size, rsp_size);
@@ -239,24 +233,27 @@ out:
 static int start_memory_lat_stats(void)
 {
 	int ret = 0;
-	struct mem_lat_cmd_buf *mem_lat_cmd_buf = NULL;
+	struct mem_cmd_buf *mem_cmd_buf = NULL;
 
-	mem_lat_cmd_buf = kzalloc(sizeof(*mem_lat_cmd_buf), GFP_KERNEL);
-	if (!mem_lat_cmd_buf)
+	mem_cmd_buf = kzalloc(sizeof(*mem_cmd_buf), GFP_KERNEL);
+
+	if (!mem_cmd_buf)
 		return -ENOMEM;
-	mem_lat_cmd_buf->lat_req.start_req.cmd_id = MEM_LAT_START_PROFILING;
-	mem_lat_cmd_buf->lat_req.start_req.active_masters = bus_lat->active_masters;
-	mem_lat_cmd_buf->req_size = sizeof(struct mem_lat_start_req);
-	ret = memory_lat_profiling_command(mem_lat_cmd_buf);
+
+	mem_cmd_buf->lat_req.start_req.cmd_id = MEM_LAT_START_PROFILING;
+	mem_cmd_buf->lat_req.start_req.active_masters = bus_lat->active_masters;
+	mem_cmd_buf->req_size = sizeof(struct mem_lat_start_req);
+	ret = memory_lat_profiling_command(mem_cmd_buf);
+
 	if (ret) {
-		pr_err("Error in %s, ret = %d\n", __func__, ret);
+		pr_err("Error starting memory latency stats, ret = %d\n", ret);
 		goto out;
 	}
 	if (!hrtimer_active(&bus_lat->hrtimer))
 		hrtimer_start(&bus_lat->hrtimer,
 				ms_to_ktime(SAMPLE_MS), HRTIMER_MODE_REL_PINNED);
 out:
-	kfree(mem_lat_cmd_buf);
+	kfree(mem_cmd_buf);
 
 	return ret;
 }
@@ -264,21 +261,23 @@ out:
 static int stop_memory_lat_stats(void)
 {
 	int ret;
-	struct mem_lat_cmd_buf *mem_lat_cmd_buf = NULL;
+	struct mem_cmd_buf *mem_cmd_buf = NULL;
 
 	hrtimer_cancel(&bus_lat->hrtimer);
 	cancel_work_sync(&bus_lat->work);
-	mem_lat_cmd_buf = kzalloc(sizeof(*mem_lat_cmd_buf), GFP_KERNEL);
-	if (!mem_lat_cmd_buf)
+	mem_cmd_buf = kzalloc(sizeof(*mem_cmd_buf), GFP_KERNEL);
+
+	if (!mem_cmd_buf)
 		return -ENOMEM;
 
-	mem_lat_cmd_buf->lat_req.stop_req.cmd_id = MEM_LAT_STOP_PROFILING;
-	mem_lat_cmd_buf->req_size = sizeof(struct mem_lat_stop_req);
-	ret = memory_lat_profiling_command(mem_lat_cmd_buf);
-	if (ret)
-		pr_err("Error in %s, ret = %d\n", __func__, ret);
+	mem_cmd_buf->lat_req.stop_req.cmd_id = MEM_LAT_STOP_PROFILING;
+	mem_cmd_buf->req_size = sizeof(struct mem_lat_stop_req);
+	ret = memory_lat_profiling_command(mem_cmd_buf);
 
-	kfree(mem_lat_cmd_buf);
+	if (ret)
+		pr_err("Error stopping memory latency stats, ret = %d\n", ret);
+
+	kfree(mem_cmd_buf);
 
 	return 0;
 }
@@ -288,29 +287,27 @@ static int set_mon_enabled(void *data, u64 val)
 	u32 count, enable = val ? 1 : 0;
 	char *master_name = data;
 	int i, ret = 0;
-	struct smci_object mem_lat_env = {NULL, NULL};
-	struct smci_object mem_lat_profiler = {NULL, NULL};
+	struct si_object *mem_lat_env, *mem_lat_profiler = NULL;
+	static struct si_object_invoke_ctx oic;
 
-	ret = get_client_env_object(&mem_lat_env);
+	ret = si_core_get_client_env(&oic, &mem_lat_env);
 	if (ret) {
-		mem_lat_env.invoke = NULL;
-		mem_lat_env.context = NULL;
+		mem_lat_env = NULL;
 		pr_err("mem_lat_profiler: get client env object failed\n");
 		ret =  -EIO;
 		goto end;
 	}
 
-	ret = smci_clientenv_open(mem_lat_env, SMCI_MEM_LAT_PROFILER_SERVICE_UID,
+	ret = si_core_client_env_open(&oic, mem_lat_env, SMCI_MEM_LAT_PROFILER_SERVICE_UID,
 			&mem_lat_profiler);
 	if (ret) {
-		mem_lat_profiler.invoke = NULL;
-		mem_lat_profiler.context = NULL;
+		mem_lat_profiler = NULL;
 		pr_err("mem_lat_profiler: smci client env open failed\n");
 		ret = -EIO;
 		goto end;
 	}
 
-	ret = smci_mem_lat_profiler_check_license_status(mem_lat_profiler,
+	ret = smci_mem_lat_profiler_check_license_status(&oic, mem_lat_profiler,
 			MEM_LATENCY_FEATURE_ID, NULL, 0);
 	if (ret) {
 		pr_err("mem_lat_profiler: smci_mem_lat_profiler_check_license_status failed\n");
@@ -319,27 +316,31 @@ static int set_mon_enabled(void *data, u64 val)
 	}
 
 	mutex_lock(&bus_lat->lock);
-	for (i = 0; i < MAX_MASTER; i++) {
+
+	for (i = 0; i < max_masters; i++) {
 		if (!strcasecmp(master_names[i], master_name))
 			break;
 	}
 
-	if (enable == (bus_lat->active_masters & BIT(i)))
+	if (enable == !!(bus_lat->active_masters & BIT(i)))
 		goto unlock;
 
 	count = hweight32(bus_lat->active_masters);
-	if (count >= MAX_MASTER && enable) {
+
+	if (count >= max_masters && enable) {
 		pr_err("Max masters already enabled\n");
 		ret = -EINVAL;
 		goto unlock;
 	}
 
 	mutex_unlock(&bus_lat->lock);
+
 	if (count)
 		stop_memory_lat_stats();
 
 	mutex_lock(&bus_lat->lock);
 	bus_lat->active_masters = (bus_lat->active_masters ^ BIT(i));
+
 	if (bus_lat->active_masters)
 		start_memory_lat_stats();
 	ret = 0;
@@ -348,8 +349,8 @@ unlock:
 	mutex_unlock(&bus_lat->lock);
 	return ret;
 end:
-	SMCI_OBJECT_ASSIGN_NULL(mem_lat_profiler);
-	SMCI_OBJECT_ASSIGN_NULL(mem_lat_env);
+	put_si_object(mem_lat_profiler);
+	put_si_object(mem_lat_env);
 	return ret;
 }
 
@@ -359,7 +360,8 @@ static int get_mon_enabled(void *data, u64 *val)
 	int i;
 
 	mutex_lock(&bus_lat->lock);
-	for (i = 0; i < MAX_MASTER; i++) {
+
+	for (i = 0; i < max_masters; i++) {
 		if (!strcasecmp(master_names[i], master_name))
 			break;
 	}
@@ -368,6 +370,7 @@ static int get_mon_enabled(void *data, u64 *val)
 		*val = 1;
 	else
 		*val = 0;
+
 	mutex_unlock(&bus_lat->lock);
 
 	return 0;
@@ -384,13 +387,13 @@ static const struct file_operations show_last_samples_ops = {
 static void bus_lat_update_work(struct work_struct *work)
 {
 	const int bufsize = sizeof(struct mem_lat_data);
-	struct mem_lat_cmd_buf *mem_lat_cmd_buf;
+	struct mem_cmd_buf *mem_cmd_buf;
 	struct qtee_shm buf_shm = {0};
 	int ret, i, j;
 	u16 magic;
 
-	mem_lat_cmd_buf = kzalloc(sizeof(*mem_lat_cmd_buf), GFP_KERNEL);
-	if (!mem_lat_cmd_buf)
+	mem_cmd_buf = kzalloc(sizeof(*mem_cmd_buf), GFP_KERNEL);
+	if (!mem_cmd_buf)
 		return;
 
 	ret = qtee_shmbridge_allocate_shm(PAGE_ALIGN(bufsize), &buf_shm);
@@ -399,13 +402,13 @@ static void bus_lat_update_work(struct work_struct *work)
 		return;
 	}
 
-	mem_lat_cmd_buf->lat_req.get_req.cmd_id = MEM_LAT_GET_DATA;
-	mem_lat_cmd_buf->lat_req.get_req.buf_ptr = (u8 *)buf_shm.paddr;
-	mem_lat_cmd_buf->lat_req.get_req.buf_size = bufsize;
-	mem_lat_cmd_buf->lat_req.get_req.type = 1;
-	mem_lat_cmd_buf->req_size = sizeof(struct mem_lat_get_req);
+	mem_cmd_buf->lat_req.get_req.cmd_id = MEM_LAT_GET_DATA;
+	mem_cmd_buf->lat_req.get_req.buf_ptr = (u8 *)buf_shm.paddr;
+	mem_cmd_buf->lat_req.get_req.buf_size = bufsize;
+	mem_cmd_buf->lat_req.get_req.type = 1;
+	mem_cmd_buf->req_size = sizeof(struct mem_lat_get_req);
 	qtee_shmbridge_flush_shm_buf(&buf_shm);
-	ret = memory_lat_profiling_command(mem_lat_cmd_buf);
+	ret = memory_lat_profiling_command(mem_cmd_buf);
 	if (ret) {
 		pr_err("memory_lat_profiling_command failed\n");
 		goto err;
@@ -420,7 +423,12 @@ static void bus_lat_update_work(struct work_struct *work)
 	}
 
 	mutex_lock(&bus_lat->lock);
-	for (i = 0; i < MAX_MASTER; i++) {
+
+	/*
+	 * For all the max masters update the unread samples and populate in
+	 * the memory latency profiling data structure.
+	 */
+	for (i = 0; i < max_masters; i++) {
 		bus_lat->mdata[i].lat_data[bus_lat->mdata[i].curr_idx].ts = bus_lat->data->qtime;
 		for (j = 0; j < 8; j++)
 			bus_lat->mdata[i].lat_data[bus_lat->mdata[i].curr_idx].histbin[j]
@@ -430,17 +438,19 @@ static void bus_lat_update_work(struct work_struct *work)
 		bus_lat->mdata[i].curr_idx =
 					(bus_lat->mdata[i].curr_idx + 1) % bus_lat->max_samples;
 	}
-	for (i = 0; i < MAX_MASTER; i++) {
+
+	for (i = 0; i < max_masters; i++) {
 		if (!(bus_lat->active_masters & BIT(i)))
 			continue;
 		trace_memory_lat_last_sample(bus_lat->data->qtime, i,
 			bus_lat->data->histbin[i]);
 	}
+
 	mutex_unlock(&bus_lat->lock);
 
 err:
 	qtee_shmbridge_free_shm(&buf_shm);
-	kfree(mem_lat_cmd_buf);
+	kfree(mem_cmd_buf);
 }
 
 static enum hrtimer_restart hrtimer_handler(struct hrtimer *timer)
@@ -464,18 +474,20 @@ static int bus_lat_create_fs_entries(void)
 		return PTR_ERR(bus_lat_dir);
 	}
 
-	for (i = 0; i < MAX_MASTER; i++) {
+	for (i = 0; i < max_masters; i++) {
 		master_dir = debugfs_create_dir(master_names[i], bus_lat_dir);
 		if (IS_ERR(master_dir)) {
 			pr_err("Debugfs directory creation failed for %s\n", master_names[i]);
 			goto cleanup;
 		}
+
 		ret = debugfs_create_file("show_last_samples", 0400, master_dir,
 						master_names[i], &show_last_samples_ops);
 		if (IS_ERR(ret)) {
 			pr_err("Debugfs file creation failed for show_last_samples\n");
 			goto cleanup;
 		}
+
 		ret = debugfs_create_file("enable", 0644, master_dir,
 						master_names[i], &set_mon_enabled_ops);
 		if (IS_ERR(ret)) {
@@ -496,27 +508,56 @@ cleanup:
 static int __init qcom_bus_lat_init(void)
 {
 	int i, j, ret = 0;
+	struct device_node *np;
+	u32 temp;
 
 	bus_lat =  kzalloc(sizeof(*bus_lat), GFP_KERNEL);
+
 	if (!bus_lat)
 		return -ENOMEM;
+
 	bus_lat->data = kzalloc(sizeof(struct mem_lat_data), GFP_KERNEL);
 	if (!bus_lat->data) {
 		kfree(bus_lat);
 		return -ENOMEM;
 	}
-	for (i = 0; i < MAX_MASTER; i++)
+
+	np = of_find_node_by_path("/soc/qcom-dcvs-prof");
+
+	if (!np) {
+		pr_debug("mem_lat_prof: Device node not found, defaulting max_masters to %u\n",
+				max_masters);
+	} else {
+		if (of_property_read_u32(np, "max_masters", &temp)) {
+			pr_debug("mem_lat_prof: Failed to read max_masters, defaulting max_masters to %u\n",
+				max_masters);
+		} else {
+			if (temp > MAX_MASTERS || temp < 1) {
+				pr_err("mem_lat_prof: Invalid max_masters value initialized %u (must be 1-%d)\n",
+						temp, MAX_MASTERS);
+				of_node_put(np);
+				goto err;
+			}
+			max_masters = temp;
+		}
+		of_node_put(np);
+	}
+
+	for (i = 0; i < max_masters; i++)
 		bus_lat->available_masters |= BIT(i);
+
 	ret =  bus_lat_create_fs_entries();
 	if (ret < 0)
 		goto err;
+
 	/*
 	 * to get no of hex char in a line multiplying size of struct lat_sample by 2
 	 * and adding 8 for tabs and 1 for new line.
 	 */
 	bus_lat->size_of_line = sizeof(struct lat_sample) * 2 + 9;
 	bus_lat->max_samples = PAGE_SIZE / bus_lat->size_of_line;
-	for (i = 0; i < MAX_MASTER ; i++) {
+
+	for (i = 0; i < max_masters; i++) {
 		bus_lat->mdata[i].lat_data = kcalloc(bus_lat->max_samples,
 				sizeof(struct lat_sample), GFP_KERNEL);
 		if (!bus_lat->mdata[i].lat_data) {
@@ -524,17 +565,18 @@ static int __init qcom_bus_lat_init(void)
 			goto debugfs_file_err;
 		}
 	}
+
 	mutex_init(&bus_lat->lock);
 	hrtimer_init(&bus_lat->hrtimer, CLOCK_MONOTONIC,
 				HRTIMER_MODE_REL);
 	bus_lat->hrtimer.function = hrtimer_handler;
-
 	bus_lat->wq = create_freezable_workqueue("bus_lat_wq");
 	if (!bus_lat->wq) {
 		pr_err("Couldn't create bus_lat workqueue.\n");
 		ret = -ENOMEM;
 		goto debugfs_file_err;
 	}
+
 	INIT_WORK(&bus_lat->work, &bus_lat_update_work);
 
 	return ret;
@@ -551,5 +593,5 @@ err:
 
 module_init(qcom_bus_lat_init);
 
-MODULE_DESCRIPTION("QCOM BUS_LAT driver");
+MODULE_DESCRIPTION("Qualcomm Technologies, Inc. BUS_LAT driver");
 MODULE_LICENSE("GPL");

@@ -334,7 +334,7 @@ static const struct spi_device_id ad7606_id_table[] = {
 	{ "ad7606-8", ID_AD7606_8 },
 	{ "ad7606b",  ID_AD7606B },
 	{ "ad7616",   ID_AD7616 },
-	{}
+	{ }
 };
 MODULE_DEVICE_TABLE(spi, ad7606_id_table);
 
@@ -345,7 +345,7 @@ static const struct of_device_id ad7606_of_match[] = {
 	{ .compatible = "adi,ad7606-8" },
 	{ .compatible = "adi,ad7606b" },
 	{ .compatible = "adi,ad7616" },
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, ad7606_of_match);
 
@@ -363,3 +363,4 @@ module_spi_driver(ad7606_driver);
 MODULE_AUTHOR("Michael Hennerich <michael.hennerich@analog.com>");
 MODULE_DESCRIPTION("Analog Devices AD7606 ADC");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(IIO_AD7606);

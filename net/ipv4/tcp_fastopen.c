@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <linux/crypto.h>
-#include <linux/err.h>
-#include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/list.h>
 #include <linux/tcp.h>
 #include <linux/rcupdate.h>
-#include <linux/rculist.h>
-#include <net/inetpeer.h>
 #include <net/tcp.h>
+#include <net/busy_poll.h>
 
 void tcp_fastopen_init_key_once(struct net *net)
 {
@@ -55,12 +50,7 @@ void tcp_fastopen_ctx_destroy(struct net *net)
 {
 	struct tcp_fastopen_context *ctxt;
 
-	spin_lock(&net->ipv4.tcp_fastopen_ctx_lock);
-
-	ctxt = rcu_dereference_protected(net->ipv4.tcp_fastopen_ctx,
-				lockdep_is_held(&net->ipv4.tcp_fastopen_ctx_lock));
-	rcu_assign_pointer(net->ipv4.tcp_fastopen_ctx, NULL);
-	spin_unlock(&net->ipv4.tcp_fastopen_ctx_lock);
+	ctxt = unrcu_pointer(xchg(&net->ipv4.tcp_fastopen_ctx, NULL));
 
 	if (ctxt)
 		call_rcu(&ctxt->rcu, tcp_fastopen_ctx_free);
@@ -89,18 +79,13 @@ int tcp_fastopen_reset_cipher(struct net *net, struct sock *sk,
 		ctx->num = 1;
 	}
 
-	spin_lock(&net->ipv4.tcp_fastopen_ctx_lock);
 	if (sk) {
 		q = &inet_csk(sk)->icsk_accept_queue.fastopenq;
-		octx = rcu_dereference_protected(q->ctx,
-			lockdep_is_held(&net->ipv4.tcp_fastopen_ctx_lock));
-		rcu_assign_pointer(q->ctx, ctx);
+		octx = unrcu_pointer(xchg(&q->ctx, RCU_INITIALIZER(ctx)));
 	} else {
-		octx = rcu_dereference_protected(net->ipv4.tcp_fastopen_ctx,
-			lockdep_is_held(&net->ipv4.tcp_fastopen_ctx_lock));
-		rcu_assign_pointer(net->ipv4.tcp_fastopen_ctx, ctx);
+		octx = unrcu_pointer(xchg(&net->ipv4.tcp_fastopen_ctx,
+					  RCU_INITIALIZER(ctx)));
 	}
-	spin_unlock(&net->ipv4.tcp_fastopen_ctx_lock);
 
 	if (octx)
 		call_rcu(&octx->rcu, tcp_fastopen_ctx_free);
@@ -194,7 +179,7 @@ void tcp_fastopen_add_skb(struct sock *sk, struct sk_buff *skb)
 	if (!skb)
 		return;
 
-	skb_dst_drop(skb);
+	tcp_cleanup_skb(skb);
 	/* segs_in has been initialized to 1 in tcp_create_openreq_child().
 	 * Hence, reset segs_in to 0 before calling tcp_segs_in()
 	 * to avoid double counting.  Also, tcp_segs_in() expects
@@ -211,7 +196,7 @@ void tcp_fastopen_add_skb(struct sock *sk, struct sk_buff *skb)
 	TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_SYN;
 
 	tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
-	__skb_queue_tail(&sk->sk_receive_queue, skb);
+	tcp_add_receive_queue(sk, skb);
 	tp->syn_data_acked = 1;
 
 	/* u64_stats_update_begin(&tp->syncp) not needed here,
@@ -289,10 +274,13 @@ static struct sock *tcp_fastopen_create_child(struct sock *sk,
 	 * The request socket is not added to the ehash
 	 * because it's been added to the accept queue directly.
 	 */
+	req->timeout = tcp_timeout_init(child);
 	inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
-				  TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+				  req->timeout, TCP_RTO_MAX);
 
 	refcount_set(&req->rsk_refcnt, 2);
+
+	sk_mark_napi_id_set(child, skb);
 
 	/* Now finish processing the fastopen child socket. */
 	tcp_init_transfer(child, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB, skb);
@@ -467,7 +455,7 @@ bool tcp_fastopen_defer_connect(struct sock *sk, int *err)
 
 	if (tp->fastopen_connect && !tp->fastopen_req) {
 		if (tcp_fastopen_cookie_check(sk, &mss, &cookie)) {
-			inet_sk(sk)->defer_connect = 1;
+			inet_set_bit(DEFER_CONNECT, sk);
 			return true;
 		}
 
@@ -545,7 +533,7 @@ bool tcp_fastopen_active_should_disable(struct sock *sk)
 	/* Paired with smp_mb__before_atomic() in tcp_fastopen_active_disable() */
 	smp_rmb();
 
-	/* Limit timout to max: 2^6 * initial timeout */
+	/* Limit timeout to max: 2^6 * initial timeout */
 	multiplier = 1 << min(tfo_da_times - 1, 6);
 
 	/* Paired with the WRITE_ONCE() in tcp_fastopen_active_disable(). */
@@ -570,6 +558,7 @@ bool tcp_fastopen_active_should_disable(struct sock *sk)
 void tcp_fastopen_active_disable_ofo_check(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
+	struct net_device *dev;
 	struct dst_entry *dst;
 	struct sk_buff *skb;
 
@@ -586,10 +575,12 @@ void tcp_fastopen_active_disable_ofo_check(struct sock *sk)
 		}
 	} else if (tp->syn_fastopen_ch &&
 		   atomic_read(&sock_net(sk)->ipv4.tfo_active_disable_times)) {
-		dst = sk_dst_get(sk);
-		if (!(dst && dst->dev && (dst->dev->flags & IFF_LOOPBACK)))
+		rcu_read_lock();
+		dst = __sk_dst_get(sk);
+		dev = dst ? dst_dev_rcu(dst) : NULL;
+		if (!(dev && (dev->flags & IFF_LOOPBACK)))
 			atomic_set(&sock_net(sk)->ipv4.tfo_active_disable_times, 0);
-		dst_release(dst);
+		rcu_read_unlock();
 	}
 }
 

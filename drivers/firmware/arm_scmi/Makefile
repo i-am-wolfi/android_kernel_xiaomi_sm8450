@@ -1,19 +1,22 @@
-# SPDX-License-Identifier: GPL-2.0-only
+# SPDX-License-Identifier: GPL-2.0
+
+ccflags-y += -I$(src)
+
+obj-$(CONFIG_QTI_SCMI_VENDOR_PROTOCOL) += qcom_scmi_vendor.o
+
+
+# --- marble: objs upstream restaurados ---
 scmi-bus-y = bus.o
+scmi-core-objs := $(scmi-bus-y)
 scmi-driver-y = driver.o notify.o
-scmi-transport-y = shmem.o
-scmi-transport-$(CONFIG_MAILBOX) += mailbox.o
-scmi-transport-$(CONFIG_HAVE_ARM_SMCCC_DISCOVERY) += smc.o
-scmi-protocols-y = base.o clock.o perf.o power.o reset.o sensors.o system.o voltage.o
-scmi-module-objs := $(scmi-bus-y) $(scmi-driver-y) $(scmi-protocols-y) \
-		    $(scmi-transport-y)
+scmi-driver-$(CONFIG_ARM_SCMI_RAW_MODE_SUPPORT) += raw_mode.o
+scmi-transport-$(CONFIG_ARM_SCMI_HAVE_SHMEM) = shmem.o
+scmi-transport-$(CONFIG_ARM_SCMI_HAVE_MSG) += msg.o
+scmi-protocols-y := base.o clock.o perf.o power.o reset.o sensors.o system.o voltage.o powercap.o
+scmi-protocols-y += pinctrl.o
+scmi-module-objs := $(scmi-driver-y) $(scmi-protocols-y) $(scmi-transport-y)
+obj-$(CONFIG_ARM_SCMI_PROTOCOL) += transports/
+obj-$(CONFIG_ARM_SCMI_PROTOCOL) += vendors/imx/
+obj-$(CONFIG_ARM_SCMI_PROTOCOL) += scmi-core.o
 obj-$(CONFIG_ARM_SCMI_PROTOCOL) += scmi-module.o
-obj-$(CONFIG_ARM_SCMI_POWER_DOMAIN) += scmi_pm_domain.o
-obj-$(CONFIG_QTI_SCMI_PMU_PROTOCOL) += pmu_vendor.o
-obj-$(CONFIG_QTI_SCMI_C1DCVS_PROTOCOL) += c1dcvs_vendor.o
-obj-$(CONFIG_QTI_SCMI_PLH_PROTOCOL) += plh_vendor.o
-obj-$(CONFIG_QTI_SCMI_MEMLAT_PROTOCOL) += memlat_vendor.o
-obj-$(CONFIG_QTI_SCMI_BWPROF_PROTOCOL) += bwprof_vendor.o
-obj-$(CONFIG_QTI_SCMI_GPLAF_PROTOCOL) += gplaf_vendor.o
-obj-$(CONFIG_QTI_SCMI_CPUFREQ_STATS_PROTOCOL) += cpufreq_stats_vendor.o
-obj-$(CONFIG_QTI_SCMI_SHARED_RAIL_PROTOCOL) += shared_rail_vendor.o
+obj-$(CONFIG_ARM_SCMI_POWER_CONTROL) += scmi_power_control.o

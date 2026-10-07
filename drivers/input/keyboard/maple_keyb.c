@@ -154,7 +154,7 @@ static int probe_maple_kbd(struct device *dev)
 	mdev = to_maple_dev(dev);
 	mdrv = to_maple_driver(dev->driver);
 
-	kbd = kzalloc(sizeof(struct dc_kbd), GFP_KERNEL);
+	kbd = kzalloc(sizeof(*kbd), GFP_KERNEL);
 	if (!kbd) {
 		error = -ENOMEM;
 		goto fail;
@@ -168,8 +168,6 @@ static int probe_maple_kbd(struct device *dev)
 
 	kbd->dev = idev;
 	memcpy(kbd->keycode, dc_kbd_keycode, sizeof(kbd->keycode));
-
-	maple_set_drvdata(mdev, kbd);
 
 	idev->name = mdev->product_name;
 	idev->evbit[0] = BIT(EV_KEY) | BIT(EV_REP);
@@ -194,6 +192,8 @@ static int probe_maple_kbd(struct device *dev)
 		MAPLE_FUNC_KEYBOARD);
 
 	mdev->driver = mdrv;
+
+	maple_set_drvdata(mdev, kbd);
 
 	return error;
 

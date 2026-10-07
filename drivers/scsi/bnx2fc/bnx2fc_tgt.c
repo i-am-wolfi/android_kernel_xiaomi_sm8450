@@ -128,10 +128,8 @@ retry_ofld:
 			BNX2FC_TGT_DBG(tgt, "ctx_alloc_failure, "
 				"retry ofld..%d\n", i++);
 			msleep_interruptible(1000);
-			if (i > 3) {
-				i = 0;
+			if (i > 3)
 				goto ofld_err;
-			}
 			goto retry_ofld;
 		}
 		goto ofld_err;
@@ -482,7 +480,7 @@ void bnx2fc_rport_event_handler(struct fc_lport *lport,
 		}
 
 		/*
-		 * Offlaod process is protected with hba mutex.
+		 * Offload process is protected with hba mutex.
 		 * Use the same mutex_lock for upload process too
 		 */
 		mutex_lock(&hba->hba_mutex);
@@ -819,7 +817,7 @@ mem_alloc_failure:
 }
 
 /**
- * bnx2i_free_session_resc - free qp resources for the session
+ * bnx2fc_free_session_resc - free qp resources for the session
  *
  * @hba:	adapter structure pointer
  * @tgt:	bnx2fc_rport structure pointer

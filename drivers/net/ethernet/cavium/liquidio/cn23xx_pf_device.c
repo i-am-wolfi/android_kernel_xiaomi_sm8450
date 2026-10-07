@@ -719,11 +719,9 @@ static int cn23xx_setup_pf_mbox(struct octeon_device *oct)
 	for (i = 0; i < oct->sriov_info.max_vfs; i++) {
 		q_no = i * oct->sriov_info.rings_per_vf;
 
-		mbox = vmalloc(sizeof(*mbox));
+		mbox = vzalloc(sizeof(*mbox));
 		if (!mbox)
 			goto free_mbox;
-
-		memset(mbox, 0, sizeof(struct octeon_mbox));
 
 		spin_lock_init(&mbox->lock);
 
@@ -1334,14 +1332,18 @@ int setup_cn23xx_octeon_pf_device(struct octeon_device *oct)
 	if (octeon_map_pci_barx(oct, 1, MAX_BAR1_IOREMAP_SIZE)) {
 		dev_err(&oct->pci_dev->dev, "%s CN23XX BAR1 map failed\n",
 			__func__);
-		goto err_unmap_bar0;
+		octeon_unmap_pci_barx(oct, 0);
+		return 1;
 	}
 
 	if (cn23xx_get_pf_num(oct) != 0)
-		goto err_unmap_bar1;
+		return 1;
 
-	if (cn23xx_sriov_config(oct))
-		goto err_unmap_bar1;
+	if (cn23xx_sriov_config(oct)) {
+		octeon_unmap_pci_barx(oct, 0);
+		octeon_unmap_pci_barx(oct, 1);
+		return 1;
+	}
 
 	octeon_write_csr64(oct, CN23XX_SLI_MAC_CREDIT_CNT, 0x3F802080802080ULL);
 
@@ -1372,13 +1374,8 @@ int setup_cn23xx_octeon_pf_device(struct octeon_device *oct)
 	oct->coproc_clock_rate = 1000000ULL * cn23xx_coprocessor_clock(oct);
 
 	return 0;
-
-err_unmap_bar1:
-	octeon_unmap_pci_barx(oct, 1);
-err_unmap_bar0:
-	octeon_unmap_pci_barx(oct, 0);
-	return 1;
 }
+EXPORT_SYMBOL_GPL(setup_cn23xx_octeon_pf_device);
 
 int validate_cn23xx_pf_config_info(struct octeon_device *oct,
 				   struct octeon_config *conf23xx)
@@ -1437,6 +1434,7 @@ int cn23xx_fw_loaded(struct octeon_device *oct)
 	val = octeon_read_csr64(oct, CN23XX_SLI_SCRATCH2);
 	return (val >> SCR2_BIT_FW_LOADED) & 1ULL;
 }
+EXPORT_SYMBOL_GPL(cn23xx_fw_loaded);
 
 void cn23xx_tell_vf_its_macaddr_changed(struct octeon_device *oct, int vfidx,
 					u8 *mac)
@@ -1458,6 +1456,7 @@ void cn23xx_tell_vf_its_macaddr_changed(struct octeon_device *oct, int vfidx,
 		octeon_mbox_write(oct, &mbox_cmd);
 	}
 }
+EXPORT_SYMBOL_GPL(cn23xx_tell_vf_its_macaddr_changed);
 
 static void
 cn23xx_get_vf_stats_callback(struct octeon_device *oct,
@@ -1491,7 +1490,7 @@ int cn23xx_get_vf_stats(struct octeon_device *oct, int vfidx,
 	mbox_cmd.q_no = vfidx * oct->sriov_info.rings_per_vf;
 	mbox_cmd.recv_len = 0;
 	mbox_cmd.recv_status = 0;
-	mbox_cmd.fn = (octeon_mbox_callback_t)cn23xx_get_vf_stats_callback;
+	mbox_cmd.fn = cn23xx_get_vf_stats_callback;
 	ctx.stats = stats;
 	atomic_set(&ctx.status, 0);
 	mbox_cmd.fn_arg = (void *)&ctx;
@@ -1512,3 +1511,4 @@ int cn23xx_get_vf_stats(struct octeon_device *oct, int vfidx,
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(cn23xx_get_vf_stats);

@@ -4,6 +4,8 @@
 
 #include <linux/kexec.h>
 
+struct kexec_segment;
+
 struct kimage *do_kimage_alloc_init(void);
 int sanity_check_segment_list(struct kimage *image);
 void kimage_free_page_list(struct list_head *list);
@@ -13,8 +15,6 @@ void kimage_terminate(struct kimage *image);
 int kimage_is_destination_range(struct kimage *image,
 				unsigned long start, unsigned long end);
 
-int machine_kexec_post_load(struct kimage *image);
-
 /*
  * Whatever is used to serialize accesses to the kexec_crash_image needs to be
  * NMI safe, as __crash_kexec() can happen during nmi_panic(), so here we use a
@@ -23,7 +23,8 @@ int machine_kexec_post_load(struct kimage *image);
 extern atomic_t __kexec_lock;
 static inline bool kexec_trylock(void)
 {
-	return atomic_cmpxchg_acquire(&__kexec_lock, 0, 1) == 0;
+	int old = 0;
+	return atomic_try_cmpxchg_acquire(&__kexec_lock, &old, 1);
 }
 static inline void kexec_unlock(void)
 {

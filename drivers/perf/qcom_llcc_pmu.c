@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/of.h>
@@ -14,12 +15,14 @@
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
+#include <linux/cpu_phys_log_map.h>
 #include <soc/qcom/qcom_llcc_pmu.h>
 static uint32_t phys_cpu[NR_CPUS];
 
 enum llcc_pmu_version {
 	LLCC_PMU_VER1 = 1,
 	LLCC_PMU_VER2,
+	LLCC_PMU_VER3,
 };
 
 struct llcc_pmu {
@@ -32,15 +35,18 @@ struct llcc_pmu {
 
 #define MON_CFG(m) ((m)->lagg_base + 0x200)
 #define MON_CNT(m, cpu) ((m)->lagg_base + 0x220 + 0x4 * cpu)
+#define MON_CFG_V3(m, cpu) ((m)->lagg_base + 0x300 + 0x4 * cpu)
 
 #define LLCC_RD_EV QCOM_LLCC_PMU_RD_EV
 #define ENABLE 0x1
-#define CLEAR 0x10
-#define CLEAR_POS 16
+#define CLEAR_V1 0x10
+#define CLEAR_POS_V2 16
+#define CLEAR_POS_V3 4
 #define DISABLE 0x0
 #define SCALING_FACTOR 0x3
 #define NUM_COUNTERS NR_CPUS
 #define VALUE_MASK 0xFFFFFF
+#define IDX_TBL_PROP "qcom,idx-tbl"
 
 static u64 llcc_stats[NUM_COUNTERS];
 static unsigned int users;
@@ -59,7 +65,7 @@ int qcom_llcc_pmu_hw_type(u32 *type)
 
 	return 0;
 }
-EXPORT_SYMBOL(qcom_llcc_pmu_hw_type);
+EXPORT_SYMBOL_GPL(qcom_llcc_pmu_hw_type);
 
 static void mon_disable(int cpu)
 {
@@ -80,6 +86,11 @@ static void mon_disable(int cpu)
 		reg &= ~(ENABLE << cpu);
 		writel_relaxed(reg, MON_CFG(llccpmu));
 		break;
+	case LLCC_PMU_VER3:
+		reg = readl_relaxed(MON_CFG_V3(llccpmu, cpu));
+		reg &= ~ENABLE;
+		writel_relaxed(reg, MON_CFG_V3(llccpmu, cpu));
+		break;
 	}
 }
 
@@ -87,9 +98,7 @@ static void mon_clear(int cpu)
 {
 	int clear_bit;
 	u32 reg;
-
 	cpu = phys_cpu[cpu];
-	clear_bit = CLEAR_POS + cpu;
 
 	if (!llccpmu->ver) {
 		pr_err("LLCCPMU version not correct\n");
@@ -98,14 +107,23 @@ static void mon_clear(int cpu)
 
 	switch (llccpmu->ver) {
 	case LLCC_PMU_VER1:
-		writel_relaxed(CLEAR, MON_CFG(llccpmu));
+		writel_relaxed(CLEAR_V1, MON_CFG(llccpmu));
 		break;
 	case LLCC_PMU_VER2:
+		clear_bit = CLEAR_POS_V2 + cpu;
 		reg = readl_relaxed(MON_CFG(llccpmu));
 		reg |= (ENABLE << clear_bit);
 		writel_relaxed(reg, MON_CFG(llccpmu));
 		reg &= ~(ENABLE << clear_bit);
 		writel_relaxed(reg, MON_CFG(llccpmu));
+		break;
+	case LLCC_PMU_VER3:
+		clear_bit = CLEAR_POS_V3;
+		reg = readl_relaxed(MON_CFG_V3(llccpmu, cpu));
+		reg |= (ENABLE << clear_bit);
+		writel_relaxed(reg, MON_CFG_V3(llccpmu, cpu));
+		reg &= ~(ENABLE << clear_bit);
+		writel_relaxed(reg, MON_CFG_V3(llccpmu, cpu));
 		break;
 	}
 }
@@ -129,18 +147,32 @@ static void mon_enable(int cpu)
 		reg |= (ENABLE << cpu);
 		writel_relaxed(reg, MON_CFG(llccpmu));
 		break;
+	case LLCC_PMU_VER3:
+		reg = readl_relaxed(MON_CFG_V3(llccpmu, cpu));
+		reg |= ENABLE;
+		writel_relaxed(reg, MON_CFG_V3(llccpmu, cpu));
+		break;
 	}
 }
 
 static unsigned long read_cnt(int cpu)
 {
+	unsigned long value;
 	cpu = phys_cpu[cpu];
+
 	if (!llccpmu->ver) {
 		pr_err("LLCCPMU version not correct\n");
 		return -EINVAL;
 	}
 
-	return readl_relaxed(MON_CNT(llccpmu, cpu));
+	switch (llccpmu->ver) {
+	case LLCC_PMU_VER1:
+	case LLCC_PMU_VER2:
+	case LLCC_PMU_VER3:
+		value = readl_relaxed(MON_CNT(llccpmu, cpu));
+		break;
+	}
+	return value;
 }
 
 static int qcom_llcc_event_init(struct perf_event *event)
@@ -250,18 +282,17 @@ static void qcom_llcc_event_del(struct perf_event *event, int flags)
 	raw_spin_unlock(&users_lock);
 }
 
-static void get_mpidr_cpu(void *cpu)
-{
-	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
-
-	*((uint32_t *)cpu) = MPIDR_AFFINITY_LEVEL(mpidr, 1);
-}
-
 static int qcom_llcc_pmu_probe(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
 	struct resource *res;
-	int ret;
-	uint32_t cpu, pcpu;
+	int pcpu, ret, len;
+	uint32_t cpu;
+	u32 *idx_tbl = NULL;
+
+	ret = cpu_logical_to_phys(0);
+	if (ret == -EPROBE_DEFER)
+		return ret;
 
 	if (llccpmu) {
 		dev_err(&pdev->dev, "Only one LLCC PMU allowed!\n");
@@ -304,21 +335,41 @@ static int qcom_llcc_pmu_probe(struct platform_device *pdev)
 	if (ret < 0)
 		dev_err(&pdev->dev, "Failed to register LLCC PMU (%d)\n", ret);
 
+	if (of_find_property(dev->of_node, IDX_TBL_PROP, &len)) {
+		len /= sizeof(*idx_tbl);
+		idx_tbl = kcalloc(len, sizeof(*idx_tbl), GFP_KERNEL);
+		if (!idx_tbl)
+			return -ENOMEM;
+		ret = of_property_read_u32_array(dev->of_node, IDX_TBL_PROP,
+							idx_tbl, len);
+		if (ret < 0) {
+			dev_err(dev, "error reading idx table: %d\n", ret);
+			goto out;
+		}
+	}
+
 	for_each_possible_cpu(cpu) {
-		smp_call_function_single(cpu, get_mpidr_cpu,
-							 &pcpu, true);
-		phys_cpu[cpu] = pcpu;
+		pcpu = cpu_logical_to_phys(cpu);
+		if (pcpu < 0)
+			pcpu = cpu;
+		if (idx_tbl)
+			phys_cpu[cpu] = idx_tbl[pcpu];
+		else
+			phys_cpu[cpu] = pcpu;
 	}
 
 	dev_info(&pdev->dev, "Registered llcc_pmu, type: %d\n",
 		 llccpmu->pmu.type);
 
-	return 0;
+out:
+	kfree(idx_tbl);
+	return ((ret < 0) ? ret : 0);
 }
 
 static const struct of_device_id qcom_llcc_pmu_match_table[] = {
 	{ .compatible = "qcom,llcc-pmu-ver1", .data = (void *) LLCC_PMU_VER1 },
 	{ .compatible = "qcom,llcc-pmu-ver2", .data = (void *) LLCC_PMU_VER2 },
+	{ .compatible = "qcom,llcc-pmu-ver3", .data = (void *) LLCC_PMU_VER3 },
 	{}
 };
 
@@ -330,18 +381,7 @@ static struct platform_driver qcom_llcc_pmu_driver = {
 	},
 	.probe = qcom_llcc_pmu_probe,
 };
-
-static int __init qcom_llcc_pmu_init(void)
-{
-	return platform_driver_register(&qcom_llcc_pmu_driver);
-}
-module_init(qcom_llcc_pmu_init);
-
-static __exit void qcom_llcc_pmu_exit(void)
-{
-	platform_driver_unregister(&qcom_llcc_pmu_driver);
-}
-module_exit(qcom_llcc_pmu_exit);
+module_platform_driver(qcom_llcc_pmu_driver);
 
 MODULE_DESCRIPTION("QCOM LLCC PMU");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

@@ -13,8 +13,6 @@
 #include <linux/input.h>
 #include <linux/rfkill.h>
 
-MODULE_LICENSE("GPL");
-
 struct cmpc_accel {
 	int sensitivity;
 	int g_select;
@@ -440,11 +438,11 @@ failed_sensitivity:
 	return error;
 }
 
-static int cmpc_accel_remove_v4(struct acpi_device *acpi)
+static void cmpc_accel_remove_v4(struct acpi_device *acpi)
 {
 	device_remove_file(&acpi->dev, &cmpc_accel_sensitivity_attr_v4);
 	device_remove_file(&acpi->dev, &cmpc_accel_g_select_attr_v4);
-	return cmpc_remove_acpi_notify_device(acpi);
+	cmpc_remove_acpi_notify_device(acpi);
 }
 
 static SIMPLE_DEV_PM_OPS(cmpc_accel_pm, cmpc_accel_suspend_v4,
@@ -456,7 +454,6 @@ static const struct acpi_device_id cmpc_accel_device_ids_v4[] = {
 };
 
 static struct acpi_driver cmpc_accel_acpi_driver_v4 = {
-	.owner = THIS_MODULE,
 	.name = "cmpc_accel_v4",
 	.class = "cmpc_accel_v4",
 	.ids = cmpc_accel_device_ids_v4,
@@ -680,10 +677,10 @@ failed_file:
 	return error;
 }
 
-static int cmpc_accel_remove(struct acpi_device *acpi)
+static void cmpc_accel_remove(struct acpi_device *acpi)
 {
 	device_remove_file(&acpi->dev, &cmpc_accel_sensitivity_attr);
-	return cmpc_remove_acpi_notify_device(acpi);
+	cmpc_remove_acpi_notify_device(acpi);
 }
 
 static const struct acpi_device_id cmpc_accel_device_ids[] = {
@@ -692,7 +689,6 @@ static const struct acpi_device_id cmpc_accel_device_ids[] = {
 };
 
 static struct acpi_driver cmpc_accel_acpi_driver = {
-	.owner = THIS_MODULE,
 	.name = "cmpc_accel",
 	.class = "cmpc_accel",
 	.ids = cmpc_accel_device_ids,
@@ -759,9 +755,9 @@ static int cmpc_tablet_add(struct acpi_device *acpi)
 					   cmpc_tablet_idev_init);
 }
 
-static int cmpc_tablet_remove(struct acpi_device *acpi)
+static void cmpc_tablet_remove(struct acpi_device *acpi)
 {
-	return cmpc_remove_acpi_notify_device(acpi);
+	cmpc_remove_acpi_notify_device(acpi);
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -786,7 +782,6 @@ static const struct acpi_device_id cmpc_tablet_device_ids[] = {
 };
 
 static struct acpi_driver cmpc_tablet_acpi_driver = {
-	.owner = THIS_MODULE,
 	.name = "cmpc_tablet",
 	.class = "cmpc_tablet",
 	.ids = cmpc_tablet_device_ids,
@@ -988,7 +983,7 @@ static int cmpc_ipml_add(struct acpi_device *acpi)
 	/*
 	 * If RFKILL is disabled, rfkill_alloc will return ERR_PTR(-ENODEV).
 	 * This is OK, however, since all other uses of the device will not
-	 * derefence it.
+	 * dereference it.
 	 */
 	if (ipml->rf) {
 		retval = rfkill_register(ipml->rf);
@@ -1006,7 +1001,7 @@ out_bd:
 	return retval;
 }
 
-static int cmpc_ipml_remove(struct acpi_device *acpi)
+static void cmpc_ipml_remove(struct acpi_device *acpi)
 {
 	struct ipml200_dev *ipml;
 
@@ -1020,8 +1015,6 @@ static int cmpc_ipml_remove(struct acpi_device *acpi)
 	}
 
 	kfree(ipml);
-
-	return 0;
 }
 
 static const struct acpi_device_id cmpc_ipml_device_ids[] = {
@@ -1030,7 +1023,6 @@ static const struct acpi_device_id cmpc_ipml_device_ids[] = {
 };
 
 static struct acpi_driver cmpc_ipml_acpi_driver = {
-	.owner = THIS_MODULE,
 	.name = "cmpc",
 	.class = "cmpc",
 	.ids = cmpc_ipml_device_ids,
@@ -1055,6 +1047,8 @@ static int cmpc_keys_codes[] = {
 	KEY_CAMERA,
 	KEY_BACK,
 	KEY_FORWARD,
+	KEY_UNKNOWN,
+	KEY_WLAN, /* NL3: 0x8b (press), 0x9b (release) */
 	KEY_MAX
 };
 
@@ -1085,9 +1079,9 @@ static int cmpc_keys_add(struct acpi_device *acpi)
 					   cmpc_keys_idev_init);
 }
 
-static int cmpc_keys_remove(struct acpi_device *acpi)
+static void cmpc_keys_remove(struct acpi_device *acpi)
 {
-	return cmpc_remove_acpi_notify_device(acpi);
+	cmpc_remove_acpi_notify_device(acpi);
 }
 
 static const struct acpi_device_id cmpc_keys_device_ids[] = {
@@ -1096,7 +1090,6 @@ static const struct acpi_device_id cmpc_keys_device_ids[] = {
 };
 
 static struct acpi_driver cmpc_keys_acpi_driver = {
-	.owner = THIS_MODULE,
 	.name = "cmpc_keys",
 	.class = "cmpc_keys",
 	.ids = cmpc_keys_device_ids,
@@ -1166,7 +1159,7 @@ static void cmpc_exit(void)
 module_init(cmpc_init);
 module_exit(cmpc_exit);
 
-static const struct acpi_device_id cmpc_device_ids[] = {
+static const struct acpi_device_id cmpc_device_ids[] __maybe_unused = {
 	{CMPC_ACCEL_HID, 0},
 	{CMPC_ACCEL_HID_V4, 0},
 	{CMPC_TABLET_HID, 0},
@@ -1176,3 +1169,5 @@ static const struct acpi_device_id cmpc_device_ids[] = {
 };
 
 MODULE_DEVICE_TABLE(acpi, cmpc_device_ids);
+MODULE_DESCRIPTION("Support for Intel Classmate PC ACPI devices");
+MODULE_LICENSE("GPL");

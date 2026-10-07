@@ -123,7 +123,7 @@ static int pn532_dev_down(struct pn533 *dev)
 	return 0;
 }
 
-static struct pn533_phy_ops uart_phy_ops = {
+static const struct pn533_phy_ops uart_phy_ops = {
 	.send_frame = pn532_uart_send_frame,
 	.send_ack = pn532_uart_send_ack,
 	.abort_cmd = pn532_uart_abort_cmd,
@@ -203,21 +203,14 @@ static int pn532_uart_rx_is_frame(struct sk_buff *skb)
 	return 0;
 }
 
-static int pn532_receive_buf(struct serdev_device *serdev,
-		const unsigned char *data, size_t count)
+static size_t pn532_receive_buf(struct serdev_device *serdev,
+				const u8 *data, size_t count)
 {
 	struct pn532_uart_phy *dev = serdev_device_get_drvdata(serdev);
 	size_t i;
 
 	del_timer(&dev->cmd_timeout);
 	for (i = 0; i < count; i++) {
-		if (!dev->recv_skb) {
-			dev->recv_skb = alloc_skb(PN532_UART_SKB_BUFF_LEN,
-						  GFP_KERNEL);
-			if (!dev->recv_skb)
-				return i;
-		}
-
 		if (unlikely(!skb_tailroom(dev->recv_skb)))
 			skb_trim(dev->recv_skb, 0);
 
@@ -226,13 +219,15 @@ static int pn532_receive_buf(struct serdev_device *serdev,
 			continue;
 
 		pn533_recv_frame(dev->priv, dev->recv_skb, 0);
-		dev->recv_skb = NULL;
+		dev->recv_skb = alloc_skb(PN532_UART_SKB_BUFF_LEN, GFP_KERNEL);
+		if (!dev->recv_skb)
+			return 0;
 	}
 
 	return i;
 }
 
-static struct serdev_device_ops pn532_serdev_ops = {
+static const struct serdev_device_ops pn532_serdev_ops = {
 	.receive_buf = pn532_receive_buf,
 	.write_wakeup = serdev_device_write_wakeup,
 };
@@ -318,7 +313,7 @@ static void pn532_uart_remove(struct serdev_device *serdev)
 	pn53x_unregister_nfc(pn532->priv);
 	serdev_device_close(serdev);
 	pn53x_common_clean(pn532->priv);
-	del_timer_sync(&pn532->cmd_timeout);
+	timer_shutdown_sync(&pn532->cmd_timeout);
 	kfree_skb(pn532->recv_skb);
 	kfree(pn532);
 }
@@ -328,7 +323,7 @@ static struct serdev_device_driver pn532_uart_driver = {
 	.remove = pn532_uart_remove,
 	.driver = {
 		.name = "pn532_uart",
-		.of_match_table = of_match_ptr(pn532_uart_of_match),
+		.of_match_table = pn532_uart_of_match,
 	},
 };
 

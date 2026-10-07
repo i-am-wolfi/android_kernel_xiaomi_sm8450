@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- *
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __GH_DBL_H
@@ -9,15 +9,25 @@
 
 #include "gh_common.h"
 
+#ifdef CONFIG_QTVM_WITH_AVF
+#define GUNYAH_QCOM_MIN_BELL	0x100
+#else
+#define GUNYAH_QCOM_MIN_BELL	0
+#endif
+
 typedef void (*dbl_rx_cb_t)(int irq, void *priv_data);
 
 enum gh_dbl_label {
-	GH_DBL_TUI_LABEL,
+	GH_DBL_TUI_LABEL = GUNYAH_QCOM_MIN_BELL,
 	GH_DBL_TUI_NEURON_BLK0,
 	GH_DBL_TUI_NEURON_BLK1,
 	GH_DBL_TUI_QRTR,
 	GH_DBL_TEST_TUIVM,
-	GH_DBL_TEST_TESTVM,
+	GH_DBL_TEST_OEMVM,
+	GH_DBL_HW_FENCE,
+	GH_DBL_TUI_DDUMP,
+	GH_DBL_OEMVM_QRTR,
+	GH_DBL_VM_PANIC_NOTIFY,
 	GH_DBL_LABEL_MAX
 };
 

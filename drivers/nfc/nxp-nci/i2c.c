@@ -16,11 +16,10 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
-#include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/nfc.h>
 #include <linux/gpio/consumer.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include <net/nfc/nfc.h>
 
@@ -98,8 +97,8 @@ static int nxp_nci_i2c_fw_read(struct nxp_nci_i2c_phy *phy,
 			       struct sk_buff **skb)
 {
 	struct i2c_client *client = phy->i2c_dev;
-	u16 header;
 	size_t frame_len;
+	__be16 header;
 	int r;
 
 	r = i2c_master_recv(client, (u8 *) &header, NXP_NCI_FW_HDR_LEN);
@@ -264,12 +263,10 @@ static const struct acpi_gpio_mapping acpi_nxp_nci_gpios[] = {
 	{ }
 };
 
-static int nxp_nci_i2c_probe(struct i2c_client *client,
-			    const struct i2c_device_id *id)
+static int nxp_nci_i2c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct nxp_nci_i2c_phy *phy;
-	unsigned long irqflags;
 	int r;
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
@@ -295,7 +292,7 @@ static int nxp_nci_i2c_probe(struct i2c_client *client,
 		return PTR_ERR(phy->gpiod_en);
 	}
 
-	phy->gpiod_fw = devm_gpiod_get(dev, "firmware", GPIOD_OUT_LOW);
+	phy->gpiod_fw = devm_gpiod_get_optional(dev, "firmware", GPIOD_OUT_LOW);
 	if (IS_ERR(phy->gpiod_fw)) {
 		nfc_err(dev, "Failed to get FW gpio\n");
 		return PTR_ERR(phy->gpiod_fw);
@@ -306,26 +303,9 @@ static int nxp_nci_i2c_probe(struct i2c_client *client,
 	if (r < 0)
 		return r;
 
-	/*
-	 * ACPI platforms may report incorrect IRQ trigger types
-	 * (e.g. level-high), which can lead to interrupt storms.
-	 *
-	 * Use the historically stable rising-edge trigger for ACPI devices.
-	 *
-	 * On non-ACPI systems (e.g. Device Tree), prefer the firmware-
-	 * provided trigger type, falling back to rising-edge if not set.
-	 */
-	if (ACPI_COMPANION(dev)) {
-		irqflags = IRQF_TRIGGER_RISING;
-	} else {
-		irqflags = irq_get_trigger_type(client->irq);
-		if (!irqflags)
-			irqflags = IRQF_TRIGGER_RISING;
-	}
-
 	r = request_threaded_irq(client->irq, NULL,
 				 nxp_nci_i2c_irq_thread_fn,
-				 irqflags | IRQF_ONESHOT,
+				 IRQF_ONESHOT,
 				 NXP_NCI_I2C_DRIVER_NAME, phy);
 	if (r < 0)
 		nfc_err(&client->dev, "Unable to register IRQ handler\n");
@@ -333,18 +313,16 @@ static int nxp_nci_i2c_probe(struct i2c_client *client,
 	return r;
 }
 
-static int nxp_nci_i2c_remove(struct i2c_client *client)
+static void nxp_nci_i2c_remove(struct i2c_client *client)
 {
 	struct nxp_nci_i2c_phy *phy = i2c_get_clientdata(client);
 
 	nxp_nci_remove(phy->ndev);
 	free_irq(client->irq, phy);
-
-	return 0;
 }
 
 static const struct i2c_device_id nxp_nci_i2c_id_table[] = {
-	{"nxp-nci_i2c", 0},
+	{ "nxp-nci_i2c" },
 	{}
 };
 MODULE_DEVICE_TABLE(i2c, nxp_nci_i2c_id_table);
@@ -358,6 +336,7 @@ MODULE_DEVICE_TABLE(of, of_nxp_nci_i2c_match);
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id acpi_id[] = {
 	{ "NXP1001" },
+	{ "NXP1002" },
 	{ "NXP7471" },
 	{ }
 };

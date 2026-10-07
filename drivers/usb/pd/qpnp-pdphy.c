@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2016-2018, 2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/module.h>
@@ -18,6 +18,7 @@
 #include <linux/seq_file.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
+
 #include "usbpd.h"
 
 #define USB_PDPHY_MAX_DATA_OBJ_LEN	28
@@ -338,7 +339,7 @@ int pd_phy_update_roles(enum data_role dr, enum power_role pr)
 		((dr == DR_DFP ? MSG_CONFIG_PORT_DATA_ROLE : 0) |
 		 (pr == PR_SRC ? MSG_CONFIG_PORT_POWER_ROLE : 0)));
 }
-EXPORT_SYMBOL(pd_phy_update_roles);
+EXPORT_SYMBOL_GPL(pd_phy_update_roles);
 
 int pd_phy_update_frame_filter(u8 frame_filter_val)
 {
@@ -346,7 +347,7 @@ int pd_phy_update_frame_filter(u8 frame_filter_val)
 
 	return pdphy_reg_write(pdphy, USB_PDPHY_FRAME_FILTER, frame_filter_val);
 }
-EXPORT_SYMBOL(pd_phy_update_frame_filter);
+EXPORT_SYMBOL_GPL(pd_phy_update_frame_filter);
 
 int pd_phy_open(struct pd_phy_params *params)
 {
@@ -412,7 +413,7 @@ int pd_phy_open(struct pd_phy_params *params)
 
 	return ret;
 }
-EXPORT_SYMBOL(pd_phy_open);
+EXPORT_SYMBOL_GPL(pd_phy_open);
 
 int pd_phy_signal(enum pd_sig_type sig)
 {
@@ -466,7 +467,7 @@ int pd_phy_signal(enum pd_sig_type sig)
 
 	return 0;
 }
-EXPORT_SYMBOL(pd_phy_signal);
+EXPORT_SYMBOL_GPL(pd_phy_signal);
 
 int pd_phy_write(u16 hdr, const u8 *data, size_t data_len, enum pd_sop_type sop)
 {
@@ -494,6 +495,13 @@ int pd_phy_write(u16 hdr, const u8 *data, size_t data_len, enum pd_sop_type sop)
 	if (data_len > USB_PDPHY_MAX_DATA_OBJ_LEN) {
 		dev_err(pdphy->dev, "%s: invalid data object len %zu\n",
 			__func__, data_len);
+		return -EINVAL;
+	}
+
+	/* Validate total length fits in TX_SIZE register (4 bits = max 15) */
+	if (total_len == 0 || total_len > 16) {
+		dev_err(pdphy->dev, "%s: invalid total length %zu\n",
+			__func__, total_len);
 		return -EINVAL;
 	}
 
@@ -562,7 +570,7 @@ int pd_phy_write(u16 hdr, const u8 *data, size_t data_len, enum pd_sop_type sop)
 
 	return pdphy->tx_status ? pdphy->tx_status : 0;
 }
-EXPORT_SYMBOL(pd_phy_write);
+EXPORT_SYMBOL_GPL(pd_phy_write);
 
 void pd_phy_close(void)
 {
@@ -599,7 +607,7 @@ void pd_phy_close(void)
 
 	pdphy_enable_power(pdphy, false);
 }
-EXPORT_SYMBOL(pd_phy_close);
+EXPORT_SYMBOL_GPL(pd_phy_close);
 
 struct pd_phy_ops pdphy_ops = {
 	.open			= pd_phy_open,
@@ -778,7 +786,7 @@ static int pdphy_request_irq(struct usb_pdphy *pdphy,
 	*irq_num = of_irq_get_byname(node, irq_name);
 	if (*irq_num < 0) {
 		dev_err(pdphy->dev, "Unable to get %s irq\n", irq_name);
-		ret = -ENXIO;
+		return -ENXIO;
 	}
 
 	irq_set_status_flags(*irq_num, IRQ_NOAUTOEN);
@@ -787,7 +795,7 @@ static int pdphy_request_irq(struct usb_pdphy *pdphy,
 	if (ret < 0) {
 		dev_err(pdphy->dev, "Unable to request %s irq: %d\n",
 				irq_name, ret);
-		ret = -ENXIO;
+		return -ENXIO;
 	}
 
 	return 0;
@@ -889,7 +897,7 @@ static int pdphy_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int pdphy_remove(struct platform_device *pdev)
+static void pdphy_remove(struct platform_device *pdev)
 {
 	struct usb_pdphy *pdphy = platform_get_drvdata(pdev);
 
@@ -900,8 +908,6 @@ static int pdphy_remove(struct platform_device *pdev)
 		pd_phy_close();
 
 	__pdphy = NULL;
-
-	return 0;
 }
 
 static void pdphy_shutdown(struct platform_device *pdev)
@@ -917,7 +923,7 @@ static const struct of_device_id pdphy_match_table[] = {
 	{
 		.compatible	 = "qcom,qpnp-pdphy",
 	},
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, pdphy_match_table);
 
@@ -934,5 +940,5 @@ static struct platform_driver pdphy_driver = {
 module_platform_driver(pdphy_driver);
 
 MODULE_DESCRIPTION("QPNP PD PHY Driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:qpnp-pdphy");

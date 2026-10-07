@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2016, 2019-2021, The Linux Foundation. All rights reserved. */
+/*
+ * Copyright (c) 2016, 2019-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ */
 
 #ifndef __QCOM_CLK_DEBUG_H__
 #define __QCOM_CLK_DEBUG_H__
 
 #include <linux/platform_device.h>
-#include "../clk.h"
+#include "drivers/clk/clk.h"
 
 /**
  * struct mux_regmap_names - Structure of mux regmap mapping
@@ -100,11 +103,16 @@ int clk_hw_debug_register(struct device *dev, struct clk_hw *clk_hw);
 int clk_debug_init(void);
 void clk_debug_exit(void);
 extern void clk_debug_print_hw(struct clk_hw *hw, struct seq_file *f);
+#ifdef CONFIG_QCOM_MINIDUMP_CLK
+void clk_debug_register_minidump(struct clk_hw *hw);
+#else
+static inline void clk_debug_register_minidump(struct clk_hw *hw) {}
+#endif
 
 #define WARN_CLK(hw, cond, fmt, ...)						\
 	do {									\
 		clk_debug_print_hw(hw, NULL);					\
-		WARN(cond, "%s: " fmt, clk_hw_get_name(hw), ##__VA_ARGS__);	\
+		WARN(cond, "%s: " fmt, qcom_clk_hw_get_name(hw), ##__VA_ARGS__);	\
 	} while (0)
 
 #define clock_debug_output(m, fmt, ...)			\

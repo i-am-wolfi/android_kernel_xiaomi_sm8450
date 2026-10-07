@@ -47,6 +47,7 @@
 #include <linux/uaccess.h>
 
 MODULE_AUTHOR("Sebastien Bouchard <sebastien.bouchard@ca.kontron.com>");
+MODULE_DESCRIPTION("Telecom Clock driver for Intel NetStructure(tm) MPCBL0010");
 MODULE_LICENSE("GPL");
 
 /*Hardware Reset of the PLL */
@@ -263,7 +264,6 @@ static ssize_t tlclk_read(struct file *filp, char __user *buf, size_t count,
 }
 
 static const struct file_operations tlclk_fops = {
-	.owner = THIS_MODULE,
 	.read = tlclk_read,
 	.open = tlclk_open,
 	.release = tlclk_release,
@@ -852,9 +852,6 @@ static void __exit tlclk_cleanup(void)
 	platform_device_unregister(tlclk_device);
 	misc_deregister(&tlclk_miscdev);
 	unregister_chrdev(tlclk_major, "telco_clock");
-
-	got_event = 1;
-	wake_up_all(&wq);
 
 	release_region(TLCLK_BASE, 8);
 	del_timer_sync(&switchover_timer);

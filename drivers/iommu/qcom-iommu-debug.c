@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2015-2021, The Linux Foundation. All rights reserved.
- *
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #define pr_fmt(fmt) "iommu-debug: %s: " fmt, __func__
 
+#include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/qcom-iommu-util.h>
 #include "qcom-iommu-debug.h"
 
@@ -132,6 +134,7 @@ iommu_debug_switch_usecase(struct iommu_debug_device *ddev, u32 usecase_nr)
 {
 	struct platform_device *test_pdev;
 	struct device_node *child;
+	const char *str;
 	int child_nr = 0;
 	int ret;
 
@@ -168,6 +171,10 @@ iommu_debug_switch_usecase(struct iommu_debug_device *ddev, u32 usecase_nr)
 		goto out;
 	}
 
+	if (of_property_read_string(child, "qcom,iommu-dma", &str))
+		str = "default";
+
+	ddev->fastmap_usecase = !strcmp(str, "fastmap");
 	ddev->usecase_nr = usecase_nr;
 	ddev->test_dev = &test_pdev->dev;
 	ddev->domain = iommu_get_domain_for_dev(ddev->test_dev);
@@ -232,7 +239,6 @@ static const struct file_operations iommu_debug_usecase_fops = {
 	.open	 = simple_open,
 	.read	 = iommu_debug_usecase_read,
 	.write   = iommu_debug_usecase_write,
-	.llseek	 = no_llseek,
 };
 
 static int iommu_debug_debugfs_setup(struct iommu_debug_device *ddev)
@@ -258,6 +264,8 @@ static int iommu_debug_debugfs_setup(struct iommu_debug_device *ddev)
 	debugfs_create_file("nr_iters", 0600, dir, ddev, &iommu_debug_nr_iters_fops);
 	debugfs_create_file("test_virt_addr", 0400, dir, ddev, &iommu_debug_test_virt_addr_fops);
 	debugfs_create_file("profiling", 0400, dir, ddev, &iommu_debug_profiling_fops);
+
+	iommu_debug_debugfs_setup_dpd(ddev);
 
 	return 0;
 }
@@ -309,7 +317,7 @@ out:
 	return ret;
 }
 
-static int iommu_debug_remove(struct platform_device *pdev)
+static void iommu_debug_remove(struct platform_device *pdev)
 {
 	struct iommu_debug_device *ddev = platform_get_drvdata(pdev);
 
@@ -318,7 +326,6 @@ static int iommu_debug_remove(struct platform_device *pdev)
 		of_platform_device_destroy(ddev->test_dev, NULL);
 
 	mutex_destroy(&ddev->state_lock);
-	return 0;
 }
 
 static const struct of_device_id iommu_debug_of_match[] = {
@@ -341,11 +348,29 @@ static struct platform_driver iommu_debug_driver = {
  */
 static int iommu_debug_usecase_probe(struct platform_device *pdev)
 {
-	return iommu_debug_usecase_register(&pdev->dev);
+	struct iommu_debug_usecase_device *udev;
+	const struct iommu_debug_allocator_ops *ops;
+	struct device *dev = &pdev->dev;
+
+	udev = devm_kzalloc(dev, sizeof(*udev), GFP_KERNEL);
+	if (!udev)
+		return -ENOMEM;
+
+	udev->dev = dev;
+	mutex_init(&udev->mem_lock);
+	INIT_LIST_HEAD(&udev->mem_list);
+
+	ops = of_device_get_match_data(dev);
+	if (ops)
+		udev->ops = ops;
+	platform_set_drvdata(pdev, udev);
+
+	return iommu_debug_usecase_register(dev);
 }
 
 static const struct of_device_id iommu_debug_usecase_of_match[] = {
-	{ .compatible = "qcom,iommu-debug-usecase" },
+	{ .compatible = "qcom,testcase-dpd-proxy", .data = &secure_allocator_ops },
+	{ .compatible = "qcom,iommu-debug-usecase", .data = NULL },
 	{ },
 };
 
@@ -380,4 +405,4 @@ static void iommu_debug_exit(void)
 module_init(iommu_debug_init);
 module_exit(iommu_debug_exit);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

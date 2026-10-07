@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright (c) 2011-2012, 2021 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _CORESIGHT_PRIV_H
@@ -11,6 +12,9 @@
 #include <linux/io.h>
 #include <linux/coresight.h>
 #include <linux/pm_runtime.h>
+
+extern struct mutex coresight_mutex;
+extern const struct device_type coresight_dev_type[];
 
 /*
  * Coresight management registers (0xf00-0xfcc)
@@ -39,40 +43,56 @@
 
 #define ETM_MODE_EXCL_KERN	BIT(30)
 #define ETM_MODE_EXCL_USER	BIT(31)
+struct cs_pair_attribute {
+	struct device_attribute attr;
+	u32 lo_off;
+	u32 hi_off;
+};
 
-typedef u32 (*coresight_read_fn)(const struct device *, u32 offset);
-#define __coresight_simple_func(type, func, name, lo_off, hi_off)	\
-static ssize_t name##_show(struct device *_dev,				\
-			   struct device_attribute *attr, char *buf)	\
-{									\
-	type *drvdata = dev_get_drvdata(_dev->parent);			\
-	coresight_read_fn fn = func;					\
-	u64 val;							\
-	int ret;							\
-	ret = pm_runtime_get_sync(_dev->parent);			\
-	if (ret < 0) {							\
-		pm_runtime_put_noidle(_dev->parent);			\
-		return ret;						\
-	}								\
-	if (fn)								\
-		val = (u64)fn(_dev->parent, lo_off);			\
-	else								\
-		val = coresight_read_reg_pair(drvdata->base,		\
-						 lo_off, hi_off);	\
-	pm_runtime_put_sync(_dev->parent);				\
-	return scnprintf(buf, PAGE_SIZE, "0x%llx\n", val);		\
-}									\
-static DEVICE_ATTR_RO(name)
+struct cs_off_attribute {
+	struct device_attribute attr;
+	u32 off;
+};
 
-#define coresight_simple_func(type, func, name, offset)			\
-	__coresight_simple_func(type, func, name, offset, -1)
-#define coresight_simple_reg32(type, name, offset)			\
-	__coresight_simple_func(type, NULL, name, offset, -1)
-#define coresight_simple_reg64(type, name, lo_off, hi_off)		\
-	__coresight_simple_func(type, NULL, name, lo_off, hi_off)
+extern ssize_t coresight_simple_show32(struct device *_dev,
+				     struct device_attribute *attr, char *buf);
+extern ssize_t coresight_simple_show_pair(struct device *_dev,
+				     struct device_attribute *attr, char *buf);
+
+#define coresight_simple_reg32(name, offset)				\
+	(&((struct cs_off_attribute[]) {				\
+	   {								\
+		__ATTR(name, 0444, coresight_simple_show32, NULL),	\
+		offset							\
+	   }								\
+	})[0].attr.attr)
+
+#define coresight_simple_reg64(name, lo_off, hi_off)			\
+	(&((struct cs_pair_attribute[]) {				\
+	   {								\
+		__ATTR(name, 0444, coresight_simple_show_pair, NULL),	\
+		lo_off, hi_off						\
+	   }								\
+	})[0].attr.attr)
 
 extern const u32 coresight_barrier_pkt[4];
 #define CORESIGHT_BARRIER_PKT_SIZE (sizeof(coresight_barrier_pkt))
+
+struct pm_config {
+	struct cpumask	powered_cpus;
+	struct cpumask	*pd_cpumask;
+	struct cpumask	online_cpus;
+	struct list_head	link;
+	bool		hw_powered;
+	bool		pm_enable;
+};
+
+struct delay_probe_arg {
+	struct amba_device	*adev;
+	struct cpumask		*cpumask;
+	struct list_head	link;
+	const struct amba_id	*id;
+};
 
 enum etm_addr_type {
 	ETM_ADDR_TYPE_NONE,
@@ -80,12 +100,6 @@ enum etm_addr_type {
 	ETM_ADDR_TYPE_RANGE,
 	ETM_ADDR_TYPE_START,
 	ETM_ADDR_TYPE_STOP,
-};
-
-enum cs_mode {
-	CS_MODE_DISABLED,
-	CS_MODE_SYSFS,
-	CS_MODE_PERF,
 };
 
 /**
@@ -132,33 +146,16 @@ static inline void CS_UNLOCK(void __iomem *addr)
 	} while (0);
 }
 
-static inline u64
-coresight_read_reg_pair(void __iomem *addr, s32 lo_offset, s32 hi_offset)
-{
-	u64 val;
-
-	val = readl_relaxed(addr + lo_offset);
-	val |= (hi_offset < 0) ? 0 :
-	       (u64)readl_relaxed(addr + hi_offset) << 32;
-	return val;
-}
-
-static inline void coresight_write_reg_pair(void __iomem *addr, u64 val,
-						 s32 lo_offset, s32 hi_offset)
-{
-	writel_relaxed((u32)val, addr + lo_offset);
-	if (hi_offset >= 0)
-		writel_relaxed((u32)(val >> 32), addr + hi_offset);
-}
-
 void coresight_disable_path(struct list_head *path);
-int coresight_enable_path(struct list_head *path, u32 mode, void *sink_data);
+int coresight_enable_path(struct list_head *path, enum cs_mode mode,
+			  void *sink_data);
 struct coresight_device *coresight_get_sink(struct list_head *path);
-struct coresight_device *
-coresight_get_enabled_sink(struct coresight_device *source);
+struct list_head *coresight_get_path(struct coresight_device *csdev);
 struct coresight_device *coresight_get_sink_by_id(u32 id);
 struct coresight_device *
 coresight_find_default_sink(struct coresight_device *csdev);
+int coresight_validate_sink(struct coresight_device *source,
+			    struct coresight_device *sink);
 struct list_head *coresight_build_path(struct coresight_device *csdev,
 				       struct coresight_device *sink);
 void coresight_release_path(struct list_head *path);
@@ -171,6 +168,9 @@ int coresight_make_links(struct coresight_device *orig,
 			 struct coresight_device *target);
 void coresight_remove_links(struct coresight_device *orig,
 			    struct coresight_connection *conn);
+int coresight_store_path(struct coresight_device *csdev,
+		struct list_head *path);
+struct list_head *coresight_remove_path(struct coresight_device *csdev);
 
 #if IS_ENABLED(CONFIG_CORESIGHT_SOURCE_ETM3X)
 extern int etm_readl_cp14(u32 off, unsigned int *val);
@@ -187,15 +187,8 @@ struct cti_assoc_op {
 
 extern void coresight_set_cti_ops(const struct cti_assoc_op *cti_op);
 extern void coresight_remove_cti_ops(void);
-
-struct csr_set_atid_op {
-	int (*set_atid)(struct coresight_device *csdev, u32 atid, bool enable);
-};
-
-extern void coresight_set_csr_ops(const struct csr_set_atid_op *csr_op);
-extern void coresight_remove_csr_ops(void);
-int of_coresight_get_atid(struct coresight_device *src_dev, u32 *atid, int atid_num);
-int of_coresight_get_atid_number(struct coresight_device *csdev);
+struct coresight_device *coresight_get_enabled_sink_from_bus(bool deactivate);
+bool of_coresight_secure_node(struct coresight_device *csdev);
 
 /*
  * Macros and inline functions to handle CoreSight UCI data and driver
@@ -221,12 +214,27 @@ int of_coresight_get_atid_number(struct coresight_device *csdev);
 	}
 
 /* coresight AMBA ID, full UCI structure: id table entry. */
-#define CS_AMBA_UCI_ID(pid, uci_ptr)		\
+#define __CS_AMBA_UCI_ID(pid, m, uci_ptr)	\
 	{					\
 		.id	= pid,			\
-		.mask	= 0x000fffff,		\
+		.mask	= m,			\
 		.data	= (void *)uci_ptr	\
 	}
+#define CS_AMBA_UCI_ID(pid, uci)	__CS_AMBA_UCI_ID(pid, 0x000fffff, uci)
+/*
+ * PIDR2[JEDEC], BIT(3) must be 1 (Read As One) to indicate that rest of the
+ * PIDR1, PIDR2 DES_* fields follow JEDEC encoding for the designer. Use that
+ * as a match value for blanket matching all devices in the given CoreSight
+ * device type and architecture.
+ */
+#define PIDR2_JEDEC			BIT(3)
+#define PID_PIDR2_JEDEC			(PIDR2_JEDEC << 16)
+/*
+ * Match all PIDs in a given CoreSight device type and architecture, defined
+ * by the uci.
+ */
+#define CS_AMBA_MATCH_ALL_UCI(uci)					\
+	__CS_AMBA_UCI_ID(PID_PIDR2_JEDEC, PID_PIDR2_JEDEC, uci)
 
 /* extract the data value from a UCI structure given amba_id pointer. */
 static inline void *coresight_get_uci_data(const struct amba_id *id)
@@ -239,14 +247,26 @@ static inline void *coresight_get_uci_data(const struct amba_id *id)
 	return uci_id->data;
 }
 
+static inline void *coresight_get_uci_data_from_amba(const struct amba_id *table, u32 pid)
+{
+	while (table->mask) {
+		if ((pid & table->mask) == table->id)
+			return coresight_get_uci_data(table);
+		table++;
+	};
+	return NULL;
+}
+
 void coresight_release_platform_data(struct coresight_device *csdev,
+				     struct device *dev,
 				     struct coresight_platform_data *pdata);
 struct coresight_device *
 coresight_find_csdev_by_fwnode(struct fwnode_handle *r_fwnode);
-void coresight_set_assoc_ectdev_mutex(struct coresight_device *csdev,
-				      struct coresight_device *ect_csdev);
+void coresight_add_helper(struct coresight_device *csdev,
+			  struct coresight_device *helper);
 
 void coresight_set_percpu_sink(int cpu, struct coresight_device *csdev);
 struct coresight_device *coresight_get_percpu_sink(int cpu);
+void coresight_disable_source(struct coresight_device *csdev, void *data);
 
 #endif

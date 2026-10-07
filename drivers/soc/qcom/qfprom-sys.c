@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #include <linux/device.h>
 #include <linux/module.h>
@@ -105,7 +108,6 @@ static int qfprom_sys_probe(struct platform_device *pdev)
 			goto remove_cells;
 		}
 	}
-
 	priv->cell_count = cell_count;
 	dev->platform_data = priv;
 	return 0;
@@ -119,7 +121,7 @@ remove_cells:
 	return ret;
 }
 
-static int qfprom_sys_remove(struct platform_device *pdev)
+static void qfprom_sys_remove(struct platform_device *pdev)
 {
 	struct qfprom_sys *priv;
 	int i;
@@ -129,8 +131,6 @@ static int qfprom_sys_remove(struct platform_device *pdev)
 		nvmem_cell_put(priv->cells[i]);
 		sysfs_remove_bin_file(&pdev->dev.kobj, priv->attrs[i]);
 	}
-
-	return 0;
 }
 
 static const struct of_device_id qfprom_sys_of_match[] = {
@@ -151,4 +151,4 @@ static struct platform_driver qfprom_sys_driver = {
 
 module_platform_driver(qfprom_sys_driver);
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. QFPROM_SYS driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

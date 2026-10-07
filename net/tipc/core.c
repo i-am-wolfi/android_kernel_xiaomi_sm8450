@@ -81,8 +81,6 @@ static int __net_init tipc_init_net(struct net *net)
 	if (err)
 		goto out_nametbl;
 
-	INIT_LIST_HEAD(&tn->dist_queue);
-
 	err = tipc_bcast_init(net);
 	if (err)
 		goto out_bclink;
@@ -219,11 +217,6 @@ static void __exit tipc_exit(void)
 	tipc_socket_stop();
 	unregister_pernet_device(&tipc_net_ops);
 	tipc_unregister_sysctl();
-
-	/* TODO: Wait for all timers that called call_rcu() to finish before
-	 * calling rcu_barrier().
-	 */
-	rcu_barrier();
 
 	pr_info("Deactivated\n");
 }

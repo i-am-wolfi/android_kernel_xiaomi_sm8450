@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* -*- mode: c; c-basic-offset: 8; -*-
- * vim: noexpandtab sw=8 ts=8 sts=0:
- *
+/*
  * dlmdebug.c
  *
  * debug functionality for the dlm
@@ -543,7 +541,7 @@ static void *lockres_seq_start(struct seq_file *m, loff_t *pos)
 	struct debug_lockres *dl = m->private;
 	struct dlm_ctxt *dlm = dl->dl_ctxt;
 	struct dlm_lock_resource *oldres = dl->dl_res;
-	struct dlm_lock_resource *res = NULL;
+	struct dlm_lock_resource *res = NULL, *iter;
 	struct list_head *track_list;
 
 	spin_lock(&dlm->track_lock);
@@ -558,11 +556,11 @@ static void *lockres_seq_start(struct seq_file *m, loff_t *pos)
 		}
 	}
 
-	list_for_each_entry(res, track_list, tracking) {
-		if (&res->tracking == &dlm->tracking_list)
-			res = NULL;
-		else
-			dlm_lockres_get(res);
+	list_for_each_entry(iter, track_list, tracking) {
+		if (&iter->tracking != &dlm->tracking_list) {
+			dlm_lockres_get(iter);
+			res = iter;
+		}
 		break;
 	}
 	spin_unlock(&dlm->track_lock);
@@ -614,7 +612,6 @@ static int debug_lockres_open(struct inode *inode, struct file *file)
 	struct dlm_ctxt *dlm = inode->i_private;
 	struct debug_lockres *dl;
 	void *buf;
-	int status = -ENOMEM;
 
 	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!buf)
@@ -627,23 +624,16 @@ static int debug_lockres_open(struct inode *inode, struct file *file)
 	dl->dl_len = PAGE_SIZE;
 	dl->dl_buf = buf;
 
-	/* ->release uses dl_ctxt after open, so it needs a real pin. */
-	dl->dl_ctxt = dlm_grab(dlm);
-	if (!dl->dl_ctxt) {
-		status = -ENOENT;
-		goto bailseq;
-	}
+	dlm_grab(dlm);
+	dl->dl_ctxt = dlm;
 
 	return 0;
 
-bailseq:
-	seq_release_private(inode, file);
 bailfree:
 	kfree(buf);
 bail:
-	if (status != -ENOENT)
-		mlog_errno(status);
-	return status;
+	mlog_errno(-ENOMEM);
+	return -ENOMEM;
 }
 
 static int debug_lockres_release(struct inode *inode, struct file *file)

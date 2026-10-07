@@ -2,6 +2,7 @@
 /*
  * Copyright 2011 Wolfson Microelectronics plc
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/debugfs.h>
@@ -15,7 +16,7 @@
 #include <linux/string.h>
 #include <linux/qti-regmap-debugfs.h>
 
-#include "internal.h"
+#include "drivers/base/regmap/internal.h"
 
 struct regmap_qti_debugfs {
 	struct list_head	list;
@@ -328,8 +329,8 @@ static ssize_t regmap_read_debugfs(struct regmap *map, unsigned int from,
 	if (*ppos < 0 || !count)
 		return -EINVAL;
 
-	if (count > (PAGE_SIZE << (MAX_ORDER - 1)))
-		count = PAGE_SIZE << (MAX_ORDER - 1);
+	if (count > (PAGE_SIZE << (MAX_PAGE_ORDER - 1)))
+		count = PAGE_SIZE << (MAX_PAGE_ORDER - 1);
 
 	buf = kzalloc(count, GFP_KERNEL);
 	if (!buf)
@@ -350,15 +351,15 @@ static ssize_t regmap_read_debugfs(struct regmap *map, unsigned int from,
 				break;
 
 			/* Format the register */
-			snprintf(buf + buf_pos, count - buf_pos, "%.*x: ",
-				 map->debugfs_reg_len, i - from);
+			scnprintf(buf + buf_pos, count - buf_pos, "%.*x: ",
+				  map->debugfs_reg_len, i - from);
 			buf_pos += map->debugfs_reg_len + 2;
 
 			/* Format the value, write all X if we can't read */
 			ret = regmap_read(map, i, &val);
 			if (ret == 0)
-				snprintf(buf + buf_pos, count - buf_pos,
-					 "%.*x", map->debugfs_val_len, val);
+				scnprintf(buf + buf_pos, count - buf_pos,
+					  "%.*x", map->debugfs_val_len, val);
 			else
 				memset(buf + buf_pos, 'X',
 				       map->debugfs_val_len);
@@ -691,4 +692,4 @@ void devm_regmap_qti_debugfs_unregister(struct regmap *regmap)
 EXPORT_SYMBOL(devm_regmap_qti_debugfs_unregister);
 
 MODULE_DESCRIPTION("Regmap QTI debugfs library");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

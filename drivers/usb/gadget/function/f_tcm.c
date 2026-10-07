@@ -19,7 +19,7 @@
 #include <scsi/scsi_tcq.h>
 #include <target/target_core_base.h>
 #include <target/target_core_fabric.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include "tcm.h"
 #include "u_tcm.h"
@@ -1041,19 +1041,17 @@ static void usbg_cmd_work(struct work_struct *work)
 
 	dir = get_cmd_dir(cmd->cmd_buf);
 	if (dir < 0) {
-		transport_init_se_cmd(se_cmd,
-				tv_nexus->tvn_se_sess->se_tpg->se_tpg_tfo,
-				tv_nexus->tvn_se_sess, cmd->data_len, DMA_NONE,
-				cmd->prio_attr, cmd->sense_iu.sense,
-				cmd->unpacked_lun);
+		__target_init_cmd(se_cmd,
+				  tv_nexus->tvn_se_sess->se_tpg->se_tpg_tfo,
+				  tv_nexus->tvn_se_sess, cmd->data_len, DMA_NONE,
+				  cmd->prio_attr, cmd->sense_iu.sense,
+				  cmd->unpacked_lun, NULL);
 		goto out;
 	}
 
-	if (target_submit_cmd(se_cmd, tv_nexus->tvn_se_sess, cmd->cmd_buf,
-			      cmd->sense_iu.sense, cmd->unpacked_lun, 0,
-			      cmd->prio_attr, dir, flags) < 0)
-		goto out;
-
+	target_submit_cmd(se_cmd, tv_nexus->tvn_se_sess, cmd->cmd_buf,
+			  cmd->sense_iu.sense, cmd->unpacked_lun, 0,
+			  cmd->prio_attr, dir, flags);
 	return;
 
 out:
@@ -1178,19 +1176,17 @@ static void bot_cmd_work(struct work_struct *work)
 
 	dir = get_cmd_dir(cmd->cmd_buf);
 	if (dir < 0) {
-		transport_init_se_cmd(se_cmd,
-				tv_nexus->tvn_se_sess->se_tpg->se_tpg_tfo,
-				tv_nexus->tvn_se_sess, cmd->data_len, DMA_NONE,
-				cmd->prio_attr, cmd->sense_iu.sense,
-				cmd->unpacked_lun);
+		__target_init_cmd(se_cmd,
+				  tv_nexus->tvn_se_sess->se_tpg->se_tpg_tfo,
+				  tv_nexus->tvn_se_sess, cmd->data_len, DMA_NONE,
+				  cmd->prio_attr, cmd->sense_iu.sense,
+				  cmd->unpacked_lun, NULL);
 		goto out;
 	}
 
-	if (target_submit_cmd(se_cmd, tv_nexus->tvn_se_sess,
-			cmd->cmd_buf, cmd->sense_iu.sense, cmd->unpacked_lun,
-			cmd->data_len, cmd->prio_attr, dir, 0) < 0)
-		goto out;
-
+	target_submit_cmd(se_cmd, tv_nexus->tvn_se_sess,
+			  cmd->cmd_buf, cmd->sense_iu.sense, cmd->unpacked_lun,
+			  cmd->data_len, cmd->prio_attr, dir, 0);
 	return;
 
 out:
@@ -1253,11 +1249,6 @@ static int usbg_check_true(struct se_portal_group *se_tpg)
 	return 1;
 }
 
-static int usbg_check_false(struct se_portal_group *se_tpg)
-{
-	return 0;
-}
-
 static char *usbg_get_fabric_wwn(struct se_portal_group *se_tpg)
 {
 	struct usbg_tpg *tpg = container_of(se_tpg,
@@ -1274,11 +1265,6 @@ static u16 usbg_get_tag(struct se_portal_group *se_tpg)
 	return tpg->tport_tpgt;
 }
 
-static u32 usbg_tpg_get_inst_index(struct se_portal_group *se_tpg)
-{
-	return 1;
-}
-
 static void usbg_release_cmd(struct se_cmd *se_cmd)
 {
 	struct usbg_cmd *cmd = container_of(se_cmd, struct usbg_cmd,
@@ -1287,20 +1273,6 @@ static void usbg_release_cmd(struct se_cmd *se_cmd)
 
 	kfree(cmd->data_buf);
 	target_free_tag(se_sess, se_cmd);
-}
-
-static u32 usbg_sess_get_index(struct se_session *se_sess)
-{
-	return 0;
-}
-
-static void usbg_set_default_node_attrs(struct se_node_acl *nacl)
-{
-}
-
-static int usbg_get_cmd_state(struct se_cmd *se_cmd)
-{
-	return 0;
 }
 
 static void usbg_queue_tm_rsp(struct se_cmd *se_cmd)
@@ -1495,42 +1467,24 @@ static struct configfs_attribute *usbg_wwn_attrs[] = {
 	NULL,
 };
 
-static ssize_t tcm_usbg_tpg_enable_show(struct config_item *item, char *page)
-{
-	struct se_portal_group *se_tpg = to_tpg(item);
-	struct usbg_tpg  *tpg = container_of(se_tpg, struct usbg_tpg, se_tpg);
-
-	return snprintf(page, PAGE_SIZE, "%u\n", tpg->gadget_connect);
-}
-
 static int usbg_attach(struct usbg_tpg *);
 static void usbg_detach(struct usbg_tpg *);
 
-static ssize_t tcm_usbg_tpg_enable_store(struct config_item *item,
-		const char *page, size_t count)
+static int usbg_enable_tpg(struct se_portal_group *se_tpg, bool enable)
 {
-	struct se_portal_group *se_tpg = to_tpg(item);
 	struct usbg_tpg  *tpg = container_of(se_tpg, struct usbg_tpg, se_tpg);
-	bool op;
-	ssize_t ret;
+	int ret = 0;
 
-	ret = strtobool(page, &op);
-	if (ret)
-		return ret;
-
-	if ((op && tpg->gadget_connect) || (!op && !tpg->gadget_connect))
-		return -EINVAL;
-
-	if (op)
+	if (enable)
 		ret = usbg_attach(tpg);
 	else
 		usbg_detach(tpg);
 	if (ret)
 		return ret;
 
-	tpg->gadget_connect = op;
+	tpg->gadget_connect = enable;
 
-	return count;
+	return 0;
 }
 
 static ssize_t tcm_usbg_tpg_nexus_show(struct config_item *item, char *page)
@@ -1546,8 +1500,8 @@ static ssize_t tcm_usbg_tpg_nexus_show(struct config_item *item, char *page)
 		ret = -ENODEV;
 		goto out;
 	}
-	ret = snprintf(page, PAGE_SIZE, "%s\n",
-			tv_nexus->tvn_se_sess->se_node_acl->initiatorname);
+	ret = sysfs_emit(page, "%s\n",
+			 tv_nexus->tvn_se_sess->se_node_acl->initiatorname);
 out:
 	mutex_unlock(&tpg->tpg_mutex);
 	return ret;
@@ -1673,11 +1627,9 @@ static ssize_t tcm_usbg_tpg_nexus_store(struct config_item *item,
 	return count;
 }
 
-CONFIGFS_ATTR(tcm_usbg_tpg_, enable);
 CONFIGFS_ATTR(tcm_usbg_tpg_, nexus);
 
 static struct configfs_attribute *usbg_base_attrs[] = {
-	&tcm_usbg_tpg_attr_enable,
 	&tcm_usbg_tpg_attr_nexus,
 	NULL,
 };
@@ -1711,16 +1663,9 @@ static const struct target_core_fabric_ops usbg_ops = {
 	.tpg_get_wwn			= usbg_get_fabric_wwn,
 	.tpg_get_tag			= usbg_get_tag,
 	.tpg_check_demo_mode		= usbg_check_true,
-	.tpg_check_demo_mode_cache	= usbg_check_false,
-	.tpg_check_demo_mode_write_protect = usbg_check_false,
-	.tpg_check_prod_mode_write_protect = usbg_check_false,
-	.tpg_get_inst_index		= usbg_tpg_get_inst_index,
 	.release_cmd			= usbg_release_cmd,
-	.sess_get_index			= usbg_sess_get_index,
 	.sess_get_initiator_sid		= NULL,
 	.write_pending			= usbg_send_write_request,
-	.set_default_node_attributes	= usbg_set_default_node_attrs,
-	.get_cmd_state			= usbg_get_cmd_state,
 	.queue_data_in			= usbg_send_read_response,
 	.queue_status			= usbg_send_status_response,
 	.queue_tm_rsp			= usbg_queue_tm_rsp,
@@ -1730,13 +1675,17 @@ static const struct target_core_fabric_ops usbg_ops = {
 	.fabric_make_wwn		= usbg_make_tport,
 	.fabric_drop_wwn		= usbg_drop_tport,
 	.fabric_make_tpg		= usbg_make_tpg,
+	.fabric_enable_tpg		= usbg_enable_tpg,
 	.fabric_drop_tpg		= usbg_drop_tpg,
 	.fabric_post_link		= usbg_port_link,
-	.fabric_post_unlink		= usbg_port_unlink,
+	.fabric_pre_unlink		= usbg_port_unlink,
 	.fabric_init_nodeacl		= usbg_init_nodeacl,
 
 	.tfc_wwn_attrs			= usbg_wwn_attrs,
 	.tfc_tpg_base_attrs		= usbg_base_attrs,
+
+	.default_submit_type		= TARGET_DIRECT_SUBMIT,
+	.direct_submit_supp		= 1,
 };
 
 /* Start gadget.c code */
@@ -2065,158 +2014,31 @@ ep_fail:
 	return -ENOTSUPP;
 }
 
-static void tcm_cleanup_old_alt(struct f_uas *fu)
-{
-	if (fu->flags & USBG_IS_UAS)
-		uasp_cleanup_old_alt(fu);
-	else if (fu->flags & USBG_IS_BOT)
-		bot_cleanup_old_alt(fu);
-	fu->flags = 0;
-}
-
-static void tcm_delayed_set_alt_done(struct f_uas *fu)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-	fu->delayed_set_alt_state = USBG_DELAYED_SET_ALT_IDLE;
-	fu->delayed_set_alt_cancel = false;
-	spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-}
-
-static bool tcm_delayed_set_alt_cancelled(struct f_uas *fu)
-{
-	bool cancelled;
-	unsigned long flags;
-
-	spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-	cancelled = fu->delayed_set_alt_cancel;
-	spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-
-	return cancelled;
-}
-
-static bool tcm_complete_delayed_status(struct f_uas *fu)
-{
-	struct usb_composite_dev *cdev = fu->function.config->cdev;
-	struct usb_request *req = cdev->req;
-	unsigned long cdev_flags;
-	bool cancelled;
-	int ret;
-
-	spin_lock_irqsave(&cdev->lock, cdev_flags);
-	spin_lock(&fu->delayed_set_alt_lock);
-	cancelled = fu->delayed_set_alt_cancel;
-	if (!cancelled) {
-		fu->delayed_set_alt_state = USBG_DELAYED_SET_ALT_IDLE;
-		fu->delayed_set_alt_cancel = false;
-	}
-	spin_unlock(&fu->delayed_set_alt_lock);
-
-	if (cancelled) {
-		spin_unlock_irqrestore(&cdev->lock, cdev_flags);
-		return false;
-	}
-
-	if (cdev->delayed_status == 0) {
-		WARN(cdev, "%s: Unexpected call\n", __func__);
-	} else if (--cdev->delayed_status == 0) {
-		req->length = 0;
-		req->context = cdev;
-		ret = usb_ep_queue(cdev->gadget->ep0, req, GFP_ATOMIC);
-		if (ret == 0) {
-			cdev->setup_pending = true;
-		} else {
-			req->status = 0;
-			req->complete(cdev->gadget->ep0, req);
-		}
-	}
-
-	spin_unlock_irqrestore(&cdev->lock, cdev_flags);
-
-	return true;
-}
-
-static bool tcm_cancel_delayed_set_alt(struct f_uas *fu)
-{
-	bool cleanup = false;
-	bool cancel = false;
-	unsigned long flags;
-
-	spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-	switch (fu->delayed_set_alt_state) {
-	case USBG_DELAYED_SET_ALT_IDLE:
-		cleanup = true;
-		break;
-	case USBG_DELAYED_SET_ALT_QUEUED:
-	case USBG_DELAYED_SET_ALT_RUNNING:
-		fu->delayed_set_alt_cancel = true;
-		cancel = true;
-		break;
-	}
-	spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-
-	if (cancel && cancel_work(&fu->delayed_set_alt)) {
-		spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-		if (fu->delayed_set_alt_state == USBG_DELAYED_SET_ALT_QUEUED) {
-			fu->delayed_set_alt_state = USBG_DELAYED_SET_ALT_IDLE;
-			fu->delayed_set_alt_cancel = false;
-			cleanup = true;
-		}
-		spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-	}
-
-	return cleanup;
-}
-
-static void tcm_cancel_delayed_set_alt_sync(struct f_uas *fu)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-	if (fu->delayed_set_alt_state != USBG_DELAYED_SET_ALT_IDLE)
-		fu->delayed_set_alt_cancel = true;
-	spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-
-	cancel_work_sync(&fu->delayed_set_alt);
-
-	spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-	fu->delayed_set_alt_state = USBG_DELAYED_SET_ALT_IDLE;
-	fu->delayed_set_alt_cancel = false;
-	spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-}
+struct guas_setup_wq {
+	struct work_struct work;
+	struct f_uas *fu;
+	unsigned int alt;
+};
 
 static void tcm_delayed_set_alt(struct work_struct *wq)
 {
-	struct f_uas *fu = container_of(wq, struct f_uas, delayed_set_alt);
-	unsigned long flags;
-	unsigned int alt;
+	struct guas_setup_wq *work = container_of(wq, struct guas_setup_wq,
+			work);
+	struct f_uas *fu = work->fu;
+	int alt = work->alt;
 
-	spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-	if (fu->delayed_set_alt_state != USBG_DELAYED_SET_ALT_QUEUED) {
-		spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-		return;
-	}
-	fu->delayed_set_alt_state = USBG_DELAYED_SET_ALT_RUNNING;
-	alt = fu->delayed_alt;
-	spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
+	kfree(work);
 
-	tcm_cleanup_old_alt(fu);
-
-	if (tcm_delayed_set_alt_cancelled(fu))
-		goto out_done;
+	if (fu->flags & USBG_IS_BOT)
+		bot_cleanup_old_alt(fu);
+	if (fu->flags & USBG_IS_UAS)
+		uasp_cleanup_old_alt(fu);
 
 	if (alt == USB_G_ALT_INT_BBB)
 		bot_set_alt(fu);
 	else if (alt == USB_G_ALT_INT_UAS)
 		uasp_set_alt(fu);
-
-	if (tcm_complete_delayed_status(fu))
-		return;
-
-	tcm_cleanup_old_alt(fu);
-out_done:
-	tcm_delayed_set_alt_done(fu);
+	usb_composite_setup_continue(fu->function.config->cdev);
 }
 
 static int tcm_get_alt(struct usb_function *f, unsigned intf)
@@ -2242,20 +2064,15 @@ static int tcm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		return -EOPNOTSUPP;
 
 	if ((alt == USB_G_ALT_INT_BBB) || (alt == USB_G_ALT_INT_UAS)) {
-		unsigned long flags;
+		struct guas_setup_wq *work;
 
-		spin_lock_irqsave(&fu->delayed_set_alt_lock, flags);
-		if (fu->delayed_set_alt_state != USBG_DELAYED_SET_ALT_IDLE) {
-			spin_unlock_irqrestore(&fu->delayed_set_alt_lock,
-					       flags);
-			return -EBUSY;
-		}
-		fu->delayed_alt = alt;
-		fu->delayed_set_alt_cancel = false;
-		fu->delayed_set_alt_state = USBG_DELAYED_SET_ALT_QUEUED;
-		spin_unlock_irqrestore(&fu->delayed_set_alt_lock, flags);
-
-		schedule_work(&fu->delayed_set_alt);
+		work = kmalloc(sizeof(*work), GFP_ATOMIC);
+		if (!work)
+			return -ENOMEM;
+		INIT_WORK(&work->work, tcm_delayed_set_alt);
+		work->fu = fu;
+		work->alt = alt;
+		schedule_work(&work->work);
 		return USB_GADGET_DELAYED_STATUS;
 	}
 	return -EOPNOTSUPP;
@@ -2265,8 +2082,11 @@ static void tcm_disable(struct usb_function *f)
 {
 	struct f_uas *fu = to_f_uas(f);
 
-	if (tcm_cancel_delayed_set_alt(fu))
-		tcm_cleanup_old_alt(fu);
+	if (fu->flags & USBG_IS_UAS)
+		uasp_cleanup_old_alt(fu);
+	else if (fu->flags & USBG_IS_BOT)
+		bot_cleanup_old_alt(fu);
+	fu->flags = 0;
 }
 
 static int tcm_setup(struct usb_function *f,
@@ -2414,16 +2234,11 @@ static void tcm_free(struct usb_function *f)
 {
 	struct f_uas *tcm = to_f_uas(f);
 
-	tcm_cancel_delayed_set_alt_sync(tcm);
 	kfree(tcm);
 }
 
 static void tcm_unbind(struct usb_configuration *c, struct usb_function *f)
 {
-	struct f_uas *fu = to_f_uas(f);
-
-	tcm_cancel_delayed_set_alt_sync(fu);
-	tcm_cleanup_old_alt(fu);
 	usb_free_all_descriptors(f);
 }
 
@@ -2456,8 +2271,6 @@ static struct usb_function *tcm_alloc(struct usb_function_instance *fi)
 	fu->function.disable = tcm_disable;
 	fu->function.free_func = tcm_free;
 	fu->tpg = tpg_instances[i].tpg;
-	INIT_WORK(&fu->delayed_set_alt, tcm_delayed_set_alt);
-	spin_lock_init(&fu->delayed_set_alt_lock);
 	mutex_unlock(&tpg_instances_lock);
 
 	return &fu->function;
@@ -2465,7 +2278,7 @@ static struct usb_function *tcm_alloc(struct usb_function_instance *fi)
 
 DECLARE_USB_FUNCTION(tcm, tcm_alloc_inst, tcm_alloc);
 
-static int tcm_init(void)
+static int __init tcm_init(void)
 {
 	int ret;
 
@@ -2481,12 +2294,13 @@ static int tcm_init(void)
 }
 module_init(tcm_init);
 
-static void tcm_exit(void)
+static void __exit tcm_exit(void)
 {
 	target_unregister_template(&usbg_ops);
 	usb_function_unregister(&tcmusb_func);
 }
 module_exit(tcm_exit);
 
+MODULE_DESCRIPTION("Target based USB-Gadget");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sebastian Andrzej Siewior");

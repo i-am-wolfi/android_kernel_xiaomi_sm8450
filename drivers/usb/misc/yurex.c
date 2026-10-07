@@ -137,6 +137,7 @@ static void yurex_interrupt(struct urb *urb)
 		dev_err(&dev->interface->dev,
 			"%s - overflow with length %d, actual length is %d\n",
 			__func__, YUREX_BUF_SIZE, dev->urb->actual_length);
+		return;
 	case -ECONNRESET:
 	case -ENOENT:
 	case -ESHUTDOWN:
@@ -399,7 +400,7 @@ static ssize_t yurex_read(struct file *file, char __user *buffer, size_t count,
 			  loff_t *ppos)
 {
 	struct usb_yurex *dev;
-	int len = 0;
+	int len;
 	char in_buffer[20];
 	unsigned long flags;
 
@@ -532,4 +533,5 @@ static const struct file_operations yurex_fops = {
 
 module_usb_driver(yurex_driver);
 
+MODULE_DESCRIPTION("USB YUREX driver support");
 MODULE_LICENSE("GPL");

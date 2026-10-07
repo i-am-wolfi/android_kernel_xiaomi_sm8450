@@ -22,6 +22,10 @@
 
 #define LP_PKT_CNT		64
 
+#define HINIC_MAX_JUMBO_FRAME_SIZE      15872
+#define HINIC_MAX_MTU_SIZE      (HINIC_MAX_JUMBO_FRAME_SIZE - ETH_HLEN - ETH_FCS_LEN)
+#define HINIC_MIN_MTU_SIZE      256
+
 enum hinic_flags {
 	HINIC_LINK_UP = BIT(0),
 	HINIC_INTF_UP = BIT(1),
@@ -100,6 +104,8 @@ struct hinic_dev {
 	u16				num_rss;
 	u16				rss_limit;
 	struct hinic_rss_type		rss_type;
+	u8				*rss_hkey_user;
+	s32				*rss_indir_user;
 	struct hinic_intr_coal_info	*rx_intr_coalesce;
 	struct hinic_intr_coal_info	*tx_intr_coalesce;
 	struct hinic_sriov_info sriov_info;

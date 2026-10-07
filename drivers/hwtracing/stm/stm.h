@@ -79,7 +79,6 @@ void stm_put_device(struct stm_device *stm);
 struct stm_source_device {
 	struct device		dev;
 	struct stm_source_data	*data;
-	struct mutex	link_mutex;
 	spinlock_t		link_lock;
 	struct stm_device __rcu	*link;
 	struct list_head	link_entry;
@@ -97,7 +96,7 @@ struct stm_protocol_driver {
 	const char	*name;
 	ssize_t		(*write)(struct stm_data *data,
 				 struct stm_output *output, unsigned int chan,
-				 const char *buf, size_t count);
+				 const char *buf, size_t count, struct stm_source_data *source);
 	void		(*policy_node_init)(void *arg);
 	int		(*output_open)(void *priv, struct stm_output *output);
 	void		(*output_close)(struct stm_output *output);

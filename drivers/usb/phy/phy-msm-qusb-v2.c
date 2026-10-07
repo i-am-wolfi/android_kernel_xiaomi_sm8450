@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/module.h>
@@ -148,11 +149,16 @@ struct qusb_phy {
 	u8                      bias_ctrl2;
 
 	bool			override_bias_ctrl2;
+	bool			power_enabled;
+	bool			clocks_enabled;
 };
 
 static void qusb_phy_enable_clocks(struct qusb_phy *qphy, bool on)
 {
 	dev_dbg(qphy->phy.dev, "%s(): on:%d\n", __func__, on);
+
+	if (qphy->clocks_enabled == on)
+		return;
 
 	if (on) {
 		clk_prepare_enable(qphy->ref_clk_src);
@@ -171,6 +177,8 @@ static void qusb_phy_enable_clocks(struct qusb_phy *qphy, bool on)
 
 		clk_disable_unprepare(qphy->ref_clk_src);
 	}
+
+	qphy->clocks_enabled = on;
 }
 
 static int qusb_phy_config_vdd(struct qusb_phy *qphy, int high)
@@ -195,6 +203,11 @@ static int qusb_phy_disable_power(struct qusb_phy *qphy)
 	int ret = 0;
 
 	mutex_lock(&qphy->lock);
+
+	if (!qphy->power_enabled) {
+		mutex_unlock(&qphy->lock);
+		return 0;
+	}
 
 	dev_dbg(qphy->phy.dev, "%s:req to turn off regulators\n",
 			__func__);
@@ -266,6 +279,7 @@ static int qusb_phy_disable_power(struct qusb_phy *qphy)
 
 	pr_debug("%s(): QUSB PHY's regulators are turned OFF.\n", __func__);
 
+	qphy->power_enabled = false;
 	mutex_unlock(&qphy->lock);
 
 	return ret;
@@ -276,6 +290,11 @@ static int qusb_phy_enable_power(struct qusb_phy *qphy)
 	int ret = 0;
 
 	mutex_lock(&qphy->lock);
+
+	if (qphy->power_enabled) {
+		mutex_unlock(&qphy->lock);
+		return 0;
+	}
 
 	dev_dbg(qphy->phy.dev, "%s:req to turn on regulators\n",
 			__func__);
@@ -354,6 +373,7 @@ static int qusb_phy_enable_power(struct qusb_phy *qphy)
 	}
 	pr_debug("%s(): QUSB PHY's regulators are turned ON.\n", __func__);
 
+	qphy->power_enabled = true;
 	mutex_unlock(&qphy->lock);
 
 	return ret;
@@ -461,6 +481,25 @@ static void qusb_phy_write_seq(void __iomem *base, u32 *seq, int cnt,
 	}
 }
 
+static void msm_usb_write_readback(void __iomem *base, u32 offset,
+					const u32 mask, u32 val)
+{
+	u32 write_val, tmp = readl_relaxed(base + offset);
+
+	tmp &= ~mask;		/* retain other bits */
+	write_val = tmp | val;
+
+	writel_relaxed(write_val, base + offset);
+
+	/* Read back to see if val was written */
+	tmp = readl_relaxed(base + offset);
+	tmp &= mask;		/* clear other bits */
+
+	if (tmp != val)
+		pr_err("%s: write: %x to QSCRATCH: %x FAILED\n",
+			__func__, val, offset);
+}
+
 static void qusb_phy_reset(struct qusb_phy *qphy)
 {
 	int ret;
@@ -495,8 +534,6 @@ static void qusb_phy_host_init(struct usb_phy *phy)
 	int p_index;
 	struct qusb_phy *qphy = container_of(phy, struct qusb_phy, phy);
 
-	dev_dbg(phy->dev, "%s\n", __func__);
-
 	qusb_phy_write_seq(qphy->base, qphy->qusb_phy_host_init_seq,
 			qphy->host_init_seq_len, 0);
 
@@ -506,7 +543,7 @@ static void qusb_phy_host_init(struct usb_phy *phy)
 	} else {
 		/* For non fused chips we need to write the TUNE1 param as
 		 * specified in DT otherwise we will end up writing 0 to
-		 * to TUNE1
+		 * TUNE1
 		 */
 		qphy->tune_val = readb_relaxed(qphy->base +
 					qphy->phy_reg[PORT_TUNE1]);
@@ -555,13 +592,13 @@ static int qusb_phy_init(struct usb_phy *phy)
 	int p_index;
 	u8 reg;
 
-	dev_dbg(phy->dev, "%s\n", __func__);
-
 	if (qphy->eud_enable_reg && readl_relaxed(qphy->eud_enable_reg)) {
 		dev_err(qphy->phy.dev, "eud is enabled\n");
 		return 0;
 	}
 
+	qusb_phy_enable_power(qphy);
+	qusb_phy_enable_clocks(qphy, true);
 	qusb_phy_reset(qphy);
 
 	if (qphy->qusb_phy_host_init_seq && qphy->phy.flags & PHY_HOST_MODE) {
@@ -656,8 +693,6 @@ static void qusb_phy_shutdown(struct usb_phy *phy)
 {
 	struct qusb_phy *qphy = container_of(phy, struct qusb_phy, phy);
 
-	dev_dbg(phy->dev, "%s\n", __func__);
-
 	qusb_phy_disable_power(qphy);
 
 }
@@ -697,9 +732,16 @@ static int qusb_phy_set_suspend(struct usb_phy *phy, int suspend)
 	}
 
 suspend:
-	if (suspend) {
-		/* Bus suspend case */
-		if (qphy->cable_connected) {
+	if (suspend) { /* Bus suspend case */
+		/*
+		 * The HUB class drivers calls usb_phy_notify_disconnect() upon a device
+		 * disconnect. Consider a scenario where a USB device is disconnected without
+		 * detaching the OTG cable. phy->cable_connected is marked false due to above
+		 * mentioned call path. Now, while entering low power mode (host bus suspend),
+		 * we come here and turn off regulators thinking no cable is connected. Prevent
+		 * this by not turning off regulators while in host mode.
+		 */
+		if (qphy->cable_connected || (qphy->phy.flags & PHY_HOST_MODE)) {
 			/* Disable all interrupts */
 			writel_relaxed(0x00,
 				qphy->base + qphy->phy_reg[INTR_CTRL]);
@@ -815,6 +857,61 @@ static int qusb_phy_notify_disconnect(struct usb_phy *phy,
 	return 0;
 }
 
+#define DP_PULSE_WIDTH_MSEC 200
+static enum usb_charger_type usb_phy_drive_dp_pulse(struct usb_phy *phy)
+{
+	struct qusb_phy *qphy = container_of(phy, struct qusb_phy, phy);
+	int ret;
+
+	ret = qusb_phy_enable_power(qphy);
+	if (ret < 0) {
+		dev_dbg(qphy->phy.dev,
+			"dpdm regulator enable failed:%d\n", ret);
+		return 0;
+	}
+	qusb_phy_enable_clocks(qphy, true);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[PWR_CTRL1],
+				PWR_CTRL1_POWR_DOWN, 0x00);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[DEBUG_CTRL4],
+				FORCED_UTMI_DPPULLDOWN, 0x00);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[DEBUG_CTRL4],
+				FORCED_UTMI_DMPULLDOWN,
+				FORCED_UTMI_DMPULLDOWN);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[DEBUG_CTRL3],
+				0xd1, 0xd1);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[PWR_CTRL1],
+				CLAMP_N_EN, CLAMP_N_EN);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[INTR_CTRL],
+				DPSE_INTR_HIGH_SEL, 0x00);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[INTR_CTRL],
+				DPSE_INTR_EN, DPSE_INTR_EN);
+
+	msleep(DP_PULSE_WIDTH_MSEC);
+
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[INTR_CTRL],
+				DPSE_INTR_HIGH_SEL |
+				DPSE_INTR_EN, 0x00);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[DEBUG_CTRL3],
+				0xd1, 0x00);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[DEBUG_CTRL4],
+				FORCED_UTMI_DPPULLDOWN |
+				FORCED_UTMI_DMPULLDOWN, 0x00);
+	msm_usb_write_readback(qphy->base, qphy->phy_reg[PWR_CTRL1],
+				PWR_CTRL1_POWR_DOWN |
+				CLAMP_N_EN, 0x00);
+
+	msleep(20);
+
+	qusb_phy_enable_clocks(qphy, false);
+	ret = qusb_phy_disable_power(qphy);
+	if (ret < 0) {
+		dev_dbg(qphy->phy.dev,
+			"dpdm regulator disable failed:%d\n", ret);
+	}
+
+	return 0;
+}
+
 static int qusb_phy_dpdm_regulator_enable(struct regulator_dev *rdev)
 {
 	int ret = 0;
@@ -823,10 +920,19 @@ static int qusb_phy_dpdm_regulator_enable(struct regulator_dev *rdev)
 	dev_dbg(qphy->phy.dev, "%s dpdm_enable:%d\n",
 				__func__, qphy->dpdm_enable);
 
+	/* Turn on the clocks to avoid unclocked access while reading EUD_EN reg*/
+	qusb_phy_enable_clocks(qphy, true);
 	if (qphy->eud_enable_reg && readl_relaxed(qphy->eud_enable_reg)) {
 		dev_err(qphy->phy.dev, "eud is enabled\n");
-		return 0;
+		/*
+		 * Dont turn off the clocks since EUD is enabled, and return -EPERM
+		 * since we dont want chargerfw to go ahead with its APSD operation
+		 */
+		return -EPERM;
 	}
+
+	if (!qphy->cable_connected)
+		qusb_phy_enable_clocks(qphy, false);
 
 	if (!qphy->dpdm_enable) {
 		ret = qusb_phy_enable_power(qphy);
@@ -872,7 +978,7 @@ static int qusb_phy_dpdm_regulator_is_enabled(struct regulator_dev *rdev)
 	return qphy->dpdm_enable;
 }
 
-static struct regulator_ops qusb_phy_dpdm_regulator_ops = {
+static const struct regulator_ops qusb_phy_dpdm_regulator_ops = {
 	.enable		= qusb_phy_dpdm_regulator_enable,
 	.disable	= qusb_phy_dpdm_regulator_disable,
 	.is_enabled	= qusb_phy_dpdm_regulator_is_enabled,
@@ -906,7 +1012,6 @@ static int qusb_phy_regulator_init(struct qusb_phy *qphy)
 
 static int qusb_phy_create_debugfs(struct qusb_phy *qphy)
 {
-	struct dentry *file;
 	int ret = 0, i;
 	char name[6];
 
@@ -921,27 +1026,12 @@ static int qusb_phy_create_debugfs(struct qusb_phy *qphy)
 
 	for (i = 0; i < 5; i++) {
 		snprintf(name, sizeof(name), "tune%d", (i + 1));
-		file = debugfs_create_x8(name, 0644, qphy->root,
+		debugfs_create_x8(name, 0644, qphy->root,
 						&qphy->tune[i]);
-		if (IS_ERR_OR_NULL(file)) {
-			dev_err(qphy->phy.dev,
-				"can't create debugfs entry for %s\n", name);
-			debugfs_remove_recursive(qphy->root);
-			ret = -ENOMEM;
-			goto create_err;
-		}
 	}
 
-	file = debugfs_create_x8("bias_ctrl2", 0644, qphy->root,
+	debugfs_create_x8("bias_ctrl2", 0644, qphy->root,
 						&qphy->bias_ctrl2);
-	if (IS_ERR_OR_NULL(file)) {
-		dev_err(qphy->phy.dev,
-			"can't create debugfs entry for bias_ctrl2\n");
-		debugfs_remove_recursive(qphy->root);
-		ret = -ENOMEM;
-		goto create_err;
-	}
-
 create_err:
 	return ret;
 }
@@ -1008,7 +1098,7 @@ static int qusb_phy_probe(struct platform_device *pdev)
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
 							"efuse_addr");
 	if (res) {
-		qphy->efuse_reg = devm_ioremap_nocache(dev, res->start,
+		qphy->efuse_reg = devm_ioremap(dev, res->start,
 							resource_size(res));
 		if (!IS_ERR_OR_NULL(qphy->efuse_reg)) {
 			ret = of_property_read_u32(dev->of_node,
@@ -1244,6 +1334,7 @@ static int qusb_phy_probe(struct platform_device *pdev)
 	qphy->phy.type			= USB_PHY_TYPE_USB2;
 	qphy->phy.notify_connect        = qusb_phy_notify_connect;
 	qphy->phy.notify_disconnect     = qusb_phy_notify_disconnect;
+	qphy->phy.charger_detect	= usb_phy_drive_dp_pulse;
 
 	ret = usb_add_phy_dev(&qphy->phy);
 	if (ret)
@@ -1267,7 +1358,7 @@ static int qusb_phy_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int qusb_phy_remove(struct platform_device *pdev)
+static void  qusb_phy_remove(struct platform_device *pdev)
 {
 	struct qusb_phy *qphy = platform_get_drvdata(pdev);
 
@@ -1276,7 +1367,6 @@ static int qusb_phy_remove(struct platform_device *pdev)
 	qusb_phy_set_suspend(&qphy->phy, true);
 	debugfs_remove_recursive(qphy->root);
 
-	return 0;
 }
 
 static const struct of_device_id qusb_phy_id_table[] = {
@@ -1297,4 +1387,4 @@ static struct platform_driver qusb_phy_driver = {
 module_platform_driver(qusb_phy_driver);
 
 MODULE_DESCRIPTION("MSM QUSB2 PHY v2 driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

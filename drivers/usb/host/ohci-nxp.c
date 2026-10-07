@@ -195,8 +195,7 @@ static int ohci_hcd_nxp_probe(struct platform_device *pdev)
 		goto fail_disable;
 	}
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
+	hcd->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(hcd->regs)) {
 		ret = PTR_ERR(hcd->regs);
 		goto fail_resource;
@@ -229,7 +228,7 @@ fail_disable:
 	return ret;
 }
 
-static int ohci_hcd_nxp_remove(struct platform_device *pdev)
+static void ohci_hcd_nxp_remove(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd = platform_get_drvdata(pdev);
 
@@ -238,8 +237,6 @@ static int ohci_hcd_nxp_remove(struct platform_device *pdev)
 	usb_put_hcd(hcd);
 	put_device(&isp1301_i2c_client->dev);
 	isp1301_i2c_client = NULL;
-
-	return 0;
 }
 
 /* work with hotplug and coldplug */
@@ -259,15 +256,13 @@ static struct platform_driver ohci_hcd_nxp_driver = {
 		.of_match_table = of_match_ptr(ohci_hcd_nxp_match),
 	},
 	.probe = ohci_hcd_nxp_probe,
-	.remove = ohci_hcd_nxp_remove,
+	.remove_new = ohci_hcd_nxp_remove,
 };
 
 static int __init ohci_nxp_init(void)
 {
 	if (usb_disabled())
 		return -ENODEV;
-
-	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
 
 	ohci_init_driver(&ohci_nxp_hc_driver, NULL);
 	return platform_driver_register(&ohci_hcd_nxp_driver);

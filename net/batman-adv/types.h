@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2007-2020  B.A.T.M.A.N. contributors:
+/* Copyright (C) B.A.T.M.A.N. contributors:
  *
  * Marek Lindner, Simon Wunderlich
  */
@@ -14,7 +14,6 @@
 #include <linux/average.h>
 #include <linux/bitops.h>
 #include <linux/compiler.h>
-#include <linux/completion.h>
 #include <linux/if.h>
 #include <linux/if_ether.h>
 #include <linux/kref.h>
@@ -22,7 +21,6 @@
 #include <linux/netdevice.h>
 #include <linux/netlink.h>
 #include <linux/sched.h> /* for linux/wait.h */
-#include <linux/seq_file.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
 #include <linux/timer.h>
@@ -84,9 +82,6 @@ struct batadv_hard_iface_bat_iv {
 	/** @ogm_seqno: OGM sequence number - used to identify each OGM */
 	atomic_t ogm_seqno;
 
-	/** @reschedule_work: recover OGM schedule after schedule error */
-	struct delayed_work reschedule_work;
-
 	/** @ogm_buff_mutex: lock protecting ogm_buff and ogm_buff_len */
 	struct mutex ogm_buff_mutex;
 };
@@ -130,12 +125,6 @@ struct batadv_hard_iface_bat_v {
 
 	/** @aggr_list: queue for to be aggregated OGM packets */
 	struct sk_buff_head aggr_list;
-
-	/**
-	 * @aggr_list_enabled: aggr_list is active and new skbs can be
-	 * enqueued. Protected by aggr_list.lock after initialization
-	 */
-	bool aggr_list_enabled:1;
 
 	/** @aggr_len: size of the OGM aggregate (excluding ethernet header) */
 	unsigned int aggr_len;
@@ -197,9 +186,6 @@ struct batadv_hard_iface {
 	/** @net_dev: pointer to the net_device */
 	struct net_device *net_dev;
 
-	/** @hardif_obj: kobject of the per interface sysfs "mesh" directory */
-	struct kobject *hardif_obj;
-
 	/** @refcount: number of contexts the object is used */
 	struct kref refcount;
 
@@ -232,13 +218,6 @@ struct batadv_hard_iface {
 	struct batadv_hard_iface_bat_v bat_v;
 #endif
 
-#ifdef CONFIG_BATMAN_ADV_DEBUGFS
-	/**
-	 * @debug_dir: dentry for nc subdir in batman-adv directory in debugfs
-	 */
-	struct dentry *debug_dir;
-#endif
-
 	/**
 	 * @neigh_list: list of unique single hop neighbors via this interface
 	 */
@@ -249,7 +228,8 @@ struct batadv_hard_iface {
 };
 
 /**
- * struct batadv_orig_ifinfo - B.A.T.M.A.N. IV private orig_ifinfo members
+ * struct batadv_orig_ifinfo_bat_iv - B.A.T.M.A.N. IV private orig_ifinfo
+ *  members
  */
 struct batadv_orig_ifinfo_bat_iv {
 	/**
@@ -307,14 +287,14 @@ struct batadv_frag_table_entry {
 	/** @lock: lock to protect the list of fragments */
 	spinlock_t lock;
 
-	/** @timestamp: time (jiffie) of last received fragment */
+	/** @timestamp: time (jiffy) of last received fragment */
 	unsigned long timestamp;
 
 	/** @seqno: sequence number of the fragments in the list */
 	u16 seqno;
 
 	/** @size: accumulated size of packets in list */
-	size_t size;
+	u16 size;
 
 	/** @total_size: expected size of the assembled packet */
 	u16 total_size;
@@ -465,7 +445,7 @@ struct batadv_orig_node {
 	 * @tt_buff_len: length of the last tt changeset this node received
 	 *  from the orig node
 	 */
-	u16 tt_buff_len;
+	s16 tt_buff_len;
 
 	/** @tt_buff_lock: lock that protects tt_buff and tt_buff_len */
 	spinlock_t tt_buff_lock;
@@ -879,6 +859,70 @@ enum batadv_counters {
 	 */
 	BATADV_CNT_TT_ROAM_ADV_RX,
 
+#ifdef CONFIG_BATMAN_ADV_MCAST
+	/**
+	 * @BATADV_CNT_MCAST_TX: transmitted batman-adv multicast packets
+	 *  counter
+	 */
+	BATADV_CNT_MCAST_TX,
+
+	/**
+	 * @BATADV_CNT_MCAST_TX_BYTES: transmitted batman-adv multicast packets
+	 *  bytes counter
+	 */
+	BATADV_CNT_MCAST_TX_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_TX_LOCAL: counter for multicast packets which
+	 *  were locally encapsulated and transmitted as batman-adv multicast
+	 *  packets
+	 */
+	BATADV_CNT_MCAST_TX_LOCAL,
+
+	/**
+	 * @BATADV_CNT_MCAST_TX_LOCAL_BYTES: bytes counter for multicast packets
+	 *  which were locally encapsulated and transmitted as batman-adv
+	 *  multicast packets
+	 */
+	BATADV_CNT_MCAST_TX_LOCAL_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX: received batman-adv multicast packet counter
+	 */
+	BATADV_CNT_MCAST_RX,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX_BYTES: received batman-adv multicast packet
+	 *  bytes counter
+	 */
+	BATADV_CNT_MCAST_RX_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX_LOCAL: counter for received batman-adv multicast
+	 *  packets which were forwarded to the local soft interface
+	 */
+	BATADV_CNT_MCAST_RX_LOCAL,
+
+	/**
+	 * @BATADV_CNT_MCAST_RX_LOCAL_BYTES: bytes counter for received
+	 *  batman-adv multicast packets which were forwarded to the local soft
+	 *  interface
+	 */
+	BATADV_CNT_MCAST_RX_LOCAL_BYTES,
+
+	/**
+	 * @BATADV_CNT_MCAST_FWD: counter for received batman-adv multicast
+	 *  packets which were forwarded to other, neighboring nodes
+	 */
+	BATADV_CNT_MCAST_FWD,
+
+	/**
+	 * @BATADV_CNT_MCAST_FWD_BYTES: bytes counter for received batman-adv
+	 *  multicast packets which were forwarded to other, neighboring nodes
+	 */
+	BATADV_CNT_MCAST_FWD_BYTES,
+#endif
+
 #ifdef CONFIG_BATMAN_ADV_DAT
 	/**
 	 * @BATADV_CNT_DAT_GET_TX: transmitted dht GET traffic packet counter
@@ -1013,7 +1057,7 @@ struct batadv_priv_tt {
 	 * @last_changeset_len: length of last tt changeset this host has
 	 *  generated
 	 */
-	u16 last_changeset_len;
+	s16 last_changeset_len;
 
 	/**
 	 * @last_changeset_lock: lock protecting last_changeset &
@@ -1042,12 +1086,6 @@ struct batadv_priv_tt {
 struct batadv_priv_bla {
 	/** @num_requests: number of bla requests in flight */
 	atomic_t num_requests;
-
-	/**
-	 * @num_requests_lock: locks update num_requests +
-	 * batadv_backbone_gw::state + batadv_backbone_gw::wait_periods update
-	 */
-	spinlock_t num_requests_lock;
 
 	/**
 	 * @claim_hash: hash table containing mesh nodes this host has claimed
@@ -1302,6 +1340,12 @@ struct batadv_priv_mcast {
 	atomic_t num_want_all_rtr6;
 
 	/**
+	 * @num_no_mc_ptype_capa: counter for number of nodes without the
+	 *  BATADV_MCAST_HAVE_MC_PTYPE_CAPA flag
+	 */
+	atomic_t num_no_mc_ptype_capa;
+
+	/**
 	 * @want_lists_lock: lock for protecting modifications to mcasts
 	 *  want_all_{unsnoopables,ipv4,ipv6}_list (traversals are rcu-locked)
 	 */
@@ -1318,13 +1362,6 @@ struct batadv_priv_mcast {
 struct batadv_priv_nc {
 	/** @work: work queue callback item for cleanup */
 	struct delayed_work work;
-
-#ifdef CONFIG_BATMAN_ADV_DEBUGFS
-	/**
-	 * @debug_dir: dentry for nc subdir in batman-adv directory in debugfs
-	 */
-	struct dentry *debug_dir;
-#endif
 
 	/**
 	 * @min_tq: only consider neighbors for encoding if neigh_tq > min_tq
@@ -1420,17 +1457,14 @@ struct batadv_tp_vars {
 	/** @role: receiver/sender modi */
 	enum batadv_tp_meter_role role;
 
-	/**
-	 * @send_result: 0 when sending is ongoing and otherwise
-	 * enum batadv_tp_meter_reason
-	 */
-	atomic_t send_result;
+	/** @sending: sending binary semaphore: 1 if sending, 0 is not */
+	atomic_t sending;
+
+	/** @reason: reason for a stopped session */
+	enum batadv_tp_meter_reason reason;
 
 	/** @finish_work: work item for the finishing procedure */
 	struct delayed_work finish_work;
-
-	/** @finished: completion signaled when a sender thread exits */
-	struct completion finished;
 
 	/** @test_length: test length in milliseconds */
 	u32 test_length;
@@ -1505,11 +1539,8 @@ struct batadv_tp_vars {
 	/** @unacked_list: list of unacked packets (meta-info only) */
 	struct list_head unacked_list;
 
-	/** @unacked_lock: protect unacked_list + &batadv_tp_receiver.last_recv */
+	/** @unacked_lock: protect unacked_list */
 	spinlock_t unacked_lock;
-
-	/** @unacked_count: number of unacked entries */
-	size_t unacked_count;
 
 	/** @last_recv_time: time (jiffies) a msg was received */
 	unsigned long last_recv_time;
@@ -1530,9 +1561,6 @@ struct batadv_softif_vlan {
 
 	/** @vid: VLAN identifier */
 	unsigned short vid;
-
-	/** @kobj: kobject for sysfs vlan subdirectory */
-	struct kobject *kobj;
 
 	/** @ap_isolation: AP isolation state */
 	atomic_t ap_isolation;		/* boolean */
@@ -1692,14 +1720,6 @@ struct batadv_priv {
 	/** @batman_queue_left: number of remaining OGM packet slots */
 	atomic_t batman_queue_left;
 
-	/** @mesh_obj: kobject for sysfs mesh subdirectory */
-	struct kobject *mesh_obj;
-
-#ifdef CONFIG_BATMAN_ADV_DEBUGFS
-	/** @debug_dir: dentry for debugfs batman-adv subdirectory */
-	struct dentry *debug_dir;
-#endif
-
 	/** @forw_bat_list: list of aggregated OGMs that will be forwarded */
 	struct hlist_head forw_bat_list;
 
@@ -1712,19 +1732,19 @@ struct batadv_priv {
 	/** @tp_list: list of tp sessions */
 	struct hlist_head tp_list;
 
-	/** @tp_num: number of currently active tp sessions */
+	/** @orig_hash: hash table containing mesh participants (orig nodes) */
 	struct batadv_hashtable *orig_hash;
 
-	/** @orig_hash: hash table containing mesh participants (orig nodes) */
+	/** @forw_bat_list_lock: lock protecting forw_bat_list */
 	spinlock_t forw_bat_list_lock;
 
-	/** @forw_bat_list_lock: lock protecting forw_bat_list */
+	/** @forw_bcast_list_lock: lock protecting forw_bcast_list */
 	spinlock_t forw_bcast_list_lock;
 
-	/** @forw_bcast_list_lock: lock protecting forw_bcast_list */
+	/** @tp_list_lock: spinlock protecting @tp_list */
 	spinlock_t tp_list_lock;
 
-	/** @tp_list_lock: spinlock protecting @tp_list */
+	/** @tp_num: number of currently active tp sessions */
 	atomic_t tp_num;
 
 	/** @orig_work: work queue callback item for orig node purging */
@@ -1791,76 +1811,9 @@ struct batadv_priv {
 	/** @bat_v: B.A.T.M.A.N. V per soft-interface private data */
 	struct batadv_priv_bat_v bat_v;
 #endif
-
-	/**
-	 * @softif_destroy: whether the mesh_free() is called via the
-	 *  batadv_softif_destroy_sysfs() or batadv_softif_destroy_netlink()
-	 *  codepath and doesn't have to clean up the untagged VLAN (sysfs)
-	 */
-	bool softif_destroy:1;
-};
-
-/**
- * struct batadv_socket_client - layer2 icmp socket client data
- */
-struct batadv_socket_client {
-	/**
-	 * @queue_list: packet queue for packets destined for this socket client
-	 */
-	struct list_head queue_list;
-
-	/** @queue_len: number of packets in the packet queue (queue_list) */
-	unsigned int queue_len;
-
-	/** @index: socket client's index in the batadv_socket_client_hash */
-	unsigned char index;
-
-	/** @lock: lock protecting queue_list, queue_len & index */
-	spinlock_t lock;
-
-	/** @queue_wait: socket client's wait queue */
-	wait_queue_head_t queue_wait;
-
-	/** @bat_priv: pointer to soft_iface this client belongs to */
-	struct batadv_priv *bat_priv;
-};
-
-/**
- * struct batadv_socket_packet - layer2 icmp packet for socket client
- */
-struct batadv_socket_packet {
-	/** @list: list node for &batadv_socket_client.queue_list */
-	struct list_head list;
-
-	/** @icmp_len: size of the layer2 icmp packet */
-	size_t icmp_len;
-
-	/** @icmp_packet: layer2 icmp packet */
-	u8 icmp_packet[BATADV_ICMP_MAX_PACKET_SIZE];
 };
 
 #ifdef CONFIG_BATMAN_ADV_BLA
-
-enum batadv_bla_backbone_gw_state {
-	/**
-	 * @BATADV_BLA_BACKBONE_GW_STOPPED: backbone gw is being removed
-	 * and it must not longer work on requests
-	 */
-	BATADV_BLA_BACKBONE_GW_STOPPED,
-
-	/**
-	 * @BATADV_BLA_BACKBONE_GW_UNSYNCED: backbone was detected out
-	 * of sync and a request was send. No traffic is forwarded until the
-	 * situation is resolved
-	 */
-	BATADV_BLA_BACKBONE_GW_UNSYNCED,
-
-	/**
-	 * @BATADV_BLA_BACKBONE_GW_SYNCED: backbone is consider to be in
-	 * sync. traffic can be forwarded
-	 */
-	BATADV_BLA_BACKBONE_GW_SYNCED,
-};
 
 /**
  * struct batadv_bla_backbone_gw - batman-adv gateway bridged into the LAN
@@ -1887,12 +1840,16 @@ struct batadv_bla_backbone_gw {
 	/**
 	 * @wait_periods: grace time for bridge forward delays and bla group
 	 *  forming at bootup phase - no bcast traffic is formwared until it has
-	 *  elapsed. Must only be access with num_requests_lock.
+	 *  elapsed
 	 */
-	u8 wait_periods;
+	atomic_t wait_periods;
 
-	/** @state: sync state. Must only be access with num_requests_lock. */
-	enum batadv_bla_backbone_gw_state state;
+	/**
+	 * @request_sent: if this bool is set to true we are out of sync with
+	 *  this backbone gateway - no bcast traffic is formwared until the
+	 *  situation was resolved
+	 */
+	atomic_t request_sent;
 
 	/** @crc: crc16 checksum over all claims */
 	u16 crc;
@@ -2065,9 +2022,6 @@ struct batadv_tt_req_node {
 struct batadv_tt_roam_node {
 	/** @addr: mac address of the client in the roaming phase */
 	u8 addr[ETH_ALEN];
-
-	/** @vid: VLAN identifier */
-	u16 vid;
 
 	/**
 	 * @counter: number of allowed roaming events per client within a single
@@ -2286,11 +2240,6 @@ struct batadv_algo_neigh_ops {
 				     struct batadv_neigh_node *neigh2,
 				     struct batadv_hard_iface *if_outgoing2);
 
-#ifdef CONFIG_BATMAN_ADV_DEBUGFS
-	/** @print: print the single hop neighbor list (optional) */
-	void (*print)(struct batadv_priv *priv, struct seq_file *seq);
-#endif
-
 	/** @dump: dump neighbors to a netlink socket (optional) */
 	void (*dump)(struct sk_buff *msg, struct netlink_callback *cb,
 		     struct batadv_priv *priv,
@@ -2301,12 +2250,6 @@ struct batadv_algo_neigh_ops {
  * struct batadv_algo_orig_ops - mesh algorithm callbacks (originator specific)
  */
 struct batadv_algo_orig_ops {
-#ifdef CONFIG_BATMAN_ADV_DEBUGFS
-	/** @print: print the originator table (optional) */
-	void (*print)(struct batadv_priv *priv, struct seq_file *seq,
-		      struct batadv_hard_iface *hard_iface);
-#endif
-
 	/** @dump: dump originators to a netlink socket (optional) */
 	void (*dump)(struct sk_buff *msg, struct netlink_callback *cb,
 		     struct batadv_priv *priv,
@@ -2321,14 +2264,9 @@ struct batadv_algo_gw_ops {
 	void (*init_sel_class)(struct batadv_priv *bat_priv);
 
 	/**
-	 * @store_sel_class: parse and stores a new GW selection class
-	 *  (optional)
+	 * @sel_class_max: maximum allowed GW selection class
 	 */
-	ssize_t (*store_sel_class)(struct batadv_priv *bat_priv, char *buff,
-				   size_t count);
-
-	/** @show_sel_class: prints the current GW selection class (optional) */
-	ssize_t (*show_sel_class)(struct batadv_priv *bat_priv, char *buff);
+	u32 sel_class_max;
 
 	/**
 	 * @get_best_gw_node: select the best GW from the list of available
@@ -2344,11 +2282,6 @@ struct batadv_algo_gw_ops {
 	bool (*is_eligible)(struct batadv_priv *bat_priv,
 			    struct batadv_orig_node *curr_gw_orig,
 			    struct batadv_orig_node *orig_node);
-
-#ifdef CONFIG_BATMAN_ADV_DEBUGFS
-	/** @print: print the gateway table (optional) */
-	void (*print)(struct batadv_priv *bat_priv, struct seq_file *seq);
-#endif
 
 	/** @dump: dump gateways to a netlink socket (optional) */
 	void (*dump)(struct sk_buff *msg, struct netlink_callback *cb,
@@ -2474,6 +2407,12 @@ struct batadv_tvlv_handler {
 			       u8 *src, u8 *dst,
 			       void *tvlv_value, u16 tvlv_value_len);
 
+	/**
+	 * @mcast_handler: handler callback which is given the tvlv payload to
+	 *  process on incoming mcast packet
+	 */
+	int (*mcast_handler)(struct batadv_priv *bat_priv, struct sk_buff *skb);
+
 	/** @type: tvlv type this handler feels responsible for */
 	u8 type;
 
@@ -2499,23 +2438,13 @@ enum batadv_tvlv_handler_flags {
 	 *  will call this handler even if its type was not found (with no data)
 	 */
 	BATADV_TVLV_HANDLER_OGM_CIFNOTFND = BIT(1),
-};
 
-/**
- * struct batadv_store_mesh_work - Work queue item to detach add/del interface
- *  from sysfs locks
- */
-struct batadv_store_mesh_work {
 	/**
-	 * @net_dev: netdevice to add/remove to/from batman-adv soft-interface
+	 * @BATADV_TVLV_HANDLER_OGM_CALLED: interval tvlv handling flag - the
+	 *  API marks a handler as being called, so it won't be called if the
+	 *  BATADV_TVLV_HANDLER_OGM_CIFNOTFND flag was set
 	 */
-	struct net_device *net_dev;
-
-	/** @soft_iface_name: name of soft-interface to modify */
-	char soft_iface_name[IFNAMSIZ];
-
-	/** @work: work queue item */
-	struct work_struct work;
+	BATADV_TVLV_HANDLER_OGM_CALLED = BIT(2),
 };
 
 #endif /* _NET_BATMAN_ADV_TYPES_H_ */

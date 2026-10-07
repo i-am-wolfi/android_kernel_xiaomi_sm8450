@@ -15,17 +15,10 @@
 #include "../virt-dma.h"
 
 #define EDMA_LL_SZ					24
-#define EDMA_MAX_WR_CH					8
-#define EDMA_MAX_RD_CH					8
 
 enum dw_edma_dir {
 	EDMA_DIR_WRITE = 0,
 	EDMA_DIR_READ
-};
-
-enum dw_edma_mode {
-	EDMA_MODE_LEGACY = 0,
-	EDMA_MODE_UNROLL
 };
 
 enum dw_edma_request {
@@ -40,21 +33,20 @@ enum dw_edma_status {
 	EDMA_ST_BUSY
 };
 
+enum dw_edma_xfer_type {
+	EDMA_XFER_SCATTER_GATHER = 0,
+	EDMA_XFER_CYCLIC,
+	EDMA_XFER_INTERLEAVED
+};
+
 struct dw_edma_chan;
 struct dw_edma_chunk;
-struct dw_edma;
 
 struct dw_edma_burst {
 	struct list_head		list;
 	u64				sar;
 	u64				dar;
 	u32				sz;
-};
-
-struct dw_edma_region {
-	phys_addr_t			paddr;
-	void				__iomem *vaddr;
-	size_t				sz;
 };
 
 struct dw_edma_chunk {
@@ -81,7 +73,6 @@ struct dw_edma_desc {
 
 struct dw_edma_chan {
 	struct virt_dma_chan		vc;
-	struct dw_edma_chip		*chip;
 	struct dw_edma			*dw;
 	int				id;
 	enum dw_edma_dir		dir;
@@ -104,38 +95,37 @@ struct dw_edma_irq {
 	struct dw_edma			*dw;
 };
 
-struct dw_edma_core_ops {
-	int	(*irq_vector)(struct device *dev, unsigned int nr);
-};
-
 struct dw_edma {
-	char				name[20];
+	char				name[32];
 
-	struct dma_device		wr_edma;
+	struct dma_device		dma;
+
 	u16				wr_ch_cnt;
-
-	struct dma_device		rd_edma;
 	u16				rd_ch_cnt;
-
-	struct dw_edma_region		rg_region;	/* Registers */
-	struct dw_edma_region		ll_region_wr[EDMA_MAX_WR_CH];
-	struct dw_edma_region		ll_region_rd[EDMA_MAX_RD_CH];
-	struct dw_edma_region		dt_region_wr[EDMA_MAX_WR_CH];
-	struct dw_edma_region		dt_region_rd[EDMA_MAX_RD_CH];
 
 	struct dw_edma_irq		*irq;
 	int				nr_irqs;
 
-	u32				version;
-	enum dw_edma_mode		mode;
-
 	struct dw_edma_chan		*chan;
 
-	raw_spinlock_t			lock;		/* Protect v0 shared registers */
+	raw_spinlock_t			lock;		/* Only for legacy */
 
 	struct dw_edma_chip             *chip;
 
 	const struct dw_edma_core_ops	*core;
+};
+
+typedef void (*dw_edma_handler_t)(struct dw_edma_chan *);
+
+struct dw_edma_core_ops {
+	void (*off)(struct dw_edma *dw);
+	u16 (*ch_count)(struct dw_edma *dw, enum dw_edma_dir dir);
+	enum dma_status (*ch_status)(struct dw_edma_chan *chan);
+	irqreturn_t (*handle_int)(struct dw_edma_irq *dw_irq, enum dw_edma_dir dir,
+				  dw_edma_handler_t done, dw_edma_handler_t abort);
+	void (*start)(struct dw_edma_chunk *chunk, bool first);
+	void (*ch_config)(struct dw_edma_chan *chan);
+	void (*debugfs_on)(struct dw_edma *dw);
 };
 
 struct dw_edma_sg {
@@ -152,12 +142,13 @@ struct dw_edma_cyclic {
 struct dw_edma_transfer {
 	struct dma_chan			*dchan;
 	union dw_edma_xfer {
-		struct dw_edma_sg	sg;
-		struct dw_edma_cyclic	cyclic;
+		struct dw_edma_sg		sg;
+		struct dw_edma_cyclic		cyclic;
+		struct dma_interleaved_template *il;
 	} xfer;
 	enum dma_transfer_direction	direction;
 	unsigned long			flags;
-	bool				cyclic;
+	enum dw_edma_xfer_type		type;
 };
 
 static inline
@@ -170,6 +161,49 @@ static inline
 struct dw_edma_chan *dchan2dw_edma_chan(struct dma_chan *dchan)
 {
 	return vc2dw_edma_chan(to_virt_chan(dchan));
+}
+
+static inline
+void dw_edma_core_off(struct dw_edma *dw)
+{
+	dw->core->off(dw);
+}
+
+static inline
+u16 dw_edma_core_ch_count(struct dw_edma *dw, enum dw_edma_dir dir)
+{
+	return dw->core->ch_count(dw, dir);
+}
+
+static inline
+enum dma_status dw_edma_core_ch_status(struct dw_edma_chan *chan)
+{
+	return chan->dw->core->ch_status(chan);
+}
+
+static inline irqreturn_t
+dw_edma_core_handle_int(struct dw_edma_irq *dw_irq, enum dw_edma_dir dir,
+			dw_edma_handler_t done, dw_edma_handler_t abort)
+{
+	return dw_irq->dw->core->handle_int(dw_irq, dir, done, abort);
+}
+
+static inline
+void dw_edma_core_start(struct dw_edma *dw, struct dw_edma_chunk *chunk, bool first)
+{
+	dw->core->start(chunk, first);
+}
+
+static inline
+void dw_edma_core_ch_config(struct dw_edma_chan *chan)
+{
+	chan->dw->core->ch_config(chan);
+}
+
+static inline
+void dw_edma_core_debugfs_on(struct dw_edma *dw)
+{
+	dw->core->debugfs_on(dw);
 }
 
 #endif /* _DW_EDMA_CORE_H */

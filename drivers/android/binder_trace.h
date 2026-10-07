@@ -78,7 +78,7 @@ DEFINE_BINDER_FUNCTION_RETURN_EVENT(binder_read_done);
 
 TRACE_EVENT(binder_set_priority,
 	TP_PROTO(int proc, int thread, unsigned int old_prio,
-		 unsigned int desired_prio, unsigned int new_prio),
+		 unsigned int new_prio, unsigned int desired_prio),
 	TP_ARGS(proc, thread, old_prio, new_prio, desired_prio),
 
 	TP_STRUCT__entry(
@@ -117,6 +117,35 @@ TRACE_EVENT(binder_wait_for_work,
 	TP_printk("proc_work=%d transaction_stack=%d thread_todo=%d",
 		  __entry->proc_work, __entry->transaction_stack,
 		  __entry->thread_todo)
+);
+
+TRACE_EVENT(binder_txn_latency_free,
+	TP_PROTO(struct binder_transaction *t,
+		 int from_proc, int from_thread,
+		 int to_proc, int to_thread),
+	TP_ARGS(t, from_proc, from_thread, to_proc, to_thread),
+	TP_STRUCT__entry(
+		__field(int, debug_id)
+		__field(int, from_proc)
+		__field(int, from_thread)
+		__field(int, to_proc)
+		__field(int, to_thread)
+		__field(unsigned int, code)
+		__field(unsigned int, flags)
+	),
+	TP_fast_assign(
+		__entry->debug_id = t->debug_id;
+		__entry->from_proc = from_proc;
+		__entry->from_thread = from_thread;
+		__entry->to_proc = to_proc;
+		__entry->to_thread = to_thread;
+		__entry->code = t->code;
+		__entry->flags = t->flags;
+	),
+	TP_printk("transaction=%d from %d:%d to %d:%d flags=0x%x code=0x%x",
+		  __entry->debug_id, __entry->from_proc, __entry->from_thread,
+		  __entry->to_proc, __entry->to_thread, __entry->code,
+		  __entry->flags)
 );
 
 TRACE_EVENT(binder_transaction,
@@ -312,7 +341,7 @@ DEFINE_EVENT(binder_buffer_class, binder_transaction_update_buffer_release,
 
 TRACE_EVENT(binder_update_page_range,
 	TP_PROTO(struct binder_alloc *alloc, bool allocate,
-		 void __user *start, void __user *end),
+		 unsigned long start, unsigned long end),
 	TP_ARGS(alloc, allocate, start, end),
 	TP_STRUCT__entry(
 		__field(int, proc)
@@ -416,6 +445,44 @@ TRACE_EVENT(binder_return,
 		  _IOC_NR(__entry->cmd) < ARRAY_SIZE(binder_return_strings) ?
 			  binder_return_strings[_IOC_NR(__entry->cmd)] :
 			  "unknown")
+);
+
+TRACE_EVENT(binder_netlink_report,
+	TP_PROTO(const char *context,
+		 struct binder_transaction *t,
+		 u32 data_size,
+		 u32 error,
+		 int is_reply),
+	TP_ARGS(context, t, data_size, error, is_reply),
+	TP_STRUCT__entry(
+		__field(const char *, context)
+		__field(u32, error)
+		__field(int, from_pid)
+		__field(int, from_tid)
+		__field(int, to_pid)
+		__field(int, to_tid)
+		__field(bool, is_reply)
+		__field(unsigned int, flags)
+		__field(unsigned int, code)
+		__field(size_t, data_size)
+	),
+	TP_fast_assign(
+		__entry->context = context;
+		__entry->error = error;
+		__entry->from_pid = t->from_pid;
+		__entry->from_tid = t->from_tid;
+		__entry->to_pid = t->to_proc ? t->to_proc->pid : 0;
+		__entry->to_tid = t->to_thread ? t->to_thread->pid : 0;
+		__entry->is_reply = is_reply;
+		__entry->flags = t->flags;
+		__entry->code = t->code;
+		__entry->data_size = data_size;
+	),
+	TP_printk("from %d:%d to %d:%d context=%s error=%d is_reply=%d flags=0x%x code=0x%x size=%zu",
+		  __entry->from_pid, __entry->from_tid,
+		  __entry->to_pid, __entry->to_tid,
+		  __entry->context, __entry->error, __entry->is_reply,
+		  __entry->flags, __entry->code, __entry->data_size)
 );
 
 #endif /* _BINDER_TRACE_H */

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
-
 #define pr_fmt(fmt) "%s:%s " fmt, KBUILD_MODNAME, __func__
 
 #include <linux/cpu.h>
@@ -15,7 +15,6 @@
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
-#define CPUFREQ_CDEV_NAME "cpu%d"
 #define CPUFREQ_CDEV "qcom-cpufreq-cdev"
 
 struct cpufreq_cdev_device {
@@ -139,7 +138,7 @@ static void cpufreq_cdev_register(struct work_struct *work)
 	cdev_data->cdev = thermal_cooling_device_register(cdev_data->cdev_name,
 						cdev_data, &cpufreq_cdev_ops);
 	if (IS_ERR(cdev_data->cdev)) {
-		pr_err("Cdev register failed for %s, ret:%d\n",
+		pr_err("Cdev register failed for %s, ret:%ld\n",
 			cdev_data->cdev_name, PTR_ERR(cdev_data->cdev));
 		freq_qos_remove_request(&cdev_data->qos_max_freq_req);
 		goto error_exit;
@@ -189,7 +188,7 @@ static int cpufreq_cdev_probe(struct platform_device *pdev)
 			cpu_phandle = it.node;
 			for_each_possible_cpu(cpu) {
 				cpu_dev = get_cpu_device(cpu);
-				if (cpu_dev && cpu_dev->of_node == cpu_phandle) {
+				if (cpu_dev && (cpu_dev->of_node == cpu_phandle)) {
 					cpu_count++;
 					break;
 				}
@@ -222,7 +221,7 @@ static int cpufreq_cdev_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int cpufreq_cdev_remove(struct platform_device *pdev)
+static void cpufreq_cdev_remove(struct platform_device *pdev)
 {
 	struct cpufreq_cdev_device *cdev_data;
 
@@ -242,7 +241,6 @@ static int cpufreq_cdev_remove(struct platform_device *pdev)
 		kfree(cdev_data->freq_table);
 	}
 	mutex_unlock(&qti_cpufreq_cdev_lock);
-	return 0;
 }
 
 static const struct of_device_id cpufreq_cdev_match[] = {
@@ -272,4 +270,4 @@ static void __exit cpufreq_cdev_exit(void)
 module_exit(cpufreq_cdev_exit);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. cpufreq cooling driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

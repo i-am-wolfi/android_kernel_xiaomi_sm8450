@@ -14,41 +14,46 @@
 #include <linux/of_device.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
-#include <linux/scmi_bwprof.h>
 #include <linux/scmi_protocol.h>
 #include <linux/configfs.h>
-#include <soc/qcom/smci_object.h>
-#include <linux/smcinvoke.h>
-#include <soc/qcom/smci_clientenv.h>
-#include "smci_bwprof.h"
-#include "trace-dcvs.h"
-#include "bwprof_scmi.h"
-
+#include <linux/qcom_scmi_vendor.h>
+#include <linux/of_platform.h>
+#include <linux/firmware/qcom/qcom_scm.h>
+#include <linux/firmware/qcom/si_object.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include "bwprof_scmi.h"
+#include "smci_bwprof.h"
+#include "trace-dcvs.h"
 
 #ifndef UINT32_C
 #define UINT32_C(x) ((uint32_t)(x))
 #endif
 
-#define BWMON_FEATURE_10MS  2102
-#define BWMON_FEATURE_1MS   2103
-#define BWMON_FEATURE_HIST  2104
+#define BWPROF_ALGO_STR	0x425750524F46 /* BWPROF */
+#define BWMON_FEATURE_10MS	2102 /* For 10ms sampling rate */
+#define BWMON_FEATURE_1MS	2103 /* For 1ms sampling rate */
+#define BWMON_FEATURE_HIST	2104 /* For Histogram sampling mode */
+#define BWMON_FEATURE_MULTIMEDIA	2107 /* For Multimedia masters */
+#define BUFFER_FILL_MS 100
 
 static struct bwprof_dev_data *bwprof_data;
 void __iomem *base_src;
+void __iomem *buffer_fill_status_src;
 struct bwprof_monitor_data *monitor_data;
 struct bwprof_hist_data *hist_data;
+struct buffer_fill_state *buffer_fill_status;
 
-static void reset_moniter_data(void)
+static void reset_monitor_data(void)
 {
+	unsigned long flags;
 	int i;
 	void __iomem *src;
 
 	if (!base_src || !monitor_data || !hist_data)
 		return;
 
-	mutex_lock(&bwprof_data->mons_lock);
+	spin_lock_irqsave(&bwprof_data->rx_lock, flags);
 	for (i = 0; i < MAX_NUM_SAMPLES; i++) {
 		src = base_src + i * sizeof(struct bwprof_monitor_data);
 		memcpy_fromio(&monitor_data[i], src,
@@ -59,33 +64,37 @@ static void reset_moniter_data(void)
 		src = base_src + i * sizeof(struct bwprof_hist_data);
 		memcpy_fromio(&hist_data[i], src, sizeof(struct bwprof_hist_data));
 	}
-	mutex_unlock(&bwprof_data->mons_lock);
+	spin_unlock_irqrestore(&bwprof_data->rx_lock, flags);
 }
 
-static bool check_master_info(u8 master, u8 list[], u8 cnt)
+static bool check_master_info(u8 master, u32 cfg_type)
 {
-	int i;
+	int i, hw_type;
+	struct bwprof_hw_group *hw_node;
+	struct sampling_mode_info *mode;
 
-	for (i = 0; i < cnt; i++)
-		if (master == list[i])
+	hw_type = (master >= DDR_CPU) ? BWPROF_DDR : BWPROF_LLCC;
+	hw_node = bwprof_data->hw_node[hw_type];
+	mode = hw_node->default_mode_val[cfg_type];
+
+	if (!hw_node || !mode)
+		return false;
+
+	for (i = 0; i < mode->num_masters; i++) {
+		if (master == mode->masters_list[i])
 			return true;
+	}
 
 	return false;
 }
 
 static bool is_master_enable(u8 master, u32 *master_idx)
 {
-	u32 hw_type = bwprof_data->hw_type;
-	struct bwprof_hw_group  *hw_node = bwprof_data->hw_node[hw_type];
-	struct sampling_mode_info *samp_mode = hw_node->mode[hw_node->cfg_type];
 	u32 i;
 
-	for (i = 0; i < samp_mode->num_masters; i++) {
-		if (master ==  samp_mode->masters_list[i]) {
+	for (i = 0; i < bwprof_data->num_masters; i++) {
+		if (master ==  bwprof_data->masters_list[i]) {
 			*master_idx = i;
-			if ((*master_idx > samp_mode->num_masters) ||
-					(*master_idx > MAX_MASTERS))
-				return false;
 			return true;
 		}
 	}
@@ -94,39 +103,39 @@ static bool is_master_enable(u8 master, u32 *master_idx)
 
 static int license_check_init(void)
 {
-	struct smci_object bwprof_env = {NULL, NULL};
-	struct smci_object bwprof_profiler = {NULL, NULL};
+	struct si_object *bwprof_env, *bwprof_profiler = NULL;
+	struct si_object_invoke_ctx oic;
 	int ret = 0;
 
-	ret = get_client_env_object(&bwprof_env);
+	ret = si_core_get_client_env(&oic, &bwprof_env);
 	if (ret) {
-		bwprof_env.invoke = NULL;
-		bwprof_env.context = NULL;
+		put_si_object(bwprof_env);
 		pr_err("bwprof_env: get client env object failed\n");
 		return -EIO;
 	}
 
-	ret = smci_clientenv_open(bwprof_env, SMCI_BWPROF_SERVICE_UID,
+	ret = si_core_client_env_open(&oic, bwprof_env, SMCI_BWPROF_SERVICE_UID,
 			&bwprof_profiler);
 	if (ret) {
-		bwprof_profiler.invoke = NULL;
-		bwprof_profiler.context = NULL;
-		pr_err("bwprof_profiler: smci client env open failed\n");
+		put_si_object(bwprof_profiler);
+		put_si_object(bwprof_env);
+		pr_err("bwprof_profiler: si core client env open failed\n");
 		return -EIO;
 	}
 
 	bwprof_data->bwprof_profiler = bwprof_profiler;
+	bwprof_data->oic = oic;
 
 	return ret;
 }
 
 static bool is_sampling_ms_valid(u32 ms_val)
 {
-	if ((ms_val == SAMPLING_1MS) || (ms_val == SAMPLING_10MS) ||
-			(ms_val == SAMPLING_100MS))
+	if (ms_val == SAMPLING_1MS || ms_val == SAMPLING_10MS ||
+			ms_val == SAMPLING_100MS)
 		return true;
 
-	if ((ms_val > SAMPLING_100MS) &&
+	if (ms_val > SAMPLING_100MS &&
 		((ms_val % SAMPLING_MS_GRANULARITY) == 0))
 		return true;
 
@@ -158,8 +167,7 @@ static int map_sampling_ms(u32 ms_mode)
 	return index;
 }
 
-static ssize_t
-bwprof_set_config_show(struct config_item *item, char *page)
+static ssize_t bwprof_set_config_show(struct config_item *item, char *page)
 {
 	if (!bwprof_data->is_set_config) {
 		page[0] = '\0';
@@ -172,10 +180,8 @@ bwprof_set_config_show(struct config_item *item, char *page)
 static ssize_t bwprof_set_config_store(struct config_item *item,
 		const char *page, size_t count)
 {
-	struct bwprof_hw_group *hw_node;
-	struct sampling_mode_info *sample_mode, *default_mode_val;
-	const struct scmi_bwprof_vendor_ops *ops = bwprof_data->bwprof_ops;
-	char *input, *token, *param_name, *ms_name;
+	const struct qcom_scmi_vendor_ops *ops = bwprof_data->bwprof_ops;
+	char *input, *token, *param_name, *ms_name, *input_str;
 	u32 i = 0, cfg_type = 0;
 	u16 sampling_ms;
 	u8 master_cnt = 0;
@@ -184,15 +190,20 @@ static ssize_t bwprof_set_config_store(struct config_item *item,
 	u8 bucket_cnt = 0;
 	u8 hist_enable = 0;
 	int ret;
+	struct sample_ms_info mode_info;
+	struct master_info info;
+	bool is_multimedia_enable = false;
 
 	if (bwprof_data->is_sampling_enable)
 		return -EINVAL;
 
-	input = kstrdup(page, GFP_KERNEL);
-	if (!input)
+	input_str = kstrdup(page, GFP_KERNEL);
+	if (!input_str)
 		return -EINVAL;
 
-	while ((token = strsep(&input, ":")) != NULL) {
+	input = input_str;
+
+	while ((token = strsep(&input_str, ":")) != NULL) {
 		param_name = strsep(&token, "=");
 		if (!param_name || !token) {
 			kfree(input);
@@ -207,11 +218,14 @@ static ssize_t bwprof_set_config_store(struct config_item *item,
 			continue;
 		} else if (!strcmp(param_name, "masters")) {
 			while ((ms_name = strsep(&token, ",")) != NULL) {
-				if (kstrtou8(ms_name, 0, &masters_list[master_cnt]) < 0) {
+				if (kstrtou8(ms_name, 0,
+					&masters_list[master_cnt]) < 0) {
 					kfree(input);
 					return -EINVAL;
 				}
 				master_cnt++;
+				if (master_cnt > MAX_MASTERS)
+					return -EINVAL;
 			}
 			continue;
 		} else if (!strcmp(param_name, "hist")) {
@@ -234,9 +248,9 @@ static ssize_t bwprof_set_config_store(struct config_item *item,
 		}
 	}
 
-	bwprof_data->is_hist_enable = (hist_enable) ? true:false;
-	if ((!is_sampling_ms_valid(sampling_ms)) || (master_cnt > MAX_MASTERS) ||
-			(master_cnt == 0))
+	bwprof_data->is_hist_enable = hist_enable ? true : false;
+	if (!is_sampling_ms_valid(sampling_ms) || master_cnt > MAX_MASTERS ||
+			master_cnt == 0)
 		return -EINVAL;
 
 	ret = license_check_init();
@@ -244,13 +258,14 @@ static ssize_t bwprof_set_config_store(struct config_item *item,
 		pr_err("bwprof_scmi: license_check_init failed\n");
 		return -EIO;
 	}
-
 	if (sampling_ms == SAMPLING_1MS) {
 		if (bwprof_data->is_hist_enable) {
-			ret = smci_bwprof_license_check(bwprof_data->bwprof_profiler,
+			ret = smci_bwprof_license_check(&bwprof_data->oic,
+					bwprof_data->bwprof_profiler,
 					BWMON_FEATURE_HIST, NULL, 0);
 		} else {
-			ret = smci_bwprof_license_check(bwprof_data->bwprof_profiler,
+			ret = smci_bwprof_license_check(&bwprof_data->oic,
+					bwprof_data->bwprof_profiler,
 					BWMON_FEATURE_1MS, NULL, 0);
 		}
 		if (ret) {
@@ -258,67 +273,75 @@ static ssize_t bwprof_set_config_store(struct config_item *item,
 			return -EIO;
 		}
 	}
-
 	cfg_type = map_sampling_ms(sampling_ms);
-	bwprof_data->hw_type = (masters_list[0] >= DDR_CPU) ? BWPROF_DDR :
-		BWPROF_LLCC;
-
-	hw_node = bwprof_data->hw_node[bwprof_data->hw_type];
-	sample_mode = hw_node->mode[cfg_type];
-	default_mode_val = hw_node->default_mode_val[cfg_type];
-
-	if (!hw_node || !sample_mode || !default_mode_val || !ops)
-		return -EINVAL;
 
 	for (i = 0; i < master_cnt; i++) {
-		if (!check_master_info(masters_list[i], default_mode_val->masters_list,
-					default_mode_val->num_masters))
+		if (!check_master_info(masters_list[i], cfg_type))
 			return -EINVAL;
+		info.masters[i] = masters_list[i];
+		if ((masters_list[i] >= LLCC_CAMERA &&
+				masters_list[i] <= LLCC_VPU) ||
+				(masters_list[i] >= DDR_CAMERA
+				&& masters_list[i] <= DDR_VPU))
+			is_multimedia_enable = true;
+	}
+
+	if (is_multimedia_enable) {
+		ret = smci_bwprof_license_check(&bwprof_data->oic,
+					bwprof_data->bwprof_profiler,
+					BWMON_FEATURE_MULTIMEDIA, NULL, 0);
+		if (ret) {
+			pr_err("smci_bwprof_license_check failed : %d\n", ret);
+			return -EIO;
+		}
 	}
 
 	if (hist_enable) {
-		if ((sampling_ms != SAMPLING_1MS) ||
-			(bucket_cnt > MAX_USER_BUCKETS) ||
-			(bucket_cnt == 0) || (bucket_cnt < MAX_USER_BUCKETS)) {
+		if (sampling_ms != SAMPLING_1MS ||
+				bucket_cnt > MAX_USER_BUCKETS ||
+				bucket_cnt == 0 ||
+				bucket_cnt < MAX_USER_BUCKETS) {
 			bwprof_data->is_hist_enable = false;
 			return -EINVAL;
 		}
-		for (i = 0; i < bucket_cnt; i++)
-			sample_mode->buckets[i] = bucket_list[i];
 	}
 
-	ret = ops->set_sample_ms(bwprof_data->ph, hist_enable, sampling_ms);
+	mode_info.hist = hist_enable;
+	mode_info.sample_ms = sampling_ms;
+	ret = ops->set_param(bwprof_data->ph, &mode_info,
+		BWPROF_ALGO_STR, BWPROF_SET_SAMPLE_MS, sizeof(mode_info));
 	if (ret < 0) {
-		pr_err("SCMI command set_sample_ms Failed: %d\n", ret);
+		pr_err("BWPROF_SET_SAMPLE_MS ops failed: %d\n", ret);
 		return ret;
 	}
 
 	if (hist_enable) {
-		ret = ops->set_hist_info(bwprof_data->ph, bucket_list);
+		ret = ops->set_param(bwprof_data->ph, &bucket_list,
+			BWPROF_ALGO_STR, BWPROF_SET_HIST_INFO,
+			sizeof(bucket_list));
 		if (ret < 0) {
-			pr_err("SCMI command set_hist_info Failed: %d\n", ret);
+			pr_err("BWPROF_SET_HIST_INFO ops failed: %d\n", ret);
 			return ret;
 		}
 	}
 
-	ret = ops->set_masters_list(bwprof_data->ph, master_cnt, masters_list);
+	info.cnt = master_cnt;
+	ret = ops->set_param(bwprof_data->ph, &info,
+		BWPROF_ALGO_STR, BWPROF_MASTER_LIST, sizeof(info));
 	if (ret < 0) {
-		pr_err("SCMI command set_masters_list Failed: %d\n", ret);
-		bwprof_data->is_hist_enable = false;
+		pr_err("BWPROF_MASTER_LIST ops failed: %d\n", ret);
 		return ret;
 	}
 
-	sample_mode->num_masters = master_cnt;
-	hw_node->cfg_type = cfg_type;
-	sample_mode->sampling_ms = sampling_ms;
 	bwprof_data->sample_ms = sampling_ms;
 	bwprof_data->is_set_config = true;
+	bwprof_data->num_masters = master_cnt;
 
 	strscpy(bwprof_data->set_config_str, page,
 			sizeof(bwprof_data->set_config_str));
 
 	for (i = 0; i < master_cnt; i++)
-		sample_mode->masters_list[i] = masters_list[i];
+		bwprof_data->masters_list[i] = masters_list[i];
 
 	kfree(input);
 	return count;
@@ -333,12 +356,10 @@ static ssize_t bwprof_available_config_show(struct config_item *item,
 	struct sampling_mode_info *mode;
 	u32 cnt = 0, j, i;
 	u8 k;
-	u32 samp_cnt;
 	const char *hw_name;
 
 	for (i = 0; i < bwprof_data->hw_cnt; i++) {
 		hw_node = bwprof_data->hw_node[i];
-		samp_cnt = hw_node->sampling_cnt;
 		if (hw_node->hw_type == BWPROF_DDR)
 			hw_name = "DDR";
 		else if (hw_node->hw_type == BWPROF_LLCC)
@@ -346,10 +367,12 @@ static ssize_t bwprof_available_config_show(struct config_item *item,
 		else
 			hw_name = "UNKNOWN";
 
-		cnt += scnprintf(page+cnt, PAGE_SIZE - cnt, "\nhw_type: %s",
+		cnt += scnprintf(page + cnt, PAGE_SIZE - cnt, "\nhw_type: %s",
 				hw_name);
-		for (j = 0; j < samp_cnt; j++) {
+		for (j = 0; j < TOTAL_SAMPLING_MODE_TYPES; j++) {
 			mode = hw_node->default_mode_val[j];
+			if (!mode)
+				continue;
 			if (j == BWPROF_HIST)
 				cnt += scnprintf(page + cnt, PAGE_SIZE - cnt,
 					"\nsampling_ms: %dms hist masters :",
@@ -362,31 +385,24 @@ static ssize_t bwprof_available_config_show(struct config_item *item,
 				cnt += scnprintf(page + cnt, PAGE_SIZE - cnt,
 					"%u ", mode->masters_list[k]);
 		}
-		cnt += scnprintf(page+cnt, PAGE_SIZE - cnt, "\n");
+		cnt += scnprintf(page + cnt, PAGE_SIZE - cnt, "\n");
 	}
 	return cnt;
 }
 
 CONFIGFS_ATTR_RO(bwprof_, available_config);
 
-static ssize_t
-bwprof_enable_config_show(struct config_item *item, char *page)
+static ssize_t bwprof_enable_config_show(struct config_item *item, char *page)
 {
-	u32 hw_type = bwprof_data->hw_type;
-	struct bwprof_hw_group  *hw_node = bwprof_data->hw_node[hw_type];
-	struct sampling_mode_info *samp_mode;
+	u8 enable = bwprof_data->is_sampling_enable ? 1 : 0;
 
-	samp_mode = hw_node->mode[hw_node->cfg_type];
-	return scnprintf(page, PAGE_SIZE, "%u\n", samp_mode->enable);
+	return scnprintf(page, PAGE_SIZE, "%u\n", enable);
 }
 
 static ssize_t bwprof_enable_config_store(struct config_item *item,
 		const char *page, size_t count)
 {
-	u32 hw_type = bwprof_data->hw_type;
-	struct bwprof_hw_group  *hw_node = bwprof_data->hw_node[hw_type];
-	struct sampling_mode_info *samp_mode = hw_node->mode[hw_node->cfg_type];
-	const struct scmi_bwprof_vendor_ops *ops = bwprof_data->bwprof_ops;
+	const struct qcom_scmi_vendor_ops *ops = bwprof_data->bwprof_ops;
 	int ret;
 	u8 enable;
 
@@ -394,67 +410,83 @@ static ssize_t bwprof_enable_config_store(struct config_item *item,
 	if (ret < 0)
 		return ret;
 
-	if ((samp_mode->enable == enable) || (!bwprof_data->is_set_config) ||
-			(!ops))
+	if (bwprof_data->is_sampling_enable == (bool)enable ||
+		!bwprof_data->is_set_config || !ops)
 		return -EINVAL;
 
-	ret = ops->set_sampling_enable(bwprof_data->ph, enable);
+	ret = ops->set_param(bwprof_data->ph, &enable,
+		BWPROF_ALGO_STR, BWPROF_SET_ENABLE, sizeof(enable));
 	if (ret < 0) {
-		pr_err("SCMI command set_sampling_enable Failed : %d\n", ret);
+		pr_err("BWPROF_SET_ENABLE ops failed: %d\n", ret);
 		return ret;
 	}
 
-	samp_mode->enable = enable;
-	bwprof_data->is_sampling_enable = (enable) ? true:false;
+	bwprof_data->is_sampling_enable = enable ? true : false;
 
-	if (!enable)
-		reset_moniter_data();
+	if (bwprof_data->polling_mode) {
+		if (bwprof_data->is_sampling_enable) {
+			if (!hrtimer_active(&bwprof_data->bwprof_hrtimer))
+				hrtimer_start(&bwprof_data->bwprof_hrtimer,
+				ms_to_ktime(BUFFER_FILL_MS),
+				HRTIMER_MODE_REL_PINNED);
+		} else {
+			hrtimer_cancel(&bwprof_data->bwprof_hrtimer);
+		}
+	}
+
+	if (!bwprof_data->is_sampling_enable)
+		reset_monitor_data();
 
 	return count;
 }
 
 CONFIGFS_ATTR(bwprof_, enable_config);
 
-static ssize_t moniter_data_show(char *page, int master_idx)
+static ssize_t monitor_data_show(char *page, int master_idx, u32 hw_type)
 {
-	u32 hw_type = bwprof_data->hw_type;
-	struct bwprof_hw_group  *hw_node = bwprof_data->hw_node[hw_type];
-	u32 bus_width = hw_node->bus_width;
+	u32 bus_width = bwprof_data->hw_node[hw_type]->bus_width;
 	int cnt = 0;
 	int i;
 	int num_samples_to_read = (MAX_NUM_SAMPLES / bwprof_data->sample_ms);
+	unsigned long flags;
 
 	if (bwprof_data->sample_ms >= SAMPLING_100MS)
 		num_samples_to_read = 1;
 
-	mutex_lock(&bwprof_data->mons_lock);
+	spin_lock_irqsave(&bwprof_data->rx_lock, flags);
 	for (i = 0; i < num_samples_to_read; i++) {
-		cnt += scnprintf(page+cnt, PAGE_SIZE - cnt, "%llu\t%u\t%u\t%u\n",
-				monitor_data[i].ts, monitor_data[i].meas_mbps[master_idx],
+		if (hw_type == BWPROF_LLCC)
+			monitor_data[i].mem_freq = LLCC_FREQ_ZERO;
+		cnt += scnprintf(page + cnt, PAGE_SIZE - cnt, "%llu\t%u\t%u\t%u\n",
+				monitor_data[i].ts,
+				monitor_data[i].meas_mbps[master_idx],
 				(monitor_data[i].mem_freq * bus_width),
 				monitor_data[i].mem_freq);
 	}
-	mutex_unlock(&bwprof_data->mons_lock);
+	spin_unlock_irqrestore(&bwprof_data->rx_lock, flags);
+
 	return cnt;
 }
 
-static ssize_t hist_moniter_data(char *page, int master_idx)
+static ssize_t hist_monitor_data(char *page, int master_idx)
 {
 	int cnt = 0;
 	u32 i, j, t;
+	unsigned long flags;
 
-	mutex_lock(&bwprof_data->mons_lock);
+	spin_lock_irqsave(&bwprof_data->rx_lock, flags);
 	for (i = 0; i < MAX_HIST_SAMPLES; i++) {
-		cnt += scnprintf(page+cnt, PAGE_SIZE - cnt, "%llu",
+		cnt += scnprintf(page + cnt, PAGE_SIZE - cnt, "%llu",
 				hist_data[i].ts);
 		for (j = 0; j < MAX_BUCKETS; j++) {
 			t = (master_idx * MAX_BUCKETS) + j;
-			cnt += scnprintf(page+cnt, PAGE_SIZE - cnt, "\t%u",
+			cnt += scnprintf(page + cnt, PAGE_SIZE - cnt, "\t%u",
 					hist_data[i].sample[t]);
 		}
-		cnt += scnprintf(page+cnt, PAGE_SIZE - cnt, "\n");
+		cnt += scnprintf(page + cnt, PAGE_SIZE - cnt, "\n");
 	}
-	mutex_unlock(&bwprof_data->mons_lock);
+	spin_unlock_irqrestore(&bwprof_data->rx_lock, flags);
+
 	return cnt;
 }
 
@@ -462,13 +494,15 @@ static ssize_t bwprof_ls_show_common(char *page, int master)
 {
 	int cnt = 0;
 	u32 master_idx;
+	u32 hw_type = (master >= DDR_CPU) ? BWPROF_DDR : BWPROF_LLCC;
 
 	if (is_master_enable(master, &master_idx)) {
 		if (!bwprof_data->is_hist_enable)
-			cnt = moniter_data_show(page, master_idx);
+			cnt = monitor_data_show(page, master_idx, hw_type);
 		else
-			cnt = hist_moniter_data(page, master_idx);
+			cnt = hist_monitor_data(page, master_idx);
 	}
+
 	return cnt;
 }
 
@@ -535,6 +569,111 @@ static ssize_t bwprof_total_ls_show(struct config_item *item, char *page)
 
 CONFIGFS_ATTR_RO(bwprof_, total_ls);
 
+static ssize_t bwprof_camera_ls_show(struct config_item *item, char *page)
+{
+	u8 master;
+	struct bwprof_hw_group *grp = container_of(to_config_group(item),
+			struct bwprof_hw_group, ls_group);
+
+	if (!grp)
+		return -EINVAL;
+
+	if (grp->hw_type == BWPROF_DDR)
+		master = DDR_CAMERA;
+	else if (grp->hw_type == BWPROF_LLCC)
+		master = LLCC_CAMERA;
+	else
+		return -EINVAL;
+
+	return bwprof_ls_show_common(page, master);
+}
+
+CONFIGFS_ATTR_RO(bwprof_, camera_ls);
+
+static ssize_t bwprof_dpu_ls_show(struct config_item *item, char *page)
+{
+	u8 master;
+	struct bwprof_hw_group *grp = container_of(to_config_group(item),
+			struct bwprof_hw_group, ls_group);
+
+	if (!grp)
+		return -EINVAL;
+
+	if (grp->hw_type == BWPROF_DDR)
+		master = DDR_DPU;
+	else if (grp->hw_type == BWPROF_LLCC)
+		master = LLCC_DPU;
+	else
+		return -EINVAL;
+
+	return bwprof_ls_show_common(page, master);
+}
+
+CONFIGFS_ATTR_RO(bwprof_, dpu_ls);
+
+static ssize_t bwprof_eva_ls_show(struct config_item *item, char *page)
+{
+	u8 master;
+	struct bwprof_hw_group *grp = container_of(to_config_group(item),
+			struct bwprof_hw_group, ls_group);
+
+	if (!grp)
+		return -EINVAL;
+
+	if (grp->hw_type == BWPROF_DDR)
+		master = DDR_EVA;
+	else if (grp->hw_type == BWPROF_LLCC)
+		master = LLCC_EVA;
+	else
+		return -EINVAL;
+
+	return bwprof_ls_show_common(page, master);
+}
+
+CONFIGFS_ATTR_RO(bwprof_, eva_ls);
+
+static ssize_t bwprof_vpu_ls_show(struct config_item *item, char *page)
+{
+	u8 master;
+	struct bwprof_hw_group *grp = container_of(to_config_group(item),
+			struct bwprof_hw_group, ls_group);
+
+	if (!grp)
+		return -EINVAL;
+
+	if (grp->hw_type == BWPROF_DDR)
+		master = DDR_VPU;
+	else if (grp->hw_type == BWPROF_LLCC)
+		master = LLCC_VPU;
+	else
+		return -EINVAL;
+
+	return bwprof_ls_show_common(page, master);
+}
+
+CONFIGFS_ATTR_RO(bwprof_, vpu_ls);
+
+static ssize_t bwprof_pcie_ls_show(struct config_item *item, char *page)
+{
+	u8 master;
+	struct bwprof_hw_group *grp = container_of(to_config_group(item),
+			struct bwprof_hw_group, ls_group);
+
+	if (!grp)
+		return -EINVAL;
+
+	if (grp->hw_type == BWPROF_DDR)
+		master = DDR_PCIe;
+	else if (grp->hw_type == BWPROF_LLCC)
+		master = LLCC_PCIe;
+	else
+		return -EINVAL;
+
+	return bwprof_ls_show_common(page, master);
+}
+
+CONFIGFS_ATTR_RO(bwprof_, pcie_ls);
+
 static struct configfs_attribute *bwprof_attrs[] = {
 	&bwprof_attr_available_config,
 	&bwprof_attr_set_config,
@@ -546,6 +685,11 @@ static struct configfs_attribute *bwprof_ls_attrs[] = {
 	&bwprof_attr_cpu_ls,
 	&bwprof_attr_gpu_ls,
 	&bwprof_attr_total_ls,
+	&bwprof_attr_camera_ls,
+	&bwprof_attr_dpu_ls,
+	&bwprof_attr_eva_ls,
+	&bwprof_attr_vpu_ls,
+	&bwprof_attr_pcie_ls,
 	NULL,
 };
 
@@ -555,9 +699,24 @@ static const struct config_item_type ls_item_type = {
 
 static void trace_event(void)
 {
-	u32 hw_type = bwprof_data->hw_type;
-	struct bwprof_hw_group  *hw_node = bwprof_data->hw_node[hw_type];
-	u32 bus_width = hw_node->bus_width;
+	int i;
+	u32 bus_width = 0;
+	bool ddr_master_enabled = false;
+
+	for (i = 0; i < bwprof_data->num_masters; i++) {
+		if (bwprof_data->masters_list[i] >= DDR_CPU) {
+			ddr_master_enabled = true;
+			break;
+		}
+	}
+
+	if (ddr_master_enabled) {
+		if (bwprof_data->hw_node[BWPROF_DDR])
+			bus_width = bwprof_data->hw_node[BWPROF_DDR]->bus_width;
+	} else {
+		if (bwprof_data->hw_node[BWPROF_LLCC])
+			monitor_data[0].mem_freq = LLCC_FREQ_ZERO;
+	}
 
 	if (!bwprof_data->is_hist_enable) {
 		trace_bwprof_last_sample_meas(dev_name(bwprof_data->dev),
@@ -573,13 +732,14 @@ static void trace_event(void)
 static void bwprof_mon_rx(struct mbox_client *client, void *msg)
 {
 	int i;
-	int num_samples_to_read  = (MAX_NUM_SAMPLES / bwprof_data->sample_ms);
+	int num_samples_to_read  = MAX_NUM_SAMPLES / bwprof_data->sample_ms;
 	void __iomem *src;
 
 	if (bwprof_data->sample_ms >= SAMPLING_100MS)
 		num_samples_to_read = 1;
 
-	mutex_lock(&bwprof_data->mons_lock);
+	spin_lock(&bwprof_data->rx_lock);
+
 	if (!bwprof_data->is_hist_enable) {
 		for (i = 0; i < num_samples_to_read; i++) {
 			src = base_src + i * sizeof(struct bwprof_monitor_data);
@@ -593,8 +753,13 @@ static void bwprof_mon_rx(struct mbox_client *client, void *msg)
 				sizeof(struct bwprof_hist_data));
 		}
 	}
+	spin_unlock(&bwprof_data->rx_lock);
 	trace_event();
-	mutex_unlock(&bwprof_data->mons_lock);
+}
+
+static void bwprof_mon_rx_timer(void)
+{
+	bwprof_mon_rx(NULL, NULL);
 }
 
 static const struct config_item_type bwprof_subsys_type = {
@@ -641,7 +806,6 @@ static int bwprof_configfs_init(void)
 			&ls_item_type);
 		configfs_add_default_group(&hw_node->ls_group,
 			&bwprof_subsys.su_group);
-
 	}
 
 	ret = configfs_register_subsystem(&bwprof_subsys);
@@ -656,10 +820,29 @@ static int bwprof_configfs_init(void)
 	return 0;
 }
 
+bool bwprof_hw_and_sampling_mode_inited(void)
+{
+	struct bwprof_hw_group  *hw_node;
+	int i;
+
+	if (bwprof_data->num_inited_hw < bwprof_data->hw_cnt)
+		return false;
+
+	for (i = 0; i < bwprof_data->hw_cnt; i++) {
+		hw_node = bwprof_data->hw_node[i];
+		if (!hw_node)
+			continue;
+		if (hw_node->num_inited_samp_mode < hw_node->sampling_cnt)
+			return false;
+	}
+
+	return true;
+}
+
 int cpucp_bwprof_init(struct scmi_device *sdev)
 {
 	u32 data_size;
-	const struct scmi_bwprof_vendor_ops *ops;
+	const struct qcom_scmi_vendor_ops *ops;
 	struct scmi_protocol_handle *ph;
 	int ret;
 
@@ -669,10 +852,11 @@ int cpucp_bwprof_init(struct scmi_device *sdev)
 	if (!sdev || !sdev->handle)
 		return -ENXIO;
 
-	ops = sdev->handle->devm_get_protocol(sdev, SCMI_PROTOCOL_BWPROF, &ph);
+	ops = sdev->handle->devm_protocol_get(sdev, QCOM_SCMI_VENDOR_PROTOCOL,
+				&ph);
 	if (IS_ERR(ops)) {
 		ret = PTR_ERR(ops);
-		pr_err("SCMI devm_get_protocol Failed\n");
+		dev_err(&sdev->dev, "SCMI QCOM_SCMI_VENDOR_PROTOCOL failed\n");
 		ops = NULL;
 		return ret;
 	}
@@ -691,7 +875,7 @@ int cpucp_bwprof_init(struct scmi_device *sdev)
 	}
 
 	if (bwprof_configfs_init()) {
-		pr_err("bwprof_configfs_init failed\n");
+		dev_err(&sdev->dev, "bwprof_configfs_init failed\n");
 		return -EINVAL;
 	}
 
@@ -700,11 +884,26 @@ int cpucp_bwprof_init(struct scmi_device *sdev)
 	bwprof_data->is_sampling_enable = false;
 	bwprof_data->is_hist_enable = false;
 	bwprof_data->is_set_config = false;
-	reset_moniter_data();
+	reset_monitor_data();
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(cpucp_bwprof_init);
+
+static enum hrtimer_restart bwprof_hrtimer_handler(struct hrtimer *timer)
+{
+	ktime_t now = ktime_get();
+
+	if (!atomic_read(&buffer_fill_status->state)) {
+		hrtimer_forward(timer, now, ms_to_ktime(1));
+		return HRTIMER_RESTART;
+	}
+
+	bwprof_mon_rx_timer();
+	atomic_set(&buffer_fill_status->state, 0);
+	hrtimer_forward(timer, now, ms_to_ktime(BUFFER_FILL_MS));
+
+	return HRTIMER_RESTART;
+}
 
 static int bwprof_dev_probe(struct platform_device *pdev)
 {
@@ -718,6 +917,7 @@ static int bwprof_dev_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	bwprof_data->dev = dev;
+	bwprof_data->polling_mode = false;
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mem-base");
 	if (!res) {
@@ -731,7 +931,7 @@ static int bwprof_dev_probe(struct platform_device *pdev)
 	}
 
 	bwprof_data->hw_cnt = of_get_available_child_count(dev->of_node);
-	if ((!bwprof_data->hw_cnt) || (bwprof_data->hw_cnt > BWPROF_TOTAL_HW)) {
+	if (!bwprof_data->hw_cnt || bwprof_data->hw_cnt > BWPROF_TOTAL_HW) {
 		dev_err(dev, "No bwprof hw nodes provided!\n");
 		return -ENODEV;
 	}
@@ -741,17 +941,42 @@ static int bwprof_dev_probe(struct platform_device *pdev)
 	cl->tx_block = false;
 	cl->knows_txdone = true;
 	cl->rx_callback = bwprof_mon_rx;
+	bwprof_data->bwprof_hrtimer.function = NULL;
 
 	bwprof_data->ch = mbox_request_channel(cl, 0);
 	if (IS_ERR(bwprof_data->ch)) {
 		ret = PTR_ERR(bwprof_data->ch);
-		if (ret != -EPROBE_DEFER)
+		if ((ret == -ENODEV) || (ret == -ENOENT))
+			bwprof_data->polling_mode = true;
+		else if (ret != -EPROBE_DEFER) {
 			dev_err(dev, "Failed mbox_request_channel: %d\n", ret);
-		return ret;
+			return ret;
+		} else
+			return ret;
+	}
+
+	if (bwprof_data->polling_mode) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "buff-fill-base");
+		if (!res) {
+			dev_err(dev, "Failed to get buff-fill-base resource\n");
+			return -ENODEV;
+		}
+		buffer_fill_status_src = devm_ioremap_resource(&pdev->dev, res);
+		if (!buffer_fill_status_src) {
+			dev_err(dev, "ioremap failed for buffer-fill-base\n");
+			return -ENOMEM;
+		}
+
+		buffer_fill_status = (struct buffer_fill_state *)buffer_fill_status_src;
+		hrtimer_init(&bwprof_data->bwprof_hrtimer, CLOCK_MONOTONIC,
+				HRTIMER_MODE_REL);
+
+		bwprof_data->bwprof_hrtimer.function = bwprof_hrtimer_handler;
 	}
 
 	bwprof_data->inited = true;
-	mutex_init(&bwprof_data->mons_lock);
+	spin_lock_init(&bwprof_data->rx_lock);
+	bwprof_data->num_inited_hw = 0;
 
 	return 0;
 }
@@ -782,16 +1007,19 @@ static int bwprof_hw_probe(struct platform_device *pdev)
 	}
 
 	sampling_cnt = of_get_available_child_count(dev->of_node);
-	if ((!sampling_cnt) || (sampling_cnt > TOTAL_SAMPLING_MODE_TYPES)) {
+	if (!sampling_cnt || sampling_cnt > TOTAL_SAMPLING_MODE_TYPES) {
 		dev_err(dev, "Incorrect sampling nodes configuration!\n");
 		return -ENODEV;
 	}
 
+	bwprof_data->num_inited_hw++;
 	bwprof_hw->dev = dev;
 	bwprof_hw->hw_type = hw_type;
 	bwprof_hw->bus_width = bus_width;
 	bwprof_hw->sampling_cnt = sampling_cnt;
+	bwprof_hw->num_inited_samp_mode = 0;
 	bwprof_data->hw_node[hw_type] = bwprof_hw;
+	bwprof_data->num_masters = 0;
 	dev_set_drvdata(dev, bwprof_hw);
 
 	return 0;
@@ -806,8 +1034,12 @@ static int bwprof_sampling_mode_probe(struct platform_device *pdev)
 	int ret;
 	u32 sampling_ms;
 	u8 num_masters;
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+	struct scmi_device *scmi_dev;
+#endif
 
-	default_mode_val = devm_kzalloc(dev, sizeof(*default_mode_val), GFP_KERNEL);
+	default_mode_val = devm_kzalloc(dev, sizeof(*default_mode_val),
+				GFP_KERNEL);
 	if (!default_mode_val)
 		return -ENOMEM;
 
@@ -824,14 +1056,14 @@ static int bwprof_sampling_mode_probe(struct platform_device *pdev)
 	num_masters = of_property_count_elems_of_size(dev->of_node,
 			"qcom,master-list", sizeof(u8));
 	if (num_masters <= 0) {
-		dev_info(dev, "Failed to get master list\n");
+		dev_err(dev, "Failed to get master list\n");
 		return -EINVAL;
 	}
 
 	ret = of_property_read_u32(dev->of_node, "qcom,sample-period",
 			&sampling_ms);
 	if (ret < 0) {
-		dev_err(dev, "Failed to get sample period =%d\n", sampling_ms);
+		dev_err(dev, "Failed to get sample period =%d\n", ret);
 		return -EINVAL;
 	}
 
@@ -842,27 +1074,44 @@ static int bwprof_sampling_mode_probe(struct platform_device *pdev)
 
 	sampling_ms = map_sampling_ms(sampling_ms);
 
-	mode->masters_list = devm_kzalloc(dev, sizeof(u8)*num_masters, GFP_KERNEL);
+	mode->masters_list = devm_kzalloc(dev, sizeof(u8) * num_masters,
+				GFP_KERNEL);
 	if (!mode->masters_list)
 		return -ENOMEM;
 
 	default_mode_val->masters_list = devm_kzalloc(dev,
-			sizeof(u8)*num_masters, GFP_KERNEL);
+			sizeof(u8) * num_masters, GFP_KERNEL);
 	if (!default_mode_val->masters_list)
 		return -ENOMEM;
 
 	ret = of_property_read_u8_array(dev->of_node, "qcom,master-list",
 			default_mode_val->masters_list, num_masters);
 	if (ret) {
-		dev_err(&pdev->dev, "Failed to get master-list\n");
+		dev_err(dev, "Failed to get master-list\n");
 		return ret;
 	}
 
+	bwprof_hw->num_inited_samp_mode++;
 	default_mode_val->num_masters = num_masters;
 	default_mode_val->enable = 0;
 	mode->enable = 0;
 	bwprof_hw->default_mode_val[sampling_ms] = default_mode_val;
 	bwprof_hw->mode[sampling_ms] = mode;
+
+	if (bwprof_hw_and_sampling_mode_inited()) {
+#if IS_ENABLED(CONFIG_QTI_SCMI_VENDOR_PROTOCOL)
+		scmi_dev = get_qcom_scmi_device();
+		if (IS_ERR(scmi_dev)) {
+			ret = PTR_ERR(scmi_dev);
+			dev_err(dev, "get_qcom_scmi_device ret: %d\n", ret);
+			return ret;
+		}
+
+		ret = cpucp_bwprof_init(scmi_dev);
+		if (ret < 0)
+			dev_err(dev, "cpucp_bwprof_init failed: %d\n", ret);
+#endif
+	}
 
 	return 0;
 }

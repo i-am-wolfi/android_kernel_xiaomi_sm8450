@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt) "cpufreq_hw_debug: %s: " fmt, __func__
 
 #include <linux/device.h>
 #include <linux/kernel.h>
+#include <linux/panic_notifier.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/platform_device.h>
 
 enum debug_hw_regs_data {
 	REG_PERF_STATE,
@@ -87,7 +89,7 @@ static ssize_t cpufreq_hwregs_show(struct kobject *kobj,
 }
 
 static int cpufreq_panic_callback(struct notifier_block *nfb,
-					unsigned long event, void *unused)
+				  unsigned long event, void *unused)
 {
 	int i, j, size = ARRAY_SIZE(cpufreq_qcom_std_data);
 	u32 regval;
@@ -145,7 +147,7 @@ static int cpufreq_get_hwregs(struct platform_device *pdev)
 
 	for (i = 0; i < hw_regs->domain_cnt; i++) {
 		ret = of_parse_phandle_with_fixed_args(pdev->dev.of_node,
-			"qcom,freq-hw-domain", 1, i, &args);
+						       "qcom,freq-hw-domain", 1, i, &args);
 		of_node_put(pdev->dev.of_node);
 		if (ret)
 			return ret;
@@ -162,7 +164,7 @@ static int cpufreq_get_hwregs(struct platform_device *pdev)
 	}
 
 	atomic_notifier_chain_register(&panic_notifier_list,
-						&cpufreq_panic_notifier);
+				       &cpufreq_panic_notifier);
 
 	return 0;
 }
@@ -201,11 +203,10 @@ static int qcom_cpufreq_hw_debug_probe(struct platform_device *pdev)
 	return enable_cpufreq_hw_debug(pdev);
 }
 
-static int qcom_cpufreq_hw_debug_remove(struct platform_device *pdev)
+static void qcom_cpufreq_hw_debug_remove(struct platform_device *pdev)
 {
 	sysfs_remove_file(kernel_kobj, &cpufreq_hwregs_attr.attr);
 	kobject_put(cpufreqhw_kobj);
-	return 0;
 }
 
 static const struct of_device_id qcom_cpufreq_hw_debug_match[] = {
@@ -238,4 +239,4 @@ static void __exit qcom_cpufreq_hw_debug_exit(void)
 module_exit(qcom_cpufreq_hw_debug_exit);
 
 MODULE_DESCRIPTION("QTI clock driver for CPUFREQ HW debug");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

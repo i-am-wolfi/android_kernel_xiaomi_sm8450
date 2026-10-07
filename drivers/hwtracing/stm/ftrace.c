@@ -2,6 +2,7 @@
 /*
  * Simple kernel driver to link kernel Ftrace and an STM device
  * Copyright (c) 2016, Linaro Ltd.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * STM Ftrace will be registered as a trace_export.
  */
@@ -23,6 +24,7 @@ static struct stm_ftrace {
 	.data	= {
 		.name		= "ftrace",
 		.nr_chans	= STM_FTRACE_NR_CHANNELS,
+		.type		= STM_FTRACE,
 		.link		= stm_ftrace_link,
 		.unlink		= stm_ftrace_unlink,
 	},

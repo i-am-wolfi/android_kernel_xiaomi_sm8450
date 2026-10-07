@@ -92,7 +92,7 @@ int vfs_statfs(const struct path *path, struct kstatfs *buf)
 		buf->f_flags = calculate_f_flags(path->mnt);
 	return error;
 }
-EXPORT_SYMBOL(vfs_statfs);
+EXPORT_SYMBOL_NS(vfs_statfs, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 int user_statfs(const char __user *pathname, struct kstatfs *st)
 {
@@ -116,8 +116,8 @@ int fd_statfs(int fd, struct kstatfs *st)
 {
 	struct fd f = fdget_raw(fd);
 	int error = -EBADF;
-	if (f.file) {
-		error = vfs_statfs(&f.file->f_path, st);
+	if (fd_file(f)) {
+		error = vfs_statfs(&fd_file(f)->f_path, st);
 		fdput(f);
 	}
 	return error;
@@ -235,7 +235,7 @@ SYSCALL_DEFINE3(fstatfs64, unsigned int, fd, size_t, sz, struct statfs64 __user 
 
 static int vfs_ustat(dev_t dev, struct kstatfs *sbuf)
 {
-	struct super_block *s = user_get_super(dev);
+	struct super_block *s = user_get_super(dev, false);
 	int err;
 	if (!s)
 		return -EINVAL;
@@ -255,7 +255,10 @@ SYSCALL_DEFINE2(ustat, unsigned, dev, struct ustat __user *, ubuf)
 
 	memset(&tmp,0,sizeof(struct ustat));
 	tmp.f_tfree = sbuf.f_bfree;
-	tmp.f_tinode = sbuf.f_ffree;
+	if (IS_ENABLED(CONFIG_ARCH_32BIT_USTAT_F_TINODE))
+		tmp.f_tinode = min_t(u64, sbuf.f_ffree, UINT_MAX);
+	else
+		tmp.f_tinode = sbuf.f_ffree;
 
 	return copy_to_user(ubuf, &tmp, sizeof(struct ustat)) ? -EFAULT : 0;
 }

@@ -1,10 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (c) 2015, 2021 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries
  */
 #ifndef LINUX_MMC_CQHCI_H
 #define LINUX_MMC_CQHCI_H
 
 #include <linux/compiler.h>
+#include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/spinlock_types.h>
 #include <linux/types.h>
@@ -23,6 +25,8 @@
 /* capabilities */
 #define CQHCI_CAP			0x04
 #define CQHCI_CAP_CS			0x10000000 /* Crypto Support */
+#define CQHCI_CAP_ITCFMUL		GENMASK(15, 12)
+#define CQHCI_ITCFMUL(x)		FIELD_GET(CQHCI_CAP_ITCFMUL, (x))
 
 /* configuration */
 #define CQHCI_CFG			0x08
@@ -121,6 +125,14 @@
 
 /* command response argument */
 #define CQHCI_CRA			0x5C
+
+/*
+ * Add new macro for updated CQ vendor specific
+ * register address for SDHC v5.0 onwards.
+ */
+#define CQE_V5_VENDOR_CFG		0x900
+#define CQHCI_VENDOR_CFG		0x100
+#define CMDQ_SEND_STATUS_TRIGGER (1 << 31)
 
 /* crypto capabilities */
 #define CQHCI_CCAP			0x100
@@ -249,6 +261,7 @@ struct cqhci_host {
 	bool activated;
 	bool waiting_for_idle;
 	bool recovery_halt;
+	bool offset_changed;
 
 	size_t desc_size;
 	size_t data_size;
@@ -279,13 +292,7 @@ struct cqhci_host {
 	union cqhci_crypto_capabilities crypto_capabilities;
 	union cqhci_crypto_cap_entry *crypto_cap_array;
 	u32 crypto_cfg_register;
-	void __iomem *ice_mmio;
-#endif
-#if IS_ENABLED(CONFIG_MMC_CRYPTO_QTI)
-	struct platform_device *pdev;
-#endif
-#if IS_ENABLED(CONFIG_QTI_HW_KEY_MANAGER)
-	void __iomem *ice_hwkm_mmio;
+	struct qcom_ice *ice;
 #endif
 };
 
@@ -303,6 +310,10 @@ struct cqhci_host_ops {
 	int (*program_key)(struct cqhci_host *cq_host,
 			   const union cqhci_crypto_cfg_entry *cfg, int slot);
 #endif
+	void (*enhanced_strobe_mask)(struct mmc_host *mmc, bool set);
+	void (*set_tran_desc)(struct cqhci_host *cq_host, u8 **desc,
+			      dma_addr_t addr, int len, bool end, bool dma64);
+
 };
 
 static inline void cqhci_writel(struct cqhci_host *host, u32 val, int reg)
@@ -328,6 +339,7 @@ irqreturn_t cqhci_irq(struct mmc_host *mmc, u32 intmask, int cmd_error,
 int cqhci_init(struct cqhci_host *cq_host, struct mmc_host *mmc, bool dma64);
 struct cqhci_host *cqhci_pltfm_init(struct platform_device *pdev);
 int cqhci_deactivate(struct mmc_host *mmc);
+void cqhci_set_tran_desc(u8 *desc, dma_addr_t addr, int len, bool end, bool dma64);
 static inline int cqhci_suspend(struct mmc_host *mmc)
 {
 	return cqhci_deactivate(mmc);

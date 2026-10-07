@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Copyright (c) 2017-2020, The Linux Foundation. All rights reserved. */
-/* Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved. */
+/*
+ * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022, 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
 #define pr_fmt(fmt)	"%s: " fmt, __func__
 
@@ -14,6 +16,8 @@
 #include <linux/of_device.h>
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
+#include <linux/platform_device.h>
+#include <linux/of.h>
 
 /* Vibrator-LDO register definitions */
 #define QPNP_VIB_LDO_REG_STATUS1	0x08
@@ -282,7 +286,7 @@ static enum led_brightness qpnp_vib_brightness_get(struct led_classdev *cdev)
 	return chip->state;
 }
 
-static void qpnp_vib_brightness_set(struct led_classdev *cdev,
+static int qpnp_vib_brightness_set(struct led_classdev *cdev,
 			enum led_brightness level)
 {
 	struct vib_ldo_chip *chip = container_of(cdev, struct vib_ldo_chip,
@@ -300,10 +304,11 @@ static void qpnp_vib_brightness_set(struct led_classdev *cdev,
 			hrtimer_cancel(&chip->overdrive_timer);
 			cancel_work_sync(&chip->overdrive_work);
 		}
-		qpnp_vib_ldo_enable(chip, false);
+		ret = qpnp_vib_ldo_enable(chip, false);
 	}
 
 	pr_debug("vibrator state=%d\n", chip->state);
+	return ret;
 }
 
 static int qpnp_vibrator_ldo_suspend(struct device *dev)
@@ -363,7 +368,7 @@ static int qpnp_vibrator_ldo_probe(struct platform_device *pdev)
 
 	chip->cdev.name = "vibrator";
 	chip->cdev.brightness_get = qpnp_vib_brightness_get;
-	chip->cdev.brightness_set = qpnp_vib_brightness_set;
+	chip->cdev.brightness_set_blocking = qpnp_vib_brightness_set;
 	chip->cdev.max_brightness = 100;
 	ret = devm_led_classdev_register(&pdev->dev, &chip->cdev);
 	if (ret < 0) {
@@ -393,7 +398,7 @@ fail:
 	return ret;
 }
 
-static int qpnp_vibrator_ldo_remove(struct platform_device *pdev)
+static void qpnp_vibrator_ldo_remove(struct platform_device *pdev)
 {
 	struct vib_ldo_chip *chip = dev_get_drvdata(&pdev->dev);
 
@@ -404,7 +409,6 @@ static int qpnp_vibrator_ldo_remove(struct platform_device *pdev)
 	mutex_destroy(&chip->lock);
 	dev_set_drvdata(&pdev->dev, NULL);
 
-	return 0;
 }
 
 static const struct of_device_id vibrator_ldo_match_table[] = {
@@ -425,4 +429,4 @@ static struct platform_driver qpnp_vibrator_ldo_driver = {
 module_platform_driver(qpnp_vibrator_ldo_driver);
 
 MODULE_DESCRIPTION("QPNP Vibrator-LDO driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

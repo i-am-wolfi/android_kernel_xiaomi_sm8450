@@ -15,6 +15,7 @@
 #include <linux/security.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <asm/syscalls.h>
 
 /*
  * CPU mask used to set process affinity for MT VPEs/TCs with FPUs
@@ -70,26 +71,20 @@ asmlinkage long mipsmt_sys_sched_setaffinity(pid_t pid, unsigned int len,
 	struct task_struct *p;
 	int retval;
 
-	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
-		return -ENOMEM;
-	if (len < cpumask_size())
-		cpumask_clear(new_mask);
-	else if (len > cpumask_size())
-		len = cpumask_size();
-	if (copy_from_user(new_mask, user_mask_ptr, len)) {
-		retval = -EFAULT;
-		goto out_free_new_mask;
-	}
+	if (len < sizeof(new_mask))
+		return -EINVAL;
 
-	get_online_cpus();
+	if (copy_from_user(&new_mask, user_mask_ptr, sizeof(new_mask)))
+		return -EFAULT;
+
+	cpus_read_lock();
 	rcu_read_lock();
 
 	p = find_process_by_pid(pid);
 	if (!p) {
 		rcu_read_unlock();
-		put_online_cpus();
-		retval = -ESRCH;
-		goto out_free_new_mask;
+		cpus_read_unlock();
+		return -ESRCH;
 	}
 
 	/* Prevent p going away */
@@ -100,9 +95,13 @@ asmlinkage long mipsmt_sys_sched_setaffinity(pid_t pid, unsigned int len,
 		retval = -ENOMEM;
 		goto out_put_task;
 	}
-	if (!alloc_cpumask_var(&effective_mask, GFP_KERNEL)) {
+	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL)) {
 		retval = -ENOMEM;
 		goto out_free_cpus_allowed;
+	}
+	if (!alloc_cpumask_var(&effective_mask, GFP_KERNEL)) {
+		retval = -ENOMEM;
+		goto out_free_new_mask;
 	}
 	if (!check_same_owner(p) && !capable(CAP_SYS_NICE)) {
 		retval = -EPERM;
@@ -143,13 +142,13 @@ asmlinkage long mipsmt_sys_sched_setaffinity(pid_t pid, unsigned int len,
 	}
 out_unlock:
 	free_cpumask_var(effective_mask);
+out_free_new_mask:
+	free_cpumask_var(new_mask);
 out_free_cpus_allowed:
 	free_cpumask_var(cpus_allowed);
 out_put_task:
 	put_task_struct(p);
-	put_online_cpus();
-out_free_new_mask:
-	free_cpumask_var(new_mask);
+	cpus_read_unlock();
 	return retval;
 }
 
@@ -168,7 +167,7 @@ asmlinkage long mipsmt_sys_sched_getaffinity(pid_t pid, unsigned int len,
 	if (len < real_len)
 		return -EINVAL;
 
-	get_online_cpus();
+	cpus_read_lock();
 	rcu_read_lock();
 
 	retval = -ESRCH;
@@ -184,7 +183,7 @@ asmlinkage long mipsmt_sys_sched_getaffinity(pid_t pid, unsigned int len,
 
 out_unlock:
 	rcu_read_unlock();
-	put_online_cpus();
+	cpus_read_unlock();
 	if (retval)
 		return retval;
 	if (copy_to_user(user_mask_ptr, &mask, real_len))

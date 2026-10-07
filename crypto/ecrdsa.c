@@ -20,12 +20,12 @@
 #include <linux/crypto.h>
 #include <crypto/streebog.h>
 #include <crypto/internal/akcipher.h>
+#include <crypto/internal/ecc.h>
 #include <crypto/akcipher.h>
 #include <linux/oid_registry.h>
 #include <linux/scatterlist.h>
 #include "ecrdsa_params.asn1.h"
 #include "ecrdsa_pub_key.asn1.h"
-#include "ecc.h"
 #include "ecrdsa_defs.h"
 
 #define ECRDSA_MAX_SIG_SIZE (2 * 512 / 8)
@@ -153,7 +153,7 @@ int ecrdsa_param_curve(void *context, size_t hdrlen, unsigned char tag,
 	struct ecrdsa_ctx *ctx = context;
 
 	ctx->curve_oid = look_up_OID(value, vlen);
-	if (ctx->curve_oid == OID__NR)
+	if (!ctx->curve_oid)
 		return -EINVAL;
 	ctx->curve = get_curve_by_oid(ctx->curve_oid);
 	return 0;

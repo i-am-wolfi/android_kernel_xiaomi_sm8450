@@ -61,11 +61,6 @@ static inline bool is_tcf_gate(const struct tc_action *a)
 	return false;
 }
 
-static inline u32 tcf_gate_index(const struct tc_action *a)
-{
-	return a->tcfa_index;
-}
-
 static inline struct tcf_gate_params *tcf_gate_params_locked(const struct tc_action *a)
 {
 	struct tcf_gate *gact = to_gate(a);

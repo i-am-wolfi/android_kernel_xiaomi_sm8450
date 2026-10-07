@@ -98,14 +98,11 @@ static void phonet_device_destroy(struct net_device *dev)
 	mutex_unlock(&pndevs->lock);
 
 	if (pnd) {
-		struct net *net = dev_net(dev);
-		u32 ifindex = dev->ifindex;
 		u8 addr;
 
 		for_each_set_bit(addr, pnd->addrs, 64)
-			phonet_address_notify(net, RTM_DELADDR, ifindex, addr);
-
-		kfree_rcu(pnd, rcu);
+			phonet_address_notify(RTM_DELADDR, dev, addr);
+		kfree(pnd);
 	}
 }
 
@@ -235,11 +232,11 @@ static int phonet_device_autoconf(struct net_device *dev)
 	struct if_phonet_req req;
 	int ret;
 
-	if (!dev->netdev_ops->ndo_do_ioctl)
+	if (!dev->netdev_ops->ndo_siocdevprivate)
 		return -EOPNOTSUPP;
 
-	ret = dev->netdev_ops->ndo_do_ioctl(dev, (struct ifreq *)&req,
-						SIOCPNGAUTOCONF);
+	ret = dev->netdev_ops->ndo_siocdevprivate(dev, (struct ifreq *)&req,
+						  NULL, SIOCPNGAUTOCONF);
 	if (ret < 0)
 		return ret;
 
@@ -247,9 +244,8 @@ static int phonet_device_autoconf(struct net_device *dev)
 	ret = phonet_address_add(dev, req.ifr_phonet_autoconf.device);
 	if (ret)
 		return ret;
-
-	phonet_address_notify(dev_net(dev), RTM_NEWADDR, dev->ifindex,
-			      req.ifr_phonet_autoconf.device);
+	phonet_address_notify(RTM_NEWADDR, dev,
+				req.ifr_phonet_autoconf.device);
 	return 0;
 }
 

@@ -416,7 +416,7 @@ out:
 	return button_info;
 }
 
-static int soc_button_remove(struct platform_device *pdev)
+static void soc_button_remove(struct platform_device *pdev)
 {
 	struct soc_button_data *priv = platform_get_drvdata(pdev);
 
@@ -425,8 +425,6 @@ static int soc_button_remove(struct platform_device *pdev)
 	for (i = 0; i < BUTTON_TYPES; i++)
 		if (priv->children[i])
 			platform_device_unregister(priv->children[i]);
-
-	return 0;
 }
 
 static int soc_button_probe(struct platform_device *pdev)
@@ -517,6 +515,27 @@ static const struct soc_device_data soc_device_INT33D3 = {
 };
 
 /*
+ * Button info for Microsoft Surface 3 (non pro), this is indentical to
+ * the PNP0C40 info except that the home button is active-high.
+ *
+ * The Surface 3 Pro also has a MSHW0028 ACPI device, but that uses a custom
+ * version of the drivers/platform/x86/intel/hid.c 5 button array ACPI API
+ * instead. A check() callback is not necessary though as the Surface 3 Pro
+ * MSHW0028 ACPI device's resource table does not contain any GPIOs.
+ */
+static const struct soc_button_info soc_button_MSHW0028[] = {
+	{ "power", 0, EV_KEY, KEY_POWER, false, true, true },
+	{ "home", 1, EV_KEY, KEY_LEFTMETA, false, true, false },
+	{ "volume_up", 2, EV_KEY, KEY_VOLUMEUP, true, false, true },
+	{ "volume_down", 3, EV_KEY, KEY_VOLUMEDOWN, true, false, true },
+	{ }
+};
+
+static const struct soc_device_data soc_device_MSHW0028 = {
+	.button_info = soc_button_MSHW0028,
+};
+
+/*
  * Special device check for Surface Book 2 and Surface Pro (2017).
  * Both, the Surface Pro 4 (surfacepro3_button.c) and the above mentioned
  * devices use MSHW0040 for power and volume buttons, however the way they
@@ -582,7 +601,8 @@ static const struct acpi_device_id soc_button_acpi_match[] = {
 	{ "ID9001", (unsigned long)&soc_device_INT33D3 },
 	{ "ACPI0011", 0 },
 
-	/* Microsoft Surface Devices (5th and 6th generation) */
+	/* Microsoft Surface Devices (3th, 5th and 6th generation) */
+	{ "MSHW0028", (unsigned long)&soc_device_MSHW0028 },
 	{ "MSHW0040", (unsigned long)&soc_device_MSHW0040 },
 
 	{ }
@@ -592,7 +612,7 @@ MODULE_DEVICE_TABLE(acpi, soc_button_acpi_match);
 
 static struct platform_driver soc_button_driver = {
 	.probe          = soc_button_probe,
-	.remove		= soc_button_remove,
+	.remove_new	= soc_button_remove,
 	.driver		= {
 		.name = KBUILD_MODNAME,
 		.acpi_match_table = ACPI_PTR(soc_button_acpi_match),
@@ -600,4 +620,5 @@ static struct platform_driver soc_button_driver = {
 };
 module_platform_driver(soc_button_driver);
 
+MODULE_DESCRIPTION("Windows-compatible SoC Button Array driver");
 MODULE_LICENSE("GPL");

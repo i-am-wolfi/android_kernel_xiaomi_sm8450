@@ -22,6 +22,7 @@
 #include <linux/wait.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/hrtimer.h>
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
@@ -33,7 +34,6 @@
 MODULE_AUTHOR("Jaroslav Kysela <perex@perex.cz>");
 MODULE_DESCRIPTION("A loopback soundcard");
 MODULE_LICENSE("GPL");
-MODULE_SUPPORTED_DEVICE("{{ALSA,Loopback soundcard}}");
 
 #define MAX_PCM_SUBSTREAMS	8
 
@@ -55,7 +55,7 @@ MODULE_PARM_DESC(pcm_substreams, "PCM substreams # (1-8) for loopback driver.");
 module_param_array(pcm_notify, int, NULL, 0444);
 MODULE_PARM_DESC(pcm_notify, "Break capture when PCM format/rate/channels changes.");
 module_param_array(timer_source, charp, NULL, 0444);
-MODULE_PARM_DESC(timer_source, "Sound card name or number and device/subdevice number of timer to be used. Empty string for jiffies timer [default].");
+MODULE_PARM_DESC(timer_source, "Sound card name or number and device/subdevice number of timer to be used. Empty string for jiffies timer [default], 'hrtimer' for high-resolution timer.");
 
 #define NO_PITCH 100000
 
@@ -99,16 +99,13 @@ struct loopback_ops {
 struct loopback_cable {
 	spinlock_t lock;
 	struct loopback_pcm *streams[2];
-	/* in-flight peer stops running outside cable->lock */
-	atomic_t stop_count;
-	wait_queue_head_t stop_wait;
 	struct snd_pcm_hardware hw;
 	/* flags */
 	unsigned int valid;
 	unsigned int running;
 	unsigned int pause;
 	/* timer specific */
-	struct loopback_ops *ops;
+	const struct loopback_ops *ops;
 	/* If sound timer is used */
 	struct {
 		int stream;
@@ -123,11 +120,13 @@ struct loopback_setup {
 	unsigned int rate_shift;
 	snd_pcm_format_t format;
 	unsigned int rate;
+	snd_pcm_access_t access;
 	unsigned int channels;
 	struct snd_ctl_elem_id active_id;
 	struct snd_ctl_elem_id format_id;
 	struct snd_ctl_elem_id rate_id;
 	struct snd_ctl_elem_id channels_id;
+	struct snd_ctl_elem_id access_id;
 };
 
 struct loopback {
@@ -160,8 +159,14 @@ struct loopback_pcm {
 	unsigned int period_size_frac;	/* period size in jiffies ticks */
 	unsigned int last_drift;
 	unsigned long last_jiffies;
-	/* If jiffies timer is used */
+	/* If jiffies / hrtimer is used */
 	struct timer_list timer;
+#ifdef CONFIG_HIGH_RES_TIMERS
+	struct hrtimer hrtimer;
+#endif
+
+	/* size of per channel buffer in case of non-interleaved access */
+	unsigned int channel_buf_n;
 };
 
 static struct platform_device *devices[SNDRV_CARDS];
@@ -222,11 +227,36 @@ static int loopback_jiffies_timer_start(struct loopback_pcm *dpcm)
 		dpcm->period_update_pending = 1;
 	}
 	tick = dpcm->period_size_frac - dpcm->irq_pos;
-	tick = (tick + dpcm->pcm_bps - 1) / dpcm->pcm_bps;
+	tick = DIV_ROUND_UP(tick, dpcm->pcm_bps);
 	mod_timer(&dpcm->timer, jiffies + tick);
 
 	return 0;
 }
+
+#ifdef CONFIG_HIGH_RES_TIMERS
+/* call in cable->lock */
+static int loopback_hrtimer_start(struct loopback_pcm *dpcm)
+{
+	unsigned long tick;
+	unsigned int rate_shift = get_rate_shift(dpcm);
+
+	if (rate_shift != dpcm->pcm_rate_shift) {
+		dpcm->pcm_rate_shift = rate_shift;
+		dpcm->period_size_frac = frac_pos(dpcm, dpcm->pcm_period_size);
+	}
+	if (dpcm->period_size_frac <= dpcm->irq_pos) {
+		dpcm->irq_pos %= dpcm->period_size_frac;
+		dpcm->period_update_pending = 1;
+	}
+	tick = dpcm->period_size_frac - dpcm->irq_pos;
+	tick = DIV_ROUND_UP(tick, dpcm->pcm_bps);
+	hrtimer_start(&dpcm->hrtimer,
+		      ns_to_ktime(div_u64((u64)tick * NSEC_PER_SEC, HZ)),
+		      HRTIMER_MODE_REL_SOFT);
+
+	return 0;
+}
+#endif
 
 /* call in cable->lock */
 static int loopback_snd_timer_start(struct loopback_pcm *dpcm)
@@ -266,6 +296,16 @@ static inline int loopback_jiffies_timer_stop(struct loopback_pcm *dpcm)
 	return 0;
 }
 
+#ifdef CONFIG_HIGH_RES_TIMERS
+/* call in cable->lock */
+static inline int loopback_hrtimer_stop(struct loopback_pcm *dpcm)
+{
+	hrtimer_try_to_cancel(&dpcm->hrtimer);
+
+	return 0;
+}
+#endif
+
 /* call in cable->lock */
 static int loopback_snd_timer_stop(struct loopback_pcm *dpcm)
 {
@@ -296,6 +336,15 @@ static inline int loopback_jiffies_timer_stop_sync(struct loopback_pcm *dpcm)
 	return 0;
 }
 
+#ifdef CONFIG_HIGH_RES_TIMERS
+static inline int loopback_hrtimer_stop_sync(struct loopback_pcm *dpcm)
+{
+	hrtimer_cancel(&dpcm->hrtimer);
+
+	return 0;
+}
+#endif
+
 /* call in loopback->cable_lock */
 static int loopback_snd_timer_close_cable(struct loopback_pcm *dpcm)
 {
@@ -321,41 +370,56 @@ static int loopback_snd_timer_close_cable(struct loopback_pcm *dpcm)
 	return 0;
 }
 
+static bool is_access_interleaved(snd_pcm_access_t access)
+{
+	switch (access) {
+	case SNDRV_PCM_ACCESS_MMAP_INTERLEAVED:
+	case SNDRV_PCM_ACCESS_RW_INTERLEAVED:
+		return true;
+	default:
+		return false;
+	}
+};
+
 static int loopback_check_format(struct loopback_cable *cable, int stream)
 {
+	struct loopback_pcm *dpcm_play, *dpcm_capt;
 	struct snd_pcm_runtime *runtime, *cruntime;
 	struct loopback_setup *setup;
 	struct snd_card *card;
+	bool stop_capture = false;
 	int check;
 
-	if (cable->valid != CABLE_VALID_BOTH) {
-		if (stream == SNDRV_PCM_STREAM_PLAYBACK)
-			goto __notify;
-		return 0;
-	}
-	runtime = cable->streams[SNDRV_PCM_STREAM_PLAYBACK]->
-							substream->runtime;
-	cruntime = cable->streams[SNDRV_PCM_STREAM_CAPTURE]->
-							substream->runtime;
-	check = runtime->format != cruntime->format ||
-		runtime->rate != cruntime->rate ||
-		runtime->channels != cruntime->channels;
-	if (!check)
-		return 0;
-	if (stream == SNDRV_PCM_STREAM_CAPTURE) {
-		return -EIO;
-	} else {
-		/* close must not free the peer runtime below */
-		atomic_inc(&cable->stop_count);
-		snd_pcm_stop(cable->streams[SNDRV_PCM_STREAM_CAPTURE]->
-					substream, SNDRV_PCM_STATE_DRAINING);
-		if (atomic_dec_and_test(&cable->stop_count))
-			wake_up(&cable->stop_wait);
-	      __notify:
-		runtime = cable->streams[SNDRV_PCM_STREAM_PLAYBACK]->
-							substream->runtime;
-		setup = get_setup(cable->streams[SNDRV_PCM_STREAM_PLAYBACK]);
-		card = cable->streams[SNDRV_PCM_STREAM_PLAYBACK]->loopback->card;
+	scoped_guard(spinlock_irqsave, &cable->lock) {
+		dpcm_play = cable->streams[SNDRV_PCM_STREAM_PLAYBACK];
+		dpcm_capt = cable->streams[SNDRV_PCM_STREAM_CAPTURE];
+
+		if (cable->valid != CABLE_VALID_BOTH) {
+			if (stream == SNDRV_PCM_STREAM_CAPTURE || !dpcm_play)
+				return 0;
+		} else {
+			if (!dpcm_play || !dpcm_capt)
+				return -EIO;
+			runtime = dpcm_play->substream->runtime;
+			cruntime = dpcm_capt->substream->runtime;
+			if (!runtime || !cruntime)
+				return -EIO;
+			check = runtime->format != cruntime->format ||
+			runtime->rate != cruntime->rate ||
+			runtime->channels != cruntime->channels ||
+			is_access_interleaved(runtime->access) !=
+			is_access_interleaved(cruntime->access);
+			if (!check)
+				return 0;
+			if (stream == SNDRV_PCM_STREAM_CAPTURE)
+				return -EIO;
+			else if (cruntime->state == SNDRV_PCM_STATE_RUNNING)
+				stop_capture = true;
+		}
+
+		setup = get_setup(dpcm_play);
+		card = dpcm_play->loopback->card;
+		runtime = dpcm_play->substream->runtime;
 		if (setup->format != runtime->format) {
 			snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
 							&setup->format_id);
@@ -371,7 +435,17 @@ static int loopback_check_format(struct loopback_cable *cable, int stream)
 							&setup->channels_id);
 			setup->channels = runtime->channels;
 		}
+		if (is_access_interleaved(setup->access) !=
+		    is_access_interleaved(runtime->access)) {
+			snd_ctl_notify(card, SNDRV_CTL_EVENT_MASK_VALUE,
+							&setup->access_id);
+			setup->access = runtime->access;
+		}
 	}
+
+	if (stop_capture)
+		snd_pcm_stop(dpcm_capt->substream, SNDRV_PCM_STATE_DRAINING);
+
 	return 0;
 }
 
@@ -480,6 +554,7 @@ static int loopback_prepare(struct snd_pcm_substream *substream)
 
 	dpcm->buf_pos = 0;
 	dpcm->pcm_buffer_size = frames_to_bytes(runtime, runtime->buffer_size);
+	dpcm->channel_buf_n = dpcm->pcm_buffer_size / runtime->channels;
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
 		/* clear capture buffer */
 		dpcm->silent_size = dpcm->pcm_buffer_size;
@@ -530,6 +605,22 @@ static void clear_capture_buf(struct loopback_pcm *dpcm, unsigned int bytes)
 	}
 }
 
+static void copy_play_buf_part_n(struct loopback_pcm *play, struct loopback_pcm *capt,
+				 unsigned int size, unsigned int src_off, unsigned int dst_off)
+{
+	unsigned int channels = capt->substream->runtime->channels;
+	unsigned int size_p_ch = size / channels;
+	unsigned int src_off_ch = src_off / channels;
+	unsigned int dst_off_ch = dst_off / channels;
+	int i;
+
+	for (i = 0; i < channels; i++) {
+		memcpy(capt->substream->runtime->dma_area + capt->channel_buf_n * i + dst_off_ch,
+		       play->substream->runtime->dma_area + play->channel_buf_n * i + src_off_ch,
+		       size_p_ch);
+	}
+}
+
 static void copy_play_buf(struct loopback_pcm *play,
 			  struct loopback_pcm *capt,
 			  unsigned int bytes)
@@ -543,7 +634,7 @@ static void copy_play_buf(struct loopback_pcm *play,
 
 	/* check if playback is draining, trim the capture copy size
 	 * when our pointer is at the end of playback ring buffer */
-	if (runtime->status->state == SNDRV_PCM_STATE_DRAINING &&
+	if (runtime->state == SNDRV_PCM_STATE_DRAINING &&
 	    snd_pcm_playback_hw_avail(runtime) < runtime->buffer_size) { 
 	    	snd_pcm_uframes_t appl_ptr, appl_ptr1, diff;
 		appl_ptr = appl_ptr1 = runtime->control->appl_ptr;
@@ -564,7 +655,10 @@ static void copy_play_buf(struct loopback_pcm *play,
 			size = play->pcm_buffer_size - src_off;
 		if (dst_off + size > capt->pcm_buffer_size)
 			size = capt->pcm_buffer_size - dst_off;
-		memcpy(dst + dst_off, src + src_off, size);
+		if (!is_access_interleaved(runtime->access))
+			copy_play_buf_part_n(play, capt, size, src_off, dst_off);
+		else
+			memcpy(dst + dst_off, src + src_off, size);
 		capt->silent_size = 0;
 		bytes -= size;
 		if (!bytes)
@@ -681,6 +775,30 @@ static void loopback_jiffies_timer_function(struct timer_list *t)
 	spin_unlock_irqrestore(&dpcm->cable->lock, flags);
 }
 
+#ifdef CONFIG_HIGH_RES_TIMERS
+static enum hrtimer_restart loopback_hrtimer_function(struct hrtimer *t)
+{
+	struct loopback_pcm *dpcm = container_of(t, struct loopback_pcm, hrtimer);
+	bool period_elapsed = false;
+
+	scoped_guard(spinlock_irqsave, &dpcm->cable->lock) {
+		if (loopback_jiffies_timer_pos_update(dpcm->cable) &
+		    (1 << dpcm->substream->stream)) {
+			loopback_hrtimer_start(dpcm);
+			if (dpcm->period_update_pending) {
+				dpcm->period_update_pending = 0;
+				period_elapsed = true;
+			}
+		}
+	}
+
+	if (period_elapsed)
+		snd_pcm_period_elapsed(dpcm->substream);
+
+	return HRTIMER_NORESTART;
+}
+#endif
+
 /* call in cable->lock */
 static int loopback_snd_timer_check_resolution(struct snd_pcm_runtime *runtime,
 					       unsigned long resolution)
@@ -738,7 +856,7 @@ static void loopback_snd_timer_period_elapsed(struct loopback_cable *cable,
 
 	if (event == SNDRV_TIMER_EVENT_MSTOP) {
 		if (!dpcm_play ||
-		    dpcm_play->substream->runtime->status->state !=
+		    dpcm_play->substream->runtime->state !=
 				SNDRV_PCM_STATE_DRAINING) {
 			spin_unlock_irqrestore(&cable->lock, flags);
 			return;
@@ -854,6 +972,21 @@ static void loopback_jiffies_timer_dpcm_info(struct loopback_pcm *dpcm,
 	snd_iprintf(buffer, "    timer_expires:\t%lu\n", dpcm->timer.expires);
 }
 
+#ifdef CONFIG_HIGH_RES_TIMERS
+static void loopback_hrtimer_dpcm_info(struct loopback_pcm *dpcm,
+				       struct snd_info_buffer *buffer)
+{
+	snd_iprintf(buffer, "    update_pending:\t%u\n",
+		    dpcm->period_update_pending);
+	snd_iprintf(buffer, "    irq_pos:\t\t%u\n", dpcm->irq_pos);
+	snd_iprintf(buffer, "    period_frac:\t%u\n", dpcm->period_size_frac);
+	snd_iprintf(buffer, "    last_jiffies:\t%lu (%lu)\n",
+		    dpcm->last_jiffies, jiffies);
+	snd_iprintf(buffer, "    timer_expires:\t%llu\n",
+		    ktime_to_ns(hrtimer_get_expires(&dpcm->hrtimer)));
+}
+#endif
+
 static void loopback_snd_timer_dpcm_info(struct loopback_pcm *dpcm,
 					 struct snd_info_buffer *buffer)
 {
@@ -864,8 +997,7 @@ static void loopback_snd_timer_dpcm_info(struct loopback_pcm *dpcm,
 		    cable->snd_timer.id.device,
 		    cable->snd_timer.id.subdevice);
 	snd_iprintf(buffer, "    timer open:\t\t%s\n",
-		    (cable->snd_timer.stream == SNDRV_PCM_STREAM_CAPTURE) ?
-			    "capture" : "playback");
+		    snd_pcm_direction_name(cable->snd_timer.stream));
 }
 
 static snd_pcm_uframes_t loopback_pointer(struct snd_pcm_substream *substream)
@@ -886,15 +1018,18 @@ static const struct snd_pcm_hardware loopback_pcm_hardware =
 {
 	.info =		(SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP |
 			 SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_PAUSE |
-			 SNDRV_PCM_INFO_RESUME),
+			 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_NONINTERLEAVED),
 	.formats =	(SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S16_BE |
 			 SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S24_BE |
 			 SNDRV_PCM_FMTBIT_S24_3LE | SNDRV_PCM_FMTBIT_S24_3BE |
 			 SNDRV_PCM_FMTBIT_S32_LE | SNDRV_PCM_FMTBIT_S32_BE |
-			 SNDRV_PCM_FMTBIT_FLOAT_LE | SNDRV_PCM_FMTBIT_FLOAT_BE),
-	.rates =	SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_192000,
+			 SNDRV_PCM_FMTBIT_FLOAT_LE | SNDRV_PCM_FMTBIT_FLOAT_BE |
+			 SNDRV_PCM_FMTBIT_DSD_U8 |
+			 SNDRV_PCM_FMTBIT_DSD_U16_LE | SNDRV_PCM_FMTBIT_DSD_U16_BE |
+			 SNDRV_PCM_FMTBIT_DSD_U32_LE | SNDRV_PCM_FMTBIT_DSD_U32_BE),
+	.rates =	SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_768000,
 	.rate_min =		8000,
-	.rate_max =		192000,
+	.rate_max =		768000,
 	.channels_min =		1,
 	.channels_max =		32,
 	.buffer_bytes_max =	2 * 1024 * 1024,
@@ -1002,29 +1137,24 @@ static void free_cable(struct snd_pcm_substream *substream)
 	struct loopback *loopback = substream->private_data;
 	int dev = get_cable_index(substream);
 	struct loopback_cable *cable;
-	struct loopback_pcm *dpcm;
-	bool other_alive;
 
 	cable = loopback->cables[substream->number][dev];
 	if (!cable)
 		return;
+	if (cable->streams[!substream->stream]) {
+		/* other stream is still alive */
+		spin_lock_irq(&cable->lock);
+		cable->streams[substream->stream] = NULL;
+		spin_unlock_irq(&cable->lock);
+	} else {
+		struct loopback_pcm *dpcm = substream->runtime->private_data;
 
-	spin_lock_irq(&cable->lock);
-	cable->streams[substream->stream] = NULL;
-	other_alive = cable->streams[!substream->stream] != NULL;
-	spin_unlock_irq(&cable->lock);
-
-	/* Pair with the stop_count increment in loopback_check_format(). */
-	wait_event(cable->stop_wait, !atomic_read(&cable->stop_count));
-	if (other_alive)
-		return;
-
-	dpcm = substream->runtime->private_data;
-	if (cable->ops && cable->ops->close_cable && dpcm)
-		cable->ops->close_cable(dpcm);
-	/* free the cable */
-	loopback->cables[substream->number][dev] = NULL;
-	kfree(cable);
+		if (cable->ops && cable->ops->close_cable && dpcm)
+			cable->ops->close_cable(dpcm);
+		/* free the cable */
+		loopback->cables[substream->number][dev] = NULL;
+		kfree(cable);
+	}
 }
 
 static int loopback_jiffies_timer_open(struct loopback_pcm *dpcm)
@@ -1034,7 +1164,7 @@ static int loopback_jiffies_timer_open(struct loopback_pcm *dpcm)
 	return 0;
 }
 
-static struct loopback_ops loopback_jiffies_timer_ops = {
+static const struct loopback_ops loopback_jiffies_timer_ops = {
 	.open = loopback_jiffies_timer_open,
 	.start = loopback_jiffies_timer_start,
 	.stop = loopback_jiffies_timer_stop,
@@ -1043,6 +1173,26 @@ static struct loopback_ops loopback_jiffies_timer_ops = {
 	.pos_update = loopback_jiffies_timer_pos_update,
 	.dpcm_info = loopback_jiffies_timer_dpcm_info,
 };
+
+#ifdef CONFIG_HIGH_RES_TIMERS
+static int loopback_hrtimer_open(struct loopback_pcm *dpcm)
+{
+	hrtimer_init(&dpcm->hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+	dpcm->hrtimer.function = loopback_hrtimer_function;
+
+	return 0;
+}
+
+static const struct loopback_ops loopback_hrtimer_ops = {
+	.open = loopback_hrtimer_open,
+	.start = loopback_hrtimer_start,
+	.stop = loopback_hrtimer_stop,
+	.stop_sync = loopback_hrtimer_stop_sync,
+	.close_substream = loopback_hrtimer_stop_sync,
+	.pos_update = loopback_jiffies_timer_pos_update,
+	.dpcm_info = loopback_hrtimer_dpcm_info,
+};
+#endif
 
 static int loopback_parse_timer_id(const char *str,
 				   struct snd_timer_id *tid)
@@ -1096,6 +1246,8 @@ static int loopback_parse_timer_id(const char *str,
 			}
 		}
 	}
+	if (card_idx == -1)
+		tid->dev_class = SNDRV_TIMER_CLASS_GLOBAL;
 	if (!err && tid) {
 		tid->card = card_idx;
 		tid->device = dev;
@@ -1185,7 +1337,7 @@ exit:
 /* stop_sync() is not required for sound timer because it does not need to be
  * restarted in loopback_prepare() on Xrun recovery
  */
-static struct loopback_ops loopback_snd_timer_ops = {
+static const struct loopback_ops loopback_snd_timer_ops = {
 	.open = loopback_snd_timer_open,
 	.start = loopback_snd_timer_start,
 	.stop = loopback_snd_timer_stop,
@@ -1219,10 +1371,13 @@ static int loopback_open(struct snd_pcm_substream *substream)
 			goto unlock;
 		}
 		spin_lock_init(&cable->lock);
-		atomic_set(&cable->stop_count, 0);
-		init_waitqueue_head(&cable->stop_wait);
 		cable->hw = loopback_pcm_hardware;
-		if (loopback->timer_source)
+#ifdef CONFIG_HIGH_RES_TIMERS
+		if (loopback->timer_source && !strcmp(loopback->timer_source, "hrtimer"))
+			cable->ops = &loopback_hrtimer_ops;
+		else
+#endif
+		if (loopback->timer_source && loopback->timer_source[0])
 			cable->ops = &loopback_snd_timer_ops;
 		else
 			cable->ops = &loopback_jiffies_timer_ops;
@@ -1510,6 +1665,29 @@ static int loopback_channels_get(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+static int loopback_access_info(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_info *uinfo)
+{
+	const char * const texts[] = {"Interleaved", "Non-interleaved"};
+
+	return snd_ctl_enum_info(uinfo, 1, ARRAY_SIZE(texts), texts);
+}
+
+static int loopback_access_get(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct loopback *loopback = snd_kcontrol_chip(kcontrol);
+	snd_pcm_access_t access;
+
+	mutex_lock(&loopback->cable_lock);
+	access = loopback->setup[kcontrol->id.subdevice][kcontrol->id.device].access;
+
+	ucontrol->value.enumerated.item[0] = !is_access_interleaved(access);
+
+	mutex_unlock(&loopback->cable_lock);
+	return 0;
+}
+
 static const struct snd_kcontrol_new loopback_controls[]  = {
 {
 	.iface =        SNDRV_CTL_ELEM_IFACE_PCM,
@@ -1556,7 +1734,15 @@ static const struct snd_kcontrol_new loopback_controls[]  = {
 	.name =         "PCM Slave Channels",
 	.info =         loopback_channels_info,
 	.get =          loopback_channels_get
-}
+},
+#define ACCESS_IDX 6
+{
+	.access =	SNDRV_CTL_ELEM_ACCESS_READ,
+	.iface =	SNDRV_CTL_ELEM_IFACE_PCM,
+	.name =		"PCM Slave Access Mode",
+	.info =		loopback_access_info,
+	.get =		loopback_access_get,
+},
 };
 
 static int loopback_mixer_new(struct loopback *loopback, int notify)
@@ -1577,6 +1763,7 @@ static int loopback_mixer_new(struct loopback *loopback, int notify)
 			setup->notify = notify;
 			setup->rate_shift = NO_PITCH;
 			setup->format = SNDRV_PCM_FORMAT_S16_LE;
+			setup->access = SNDRV_PCM_ACCESS_RW_INTERLEAVED;
 			setup->rate = 48000;
 			setup->channels = 2;
 			for (idx = 0; idx < ARRAY_SIZE(loopback_controls);
@@ -1607,6 +1794,9 @@ static int loopback_mixer_new(struct loopback *loopback, int notify)
 					break;
 				case CHANNELS_IDX:
 					setup->channels_id = kctl->id;
+					break;
+				case ACCESS_IDX:
+					setup->access_id = kctl->id;
 					break;
 				default:
 					break;
@@ -1728,8 +1918,8 @@ static int loopback_probe(struct platform_device *devptr)
 	int dev = devptr->id;
 	int err;
 
-	err = snd_card_new(&devptr->dev, index[dev], id[dev], THIS_MODULE,
-			   sizeof(struct loopback), &card);
+	err = snd_devm_card_new(&devptr->dev, index[dev], id[dev], THIS_MODULE,
+				sizeof(struct loopback), &card);
 	if (err < 0)
 		return err;
 	loopback = card->private_data;
@@ -1746,13 +1936,13 @@ static int loopback_probe(struct platform_device *devptr)
 
 	err = loopback_pcm_new(loopback, 0, pcm_substreams[dev]);
 	if (err < 0)
-		goto __nodev;
+		return err;
 	err = loopback_pcm_new(loopback, 1, pcm_substreams[dev]);
 	if (err < 0)
-		goto __nodev;
+		return err;
 	err = loopback_mixer_new(loopback, pcm_notify[dev] ? 1 : 0);
 	if (err < 0)
-		goto __nodev;
+		return err;
 	loopback_cable_proc_new(loopback, 0);
 	loopback_cable_proc_new(loopback, 1);
 	loopback_timer_source_proc_new(loopback);
@@ -1760,22 +1950,12 @@ static int loopback_probe(struct platform_device *devptr)
 	strcpy(card->shortname, "Loopback");
 	sprintf(card->longname, "Loopback %i", dev + 1);
 	err = snd_card_register(card);
-	if (!err) {
-		platform_set_drvdata(devptr, card);
-		return 0;
-	}
-      __nodev:
-	snd_card_free(card);
-	return err;
-}
-
-static int loopback_remove(struct platform_device *devptr)
-{
-	snd_card_free(platform_get_drvdata(devptr));
+	if (err < 0)
+		return err;
+	platform_set_drvdata(devptr, card);
 	return 0;
 }
 
-#ifdef CONFIG_PM_SLEEP
 static int loopback_suspend(struct device *pdev)
 {
 	struct snd_card *card = dev_get_drvdata(pdev);
@@ -1792,20 +1972,15 @@ static int loopback_resume(struct device *pdev)
 	return 0;
 }
 
-static SIMPLE_DEV_PM_OPS(loopback_pm, loopback_suspend, loopback_resume);
-#define LOOPBACK_PM_OPS	&loopback_pm
-#else
-#define LOOPBACK_PM_OPS	NULL
-#endif
+static DEFINE_SIMPLE_DEV_PM_OPS(loopback_pm, loopback_suspend, loopback_resume);
 
 #define SND_LOOPBACK_DRIVER	"snd_aloop"
 
 static struct platform_driver loopback_driver = {
 	.probe		= loopback_probe,
-	.remove		= loopback_remove,
 	.driver		= {
 		.name	= SND_LOOPBACK_DRIVER,
-		.pm	= LOOPBACK_PM_OPS,
+		.pm	= &loopback_pm,
 	},
 };
 
@@ -1845,7 +2020,7 @@ static int __init alsa_card_loopback_init(void)
 	}
 	if (!cards) {
 #ifdef MODULE
-		printk(KERN_ERR "aloop: No loopback enabled\n");
+		pr_err("aloop: No loopback enabled\n");
 #endif
 		loopback_unregister_all();
 		return -ENODEV;

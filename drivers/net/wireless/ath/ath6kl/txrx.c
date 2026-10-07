@@ -708,7 +708,7 @@ void ath6kl_tx_complete(struct htc_target *target,
 				 packet->endpoint >= ENDPOINT_MAX))
 			continue;
 
-		ath6kl_cookie = (struct ath6kl_cookie *)packet->pkt_cntxt;
+		ath6kl_cookie = packet->pkt_cntxt;
 		if (WARN_ON_ONCE(!ath6kl_cookie))
 			continue;
 
@@ -839,7 +839,7 @@ static void ath6kl_deliver_frames_to_nw_stack(struct net_device *dev,
 
 	skb->protocol = eth_type_trans(skb, skb->dev);
 
-	netif_rx_ni(skb);
+	netif_rx(skb);
 }
 
 static void ath6kl_alloc_netbufs(struct sk_buff_head *q, u16 num)
@@ -1722,14 +1722,12 @@ void aggr_recv_addba_req_evt(struct ath6kl_vif *vif, u8 tid_mux, u16 seq_no,
 
 	rxtid = &aggr_conn->rx_tid[tid];
 
-	if (rxtid->aggr)
-		aggr_delete_tid_state(aggr_conn, tid);
-
-	if (win_sz < AGGR_WIN_SZ_MIN || win_sz > AGGR_WIN_SZ_MAX) {
+	if (win_sz < AGGR_WIN_SZ_MIN || win_sz > AGGR_WIN_SZ_MAX)
 		ath6kl_dbg(ATH6KL_DBG_WLAN_RX, "%s: win_sz %d, tid %d\n",
 			   __func__, win_sz, tid);
-		return;
-	}
+
+	if (rxtid->aggr)
+		aggr_delete_tid_state(aggr_conn, tid);
 
 	rxtid->seq_next = seq_no;
 	hold_q_size = TID_WINDOW_SZ(win_sz) * sizeof(struct skb_hold_q);

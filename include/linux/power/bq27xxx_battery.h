@@ -35,6 +35,7 @@ enum bq27xxx_chip {
 	BQ27Z561,
 	BQ28Z610,
 	BQ34Z100,
+	BQ78Z100,
 };
 
 struct bq27xxx_device_info;
@@ -46,21 +47,12 @@ struct bq27xxx_access_methods {
 };
 
 struct bq27xxx_reg_cache {
-	int temperature;
-	int time_to_empty;
-	int time_to_empty_avg;
-	int time_to_full;
-	int charge_full;
-	int cycle_count;
 	int capacity;
-	int energy;
 	int flags;
-	int health;
 };
 
 struct bq27xxx_device_info {
 	struct device *dev;
-	int id;
 	enum bq27xxx_chip chip;
 	u32 opts;
 	const char *name;
@@ -77,14 +69,11 @@ struct bq27xxx_device_info {
 	struct list_head list;
 	struct mutex lock;
 	u8 *regs;
-#ifdef CONFIG_BATTERY_BQ27XXX_RESIST_TABLE_UPDATES_NVM
-	u32 qmax_cell0;
-	u32 resist_table[15];
-#endif
 };
 
 void bq27xxx_battery_update(struct bq27xxx_device_info *di);
 int bq27xxx_battery_setup(struct bq27xxx_device_info *di);
 void bq27xxx_battery_teardown(struct bq27xxx_device_info *di);
+extern const struct dev_pm_ops bq27xxx_battery_battery_pm_ops;
 
 #endif

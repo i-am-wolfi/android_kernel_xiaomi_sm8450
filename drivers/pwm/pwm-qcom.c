@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #define pr_fmt(fmt) "%s: " fmt, __func__
 
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -37,8 +29,11 @@
 #define PWM_CYC_CFG	0xC
 #define PWM_UPDATE	0x10
 #define PWM_PERIOD_CNT	0x14
+#define PWM_RESET	0x18
 
-#define PWM_FRAME_POLARITY_BIT	0
+#define PWM_FRAME_POLARITY_BIT		BIT(0)
+#define PWM_FRAME_ROLLOVER_CNT_BIT	BIT(4)
+#define PWM_FRAME_RESET_BIT		BIT(0)
 
 enum {
 	ENABLE_STATUS0,
@@ -50,6 +45,8 @@ enum {
 struct pdm_pwm_priv_data {
 	unsigned int max_channels;
 	const u16 *status_reg_offsets;
+	bool pwm_reset_support;
+	bool pwm_cnt_rollover;
 };
 
 /*
@@ -62,6 +59,9 @@ struct pdm_pwm_priv_data {
  * @current_freq: Current frequency of frame.
  * @freq_set: This bool flag is responsible for setting period once per frame.
  * @mutex: mutex lock per frame.
+ * @cnt_rollover_en: This bool flag is used to set rollover bit per frame.
+ * @frame_clk: pwm clock for each frame.
+ * @frame_rate: core rate of frame_clk.
  */
 struct pdm_pwm_frames {
 	u32	frame_id;
@@ -74,6 +74,9 @@ struct pdm_pwm_frames {
 	bool	freq_set;
 	struct mutex frame_lock; /* PWM per frame lock */
 	struct pdm_pwm_chip *pwm_chip;
+	bool cnt_rollover_en;
+	struct clk *frame_clk;
+	unsigned long frame_clk_rate;
 };
 
 /*
@@ -95,7 +98,7 @@ struct pdm_pwm_chip {
 	struct pdm_pwm_frames	*frames;
 	struct clk		*pdm_ahb_clk;
 	struct clk		*pwm_core_clk;
-	struct pdm_pwm_priv_data	*priv_data;
+	const struct pdm_pwm_priv_data	*priv_data;
 	/* This lock to be used for Enable/Disable as it is per PWM channel */
 	struct mutex		lock;
 	unsigned long		pwm_core_rate;
@@ -105,24 +108,29 @@ struct pdm_pwm_chip {
 static int __pdm_pwm_calc_pwm_frequency(struct pdm_pwm_chip *chip,
 					int period_ns, u32 hw_idx)
 {
-	unsigned long cyc_cfg, freq;
+	unsigned long cyc_cfg, freq, rate;
 	int ret;
 
-	/* PWM client could set the period only once, due to HW limitation. */
-	if (chip->frames[hw_idx].freq_set)
+	/*
+	 * PWM client can set the period only once if the HW version does
+	 * not support reset functionality.
+	 */
+	if (chip->frames[hw_idx].freq_set && !chip->priv_data->pwm_reset_support)
 		return 0;
+
+	rate = chip->pwm_core_clk ? chip->pwm_core_rate : chip->frames[hw_idx].frame_clk_rate;
 
 	freq = PERIOD_TO_HZ(period_ns);
 	if (!freq) {
 		pr_err("Frequency cannot be Zero\n");
 		return -EINVAL;
 	}
-	if (freq > (chip->pwm_core_rate >> 1) || freq <= (chip->pwm_core_rate >> 16)) {
+	if (freq > (rate >> 1) || freq <= (rate >> 16)) {
 		pr_debug("Freq %ld is not in range Max=%ld Min=%ld\n", freq,
-		(chip->pwm_core_rate >> 1), (chip->pwm_core_rate >> 16) + 1);
+		(rate >> 1), (rate >> 16) + 1);
 		return -ERANGE;
 	}
-	cyc_cfg = DIV_ROUND_CLOSEST(chip->pwm_core_rate, freq) - 1;
+	cyc_cfg = DIV_ROUND_CLOSEST(rate, freq) - 1;
 
 	ret = regmap_update_bits(chip->regmap,
 				chip->frames[hw_idx].reg_offset + PWM_CYC_CFG,
@@ -137,23 +145,23 @@ static int __pdm_pwm_calc_pwm_frequency(struct pdm_pwm_chip *chip,
 	return 0;
 }
 
-static void pdm_pwm_get_state(struct pwm_chip *pwm_chip, struct pwm_device *pwm,
+static int pdm_pwm_get_state(struct pwm_chip *pwm_chip, struct pwm_device *pwm,
 				struct pwm_state *state)
 {
-	struct pdm_pwm_chip *chip = container_of(pwm_chip,
-				struct pdm_pwm_chip, pwm_chip);
+	struct pdm_pwm_chip *chip = pwmchip_get_drvdata(pwm_chip);
 
 	state->enabled = chip->frames[pwm->hwpwm].is_enabled;
 	state->polarity = chip->frames[pwm->hwpwm].polarity;
 	state->period = chip->frames[pwm->hwpwm].current_period_ns;
 	state->duty_cycle = chip->frames[pwm->hwpwm].current_duty_ns;
 
+	return 0;
 }
 
 static int pdm_pwm_config(struct pdm_pwm_chip *chip, u32 hw_idx,
 				int duty_ns, int period_ns, int polarity)
 {
-	unsigned long ctl1;
+	unsigned long ctl1, rate;
 	int current_period = period_ns, ret;
 	u32 cyc_cfg;
 
@@ -175,23 +183,44 @@ static int pdm_pwm_config(struct pdm_pwm_chip *chip, u32 hw_idx,
 
 	mutex_lock(&chip->frames[hw_idx].frame_lock);
 
+	ret = clk_prepare_enable(chip->frames[hw_idx].frame_clk);
+	if (ret)
+		goto err;
+
+	/*
+	 * Set the counter rollover enable bit, so that counter doesn't get stuck
+	 * in period change configuration.
+	 */
+	if (chip->priv_data->pwm_cnt_rollover && !chip->frames[hw_idx].cnt_rollover_en) {
+		regmap_update_bits(chip->regmap, chip->frames[hw_idx].reg_offset + PWM_CTL0,
+				PWM_FRAME_ROLLOVER_CNT_BIT, PWM_FRAME_ROLLOVER_CNT_BIT);
+		chip->frames[hw_idx].cnt_rollover_en = true;
+	}
+
 	ret = __pdm_pwm_calc_pwm_frequency(chip, current_period, hw_idx);
 	if (ret)
 		goto out;
 
 	if (chip->frames[hw_idx].current_period_ns != period_ns) {
-		pr_err("Period cannot be updated, calculating dutycycle on old period\n");
-		current_period = chip->frames[hw_idx].current_period_ns;
+		if (chip->priv_data->pwm_reset_support)
+			regmap_update_bits(chip->regmap,
+					chip->frames[hw_idx].reg_offset + PWM_RESET,
+					PWM_FRAME_RESET_BIT, PWM_FRAME_RESET_BIT);
+		else {
+			pr_err("Period cannot be updated, calculating dutycycle on old period\n");
+			current_period = chip->frames[hw_idx].current_period_ns;
+		}
 	}
 
 	if (chip->frames[hw_idx].polarity != polarity) {
 		regmap_update_bits(chip->regmap, chip->frames[hw_idx].reg_offset
-				+ PWM_CTL0, BIT(PWM_FRAME_POLARITY_BIT), polarity);
+				+ PWM_CTL0, PWM_FRAME_POLARITY_BIT, polarity);
 		chip->frames[hw_idx].polarity = polarity;
 	}
 
-	ctl1 = DIV_ROUND_CLOSEST(chip->pwm_core_rate, chip->frames[hw_idx].current_freq);
+	rate = chip->pwm_core_clk ? chip->pwm_core_rate : chip->frames[hw_idx].frame_clk_rate;
 
+	ctl1 = DIV_ROUND_CLOSEST(rate, chip->frames[hw_idx].current_freq);
 	ctl1 = DIV_ROUND_CLOSEST(ctl1 * (DIV_ROUND_CLOSEST((duty_ns * 100),
 							current_period)), 100);
 
@@ -219,28 +248,14 @@ static int pdm_pwm_config(struct pdm_pwm_chip *chip, u32 hw_idx,
 
 	chip->frames[hw_idx].current_duty_ns = duty_ns;
 out:
+	clk_disable_unprepare(chip->frames[hw_idx].frame_clk);
+err:
 	mutex_unlock(&chip->frames[hw_idx].frame_lock);
-
 	clk_disable_unprepare(chip->pwm_core_clk);
 fail:
 	clk_disable_unprepare(chip->pdm_ahb_clk);
 
 	return ret;
-}
-
-static void pdm_pwm_free(struct pwm_chip *pwm_chip, struct pwm_device *pwm)
-{
-	struct pdm_pwm_chip *chip = container_of(pwm_chip,
-					struct pdm_pwm_chip, pwm_chip);
-	u32 hw_idx = pwm->hwpwm;
-
-	mutex_lock(&chip->lock);
-
-	chip->frames[hw_idx].freq_set = false;
-	chip->frames[hw_idx].current_period_ns = 0;
-	chip->frames[hw_idx].current_duty_ns = 0;
-
-	mutex_unlock(&chip->lock);
 }
 
 static int pdm_pwm_enable(struct pdm_pwm_chip *chip, struct pwm_device *pwm)
@@ -258,11 +273,17 @@ static int pdm_pwm_enable(struct pdm_pwm_chip *chip, struct pwm_device *pwm)
 		return ret;
 	}
 
+	ret = clk_prepare_enable(chip->frames[hw_idx].frame_clk);
+	if (ret) {
+		clk_disable_unprepare(chip->pdm_ahb_clk);
+		return ret;
+	}
+
 	mutex_lock(&chip->lock);
 
 	/* Check the channel in Chip channel and enable the BIT in PWM_TOP */
 	pr_debug("%s: PWM device Label %s, HW index %u, PWM index %u\n", __func__
-					, pwm->label, hw_idx, pwm->pwm);
+					, pwm->label, hw_idx, pwm->hwpwm);
 	pr_debug("%s: PWM frame-index %d, frame-offset 0x%x\n", __func__,
 			chip->frames[hw_idx].frame_id,
 					chip->frames[hw_idx].reg_offset);
@@ -298,6 +319,7 @@ static int pdm_pwm_disable(struct pdm_pwm_chip *chip, struct pwm_device *pwm)
 		return ret;
 	chip->frames[hw_idx].is_enabled = false;
 
+	clk_disable_unprepare(chip->frames[hw_idx].frame_clk);
 	clk_disable_unprepare(chip->pwm_core_clk);
 	clk_disable_unprepare(chip->pdm_ahb_clk);
 
@@ -307,13 +329,13 @@ static int pdm_pwm_disable(struct pdm_pwm_chip *chip, struct pwm_device *pwm)
 static int pdm_pwm_apply(struct pwm_chip *pwm_chip, struct pwm_device *pwm,
 					const struct pwm_state *state)
 {
-	struct pdm_pwm_chip *chip = container_of(pwm_chip, struct pdm_pwm_chip, pwm_chip);
+	struct pdm_pwm_chip *chip = pwmchip_get_drvdata(pwm_chip);
 	struct pwm_state curr_state;
 	int ret;
 
 	pwm_get_state(pwm, &curr_state);
 
-	if (state->period < curr_state.period)
+	if (state->period < curr_state.period && !chip->priv_data->pwm_reset_support)
 		return -EINVAL;
 
 	if (state->period != curr_state.period ||
@@ -337,6 +359,22 @@ static int pdm_pwm_apply(struct pwm_chip *pwm_chip, struct pwm_device *pwm,
 	}
 
 	return 0;
+}
+
+static void pdm_pwm_free(struct pwm_chip *pwm_chip, struct pwm_device *pwm)
+{
+	struct pdm_pwm_chip *chip = pwmchip_get_drvdata(pwm_chip);
+	u32 hw_idx = pwm->hwpwm;
+
+	mutex_lock(&chip->lock);
+
+	chip->frames[hw_idx].freq_set = false;
+	chip->frames[hw_idx].current_period_ns = 0;
+	chip->frames[hw_idx].current_duty_ns = 0;
+	chip->frames[hw_idx].cnt_rollover_en = false;
+	mutex_unlock(&chip->lock);
+
+	pdm_pwm_disable(chip, pwm);
 }
 
 static const struct pwm_ops pdm_pwm_ops = {
@@ -368,7 +406,7 @@ static int pdm_pwm_parse_dt(struct platform_device *pdev,
 		return PTR_ERR(chip->pdm_ahb_clk);
 	}
 
-	chip->pwm_core_clk = devm_clk_get(chip->dev, "pwm_core_clk");
+	chip->pwm_core_clk = devm_clk_get_optional(chip->dev, "pwm_core_clk");
 	if (IS_ERR(chip->pwm_core_clk)) {
 		if (PTR_ERR(chip->pwm_core_clk) != -EPROBE_DEFER)
 			dev_err(chip->dev, "Unable to get core clock handle\n");
@@ -434,6 +472,18 @@ static int pdm_pwm_parse_dt(struct platform_device *pdev,
 		}
 		chip->frames[count].reg_offset = off;
 
+		if (!chip->pwm_core_clk) {
+			chip->frames[count].frame_clk = of_clk_get_by_name(frame_node, "frame-clk");
+			if (IS_ERR(chip->frames[count].frame_clk)) {
+				if (PTR_ERR(chip->frames[count].frame_clk) != -EPROBE_DEFER)
+					dev_err(chip->dev, "Unable to get frame-%d clock handle\n",
+							count);
+				return PTR_ERR(chip->frames[count].frame_clk);
+			}
+
+			chip->frames[count].frame_clk_rate =
+				clk_get_rate(chip->frames[count].frame_clk);
+		}
 		/* Holding a reference to the pdm chip for debug operations. */
 		chip->frames[count].pwm_chip = chip;
 
@@ -446,12 +496,10 @@ static int pdm_pwm_parse_dt(struct platform_device *pdev,
 		return ret;
 
 	ret = regmap_update_bits(chip->regmap, PWM_TOPCTL0, GENMASK(chip->num_frames, 0), 0);
-	if (ret)
-		return ret;
 
 	clk_disable_unprepare(chip->pdm_ahb_clk);
 
-	return 0;
+	return ret;
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -473,7 +521,7 @@ static int get_polarity(struct seq_file *m, void *unused)
 	u32 temp;
 
 	regmap_read(chip->regmap, frame->reg_offset + PWM_CTL0, &temp);
-	if (BIT(PWM_FRAME_POLARITY_BIT) & temp)
+	if (PWM_FRAME_POLARITY_BIT & temp)
 		seq_puts(m, "PWM_POLARITY_INVERSED\n");
 	else
 		seq_puts(m, "PWM_POLARITY_NORMAL\n");
@@ -564,19 +612,43 @@ static int duty_ns_get(void *data, u64 *val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(pwm_duty_ns_fops, duty_ns_get, NULL, "%lld\n");
 
-static void pdm_dwm_debug_init(struct pwm_chip *pwm_chip)
+static int get_clk_name(struct seq_file *m, void *unused)
 {
-	struct pdm_pwm_chip *chip = container_of(pwm_chip, struct pdm_pwm_chip, pwm_chip);
+	struct pdm_pwm_frames *frame = m->private;
+	struct pdm_pwm_chip *chip = frame->pwm_chip;
+
+	if (!chip->pwm_core_clk)
+		seq_printf(m, "%s\n", __clk_get_name(frame->frame_clk));
+	else
+		seq_printf(m, "%s\n", __clk_get_name(chip->pwm_core_clk));
+
+	return 0;
+}
+
+static int print_clk_name(struct inode *inode, struct file *file)
+{
+	return single_open(file, get_clk_name, inode->i_private);
+};
+
+static const struct file_operations pwm_clk_name_fops = {
+	.open = print_clk_name,
+	.read = seq_read,
+};
+
+static void pdm_pwm_debug_init(struct pwm_chip *pwm_chip)
+{
+	struct pdm_pwm_chip *chip = pwmchip_get_drvdata(pwm_chip);
 	struct pwm_device *pwm;
-	static struct dentry *debugfs_base, *debugfs_frame_base;
+	struct dentry *debugfs_base, *debugfs_frame_base;
 	int i, hw_idx;
 	char frame[FRAME_NUM_MAX_LEN];
 
-	debugfs_base = debugfs_create_dir(chip->dev->of_node->name, NULL);
+	debugfs_base = debugfs_create_dir("pdm_pwm", NULL);
 	if (IS_ERR_OR_NULL(debugfs_base)) {
 		pr_err("Failed in creating debugfs directory.\n");
 		return;
 	}
+
 	for (i = 0; i < pwm_chip->npwm; i++) {
 		pwm = &pwm_chip->pwms[i];
 		hw_idx = pwm->hwpwm;
@@ -604,6 +676,10 @@ static void pdm_dwm_debug_init(struct pwm_chip *pwm_chip)
 
 		debugfs_create_file("current_duty_cycle_ns", 0444, debugfs_frame_base,
 						&chip->frames[hw_idx], &pwm_duty_ns_fops);
+
+		debugfs_create_file("clk_parent", 0444, debugfs_frame_base,
+						&chip->frames[hw_idx], &pwm_clk_name_fops);
+
 	}
 }
 
@@ -611,62 +687,49 @@ static void pdm_dwm_debug_init(struct pwm_chip *pwm_chip)
 
 static int pdm_pwm_probe(struct platform_device *pdev)
 {
+	struct pwm_chip *pchip;
 	struct pdm_pwm_chip *chip;
 	int rc;
+	const struct pdm_pwm_priv_data *priv;
 
+	/* Allocate your private and link it */
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
 
-	chip->priv_data = (struct pdm_pwm_priv_data *)of_device_get_match_data(&pdev->dev);
-	if (IS_ERR_OR_NULL(chip->priv_data))
+	priv = of_device_get_match_data(&pdev->dev);
+	if (IS_ERR(priv))
 		return -EINVAL;
 
-	chip->dev = &pdev->dev;
+	chip->priv_data  = priv;
+	chip->dev        = &pdev->dev;
 	mutex_init(&chip->lock);
+	/* Parse DT (regmap/clocks/frames/etc.) AFTER chip registration */
 	rc = pdm_pwm_parse_dt(pdev, chip);
-	if (rc < 0) {
-		dev_err(chip->dev, "Devicetree properties parsing failed, rc=%d\n", rc);
+	if (rc)
 		goto err_out;
-	}
 
-	dev_set_drvdata(chip->dev, chip);
-	chip->pwm_chip.dev = chip->dev;
-	chip->pwm_chip.base = -1;
-	chip->pwm_chip.npwm = chip->num_frames;
-	chip->pwm_chip.ops = &pdm_pwm_ops;
-	chip->pwm_chip.of_xlate = of_pwm_xlate_with_flags;
-	chip->pwm_chip.of_pwm_n_cells = 3;
+	/* Allocate pwm_chip with correct npwm */
+	pchip = devm_pwmchip_alloc(&pdev->dev, chip->num_frames, 0);
+	if (IS_ERR(pchip))
+		return -ENOMEM;
 
-	rc = pwmchip_add(&chip->pwm_chip);
-	if (rc < 0) {
-		dev_err(chip->dev, "Add pwmchip failed, rc=%d\n", rc);
+	pwmchip_set_drvdata(pchip, chip);
+
+	/* Fill ops and register */
+	pchip->ops      = &pdm_pwm_ops;
+	pchip->npwm     = chip->num_frames;
+	rc = devm_pwmchip_add(&pdev->dev, pchip);
+	if (rc)
 		goto err_out;
-	}
 
 #ifdef CONFIG_DEBUG_FS
-	pdm_dwm_debug_init(&chip->pwm_chip);
+	pdm_pwm_debug_init(pchip);
 #endif
 	dev_info(chip->dev, "pwmchip driver success.\n");
 	return rc;
 err_out:
 	mutex_destroy(&chip->lock);
-	return rc;
-}
-
-static int pdm_pwm_remove(struct platform_device *pdev)
-{
-	struct pdm_pwm_chip *chip = dev_get_drvdata(&pdev->dev);
-	int rc;
-
-	rc = pwmchip_remove(&chip->pwm_chip);
-	if (rc < 0)
-		dev_err(chip->dev, "Remove pwmchip failed, rc=%d\n", rc);
-
-	mutex_destroy(&chip->lock);
-
-	dev_set_drvdata(chip->dev, NULL);
-
 	return rc;
 }
 
@@ -683,6 +746,8 @@ static struct pdm_pwm_priv_data pdm_pwm_v2_reg_offsets = {
 		[ENABLE_STATUS0] = 0xc,
 		[ENABLE_STATUS1] = 0x10,
 	},
+	.pwm_reset_support = true,
+	.pwm_cnt_rollover = true,
 };
 
 static const struct of_device_id pdm_pwm_of_match[] = {
@@ -697,10 +762,9 @@ static struct platform_driver pdm_pwm_driver = {
 		.of_match_table	= pdm_pwm_of_match,
 	},
 	.probe		= pdm_pwm_probe,
-	.remove		= pdm_pwm_remove,
 };
 module_platform_driver(pdm_pwm_driver);
 
 MODULE_DESCRIPTION("QTI PDM PWM driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("pwm:pdm-pwm");

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -249,7 +250,7 @@ static int cpu_hot_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int cpu_hot_remove(struct platform_device *pdev)
+static void cpu_hot_remove(struct platform_device *pdev)
 {
 	struct cpu_hot_cdev *cpu_hot_cdev = NULL, *next = NULL;
 	int ret = 0;
@@ -275,8 +276,6 @@ loop_skip:
 		list_del(&cpu_hot_cdev->node);
 	}
 	mutex_unlock(&cpu_hot_lock);
-
-	return 0;
 }
 
 static const struct of_device_id cpu_hot_match[] = {
@@ -294,4 +293,4 @@ static struct platform_driver cpu_hot_driver = {
 };
 module_platform_driver(cpu_hot_driver);
 MODULE_DESCRIPTION("CPU Hotplug cooling device driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

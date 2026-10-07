@@ -61,6 +61,7 @@ module_param(timeout, int, 0);
 module_param(backplane, int, 0);
 module_param(clockp, int, 0);
 module_param(clockm, int, 0);
+MODULE_DESCRIPTION("ARCnet COM20020 chipset PCI driver");
 MODULE_LICENSE("GPL");
 
 static void led_tx_set(struct led_classdev *led_cdev,
@@ -199,7 +200,7 @@ static int com20020pci_probe(struct pci_dev *pdev,
 
 		SET_NETDEV_DEV(dev, &pdev->dev);
 		dev->base_addr = ioaddr;
-		dev->dev_addr[0] = node;
+		arcnet_set_addr(dev, node);
 		dev->sysfs_groups[0] = &com20020_state_group;
 		dev->irq = pdev->irq;
 		lp->card_name = "PCI COM20020";

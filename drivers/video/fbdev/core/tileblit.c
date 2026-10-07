@@ -13,7 +13,6 @@
 #include <linux/fb.h>
 #include <linux/vt_kern.h>
 #include <linux/console.h>
-#include <linux/font.h>
 #include <asm/types.h>
 #include "fbcon.h"
 
@@ -113,7 +112,7 @@ static void tile_clear_margins(struct vc_data *vc, struct fb_info *info,
 	}
 }
 
-static void tile_cursor(struct vc_data *vc, struct fb_info *info, int mode,
+static void tile_cursor(struct vc_data *vc, struct fb_info *info, bool enable,
 			int fg, int bg)
 {
 	struct fb_tilecursor cursor;
@@ -121,7 +120,7 @@ static void tile_cursor(struct vc_data *vc, struct fb_info *info, int mode,
 
 	cursor.sx = vc->state.x;
 	cursor.sy = vc->state.y;
-	cursor.mode = (mode == CM_ERASE || use_sw) ? 0 : 1;
+	cursor.mode = enable && !use_sw;
 	cursor.fg = fg;
 	cursor.bg = bg;
 
@@ -178,11 +177,8 @@ void fbcon_set_tileops(struct vc_data *vc, struct fb_info *info)
 		map.width = vc->vc_font.width;
 		map.height = vc->vc_font.height;
 		map.depth = 1;
-		map.length = (ops->p->userfont) ?
-			FNTCHARCNT(ops->p->fontdata) : 256;
+		map.length = vc->vc_font.charcount;
 		map.data = ops->p->fontdata;
 		info->tileops->fb_settile(info, &map);
 	}
 }
-
-EXPORT_SYMBOL(fbcon_set_tileops);

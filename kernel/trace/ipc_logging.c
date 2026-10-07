@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <asm/arch_timer.h>
@@ -20,6 +20,7 @@
 #include <linux/delay.h>
 #include <linux/completion.h>
 #include <linux/sched/clock.h>
+#include <linux/mm.h>
 #include <linux/ipc_logging.h>
 #include <soc/qcom/minidump.h>
 
@@ -131,18 +132,39 @@ static struct ipc_log_page *get_next_page(struct ipc_log_context *ilctxt,
 	return pg;
 }
 
+static phys_addr_t minidump_virt_to_phys(uint64_t virt_addr)
+{
+	struct page *page;
+
+	if (is_vmalloc_or_module_addr((void *)virt_addr)) {
+		page = vmalloc_to_page((void *)virt_addr);
+		if (!page) {
+			pr_warn("%s: Cannot get page for address 0x%llx\n",
+				__func__, virt_addr);
+			return 0;
+		}
+		return page_to_phys(page) + offset_in_page(virt_addr);
+	}
+
+	return virt_to_phys((void *)virt_addr);
+}
+
 static void register_minidump(u64 vaddr, u64 size,
 			      const char *buf_name, int index)
 {
 	struct md_region md_entry;
+	phys_addr_t phys;
 	int ret;
 
 	if (msm_minidump_enabled()
 	    && (minidump_buf_cnt < MAX_MINIDUMP_BUFFERS)) {
+		phys = minidump_virt_to_phys(vaddr);
+		if (!phys)
+			return;
 		scnprintf(md_entry.name, sizeof(md_entry.name), "%s_%d",
 			  buf_name, index);
 		md_entry.virt_addr = vaddr;
-		md_entry.phys_addr = virt_to_phys((void *)vaddr);
+		md_entry.phys_addr = phys;
 		md_entry.size = size;
 
 		ret = msm_minidump_add_region(&md_entry);
@@ -886,7 +908,7 @@ void *ipc_log_context_create(int max_num_pages,
 
 	ctxt->log_id = (uint64_t)(uintptr_t)ctxt;
 	ctxt->version = IPC_LOG_VERSION;
-	strlcpy(ctxt->name, mod_name, IPC_LOG_MAX_CONTEXT_NAME_LEN);
+	strscpy(ctxt->name, mod_name, IPC_LOG_MAX_CONTEXT_NAME_LEN);
 	ctxt->user_version = feature_version & 0xffff;
 	ctxt->first_page = get_first_page(ctxt);
 	ctxt->last_page = pg;
@@ -898,7 +920,7 @@ void *ipc_log_context_create(int max_num_pages,
 	kref_init(&ctxt->refcount);
 	ctxt->destroyed = false;
 	create_ctx_debugfs(ctxt, mod_name);
-
+	ipc_log_cdev_create(ctxt, mod_name);
 	/* set magic last to signal context init is complete */
 	ctxt->magic = IPC_LOG_CONTEXT_MAGIC_NUM;
 	ctxt->nmagic = ~(IPC_LOG_CONTEXT_MAGIC_NUM);
@@ -953,7 +975,7 @@ int ipc_log_context_destroy(void *ctxt)
 		return 0;
 
 	debugfs_remove_recursive(ilctxt->dent);
-
+	ipc_log_cdev_remove(ilctxt);
 	spin_lock(&ilctxt->context_lock_lhb1);
 	ilctxt->destroyed = true;
 	complete_all(&ilctxt->read_avail);
@@ -976,7 +998,7 @@ EXPORT_SYMBOL(ipc_log_context_destroy);
 static int __init ipc_logging_init(void)
 {
 	check_and_create_debugfs();
-
+	ipc_log_cdev_init();
 	register_minidump((u64)&ipc_log_context_list, sizeof(struct list_head),
 			  "ipc_log_ctxt_list", minidump_buf_cnt);
 
@@ -986,4 +1008,4 @@ static int __init ipc_logging_init(void)
 module_init(ipc_logging_init);
 
 MODULE_DESCRIPTION("ipc logging");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

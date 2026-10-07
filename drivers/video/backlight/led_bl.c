@@ -200,8 +200,8 @@ static int led_bl_probe(struct platform_device *pdev)
 	props.type = BACKLIGHT_RAW;
 	props.max_brightness = priv->max_brightness;
 	props.brightness = priv->default_brightness;
-	props.power = (priv->default_brightness > 0) ? FB_BLANK_POWERDOWN :
-		      FB_BLANK_UNBLANK;
+	props.power = (priv->default_brightness > 0) ? BACKLIGHT_POWER_OFF :
+		      BACKLIGHT_POWER_ON;
 	priv->bl_dev = backlight_device_register(dev_name(&pdev->dev),
 			&pdev->dev, priv, &led_bl_ops, &props);
 	if (IS_ERR(priv->bl_dev)) {
@@ -233,7 +233,7 @@ static int led_bl_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int led_bl_remove(struct platform_device *pdev)
+static void led_bl_remove(struct platform_device *pdev)
 {
 	struct led_bl_data *priv = platform_get_drvdata(pdev);
 	struct backlight_device *bl = priv->bl_dev;
@@ -247,8 +247,6 @@ static int led_bl_remove(struct platform_device *pdev)
 		led_sysfs_enable(priv->leds[i]);
 		mutex_unlock(&priv->leds[i]->led_access);
 	}
-
-	return 0;
 }
 
 static const struct of_device_id led_bl_of_match[] = {
@@ -261,10 +259,10 @@ MODULE_DEVICE_TABLE(of, led_bl_of_match);
 static struct platform_driver led_bl_driver = {
 	.driver		= {
 		.name		= "led-backlight",
-		.of_match_table	= of_match_ptr(led_bl_of_match),
+		.of_match_table	= led_bl_of_match,
 	},
 	.probe		= led_bl_probe,
-	.remove		= led_bl_remove,
+	.remove_new	= led_bl_remove,
 };
 
 module_platform_driver(led_bl_driver);

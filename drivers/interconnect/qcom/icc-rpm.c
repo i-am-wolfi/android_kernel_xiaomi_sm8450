@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
- *
+ * Copyright (C) 2020 Linaro Ltd
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <asm/div64.h>
 #include <linux/clk.h>
-#include <linux/interconnect.h>
 #include <linux/interconnect-provider.h>
 #include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
-#include <linux/soc/qcom/smd-rpm.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
 
 #include "icc-rpm.h"
+#include "qnoc-qos-rpm.h"
 
 static int qcom_icc_rpm_smd_send_msg(int ctx, int rsc_type, int rpm_id, u64 val)
 {
@@ -29,6 +26,22 @@ static int qcom_icc_rpm_smd_send_msg(int ctx, int rsc_type, int rpm_id, u64 val)
 
 	return ret;
 }
+
+/**
+ * qcom_icc_get_bw_stub - initializes the bw values to zero
+ * @node: icc node to operate on
+ * @avg: initial bw to sum aggregate
+ * @peak: initial bw to max aggregate
+ * Return: 0 on success
+ */
+int qcom_icc_get_bw_stub(struct icc_node *node, u32 *avg, u32 *peak)
+{
+	*avg = 0;
+	*peak = 0;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_icc_get_bw_stub);
 
 /**
  * qcom_icc_rpm_pre_aggregate - cleans up stale values from prior icc_set
@@ -56,6 +69,7 @@ EXPORT_SYMBOL_GPL(qcom_icc_rpm_pre_aggregate);
  * @peak_bw: new bw to max aggregate
  * @agg_avg: existing aggregate avg bw val
  * @agg_peak: existing aggregate peak bw val
+ * Return: 0 on success
  */
 int qcom_icc_rpm_aggregate(struct icc_node *node, u32 tag, u32 avg_bw,
 		       u32 peak_bw, u32 *agg_avg, u32 *agg_peak)
@@ -76,6 +90,9 @@ int qcom_icc_rpm_aggregate(struct icc_node *node, u32 tag, u32 avg_bw,
 			qn->max_peak[i] = max_t(u32, qn->max_peak[i], peak_bw);
 		}
 	}
+
+	*agg_avg += avg_bw;
+	*agg_peak = max_t(u32, *agg_peak, peak_bw);
 
 	qn->dirty = true;
 
@@ -129,6 +146,9 @@ int qcom_icc_rpm_set(struct icc_node *src, struct icc_node *dst)
 			do_div(clk_rate, qn->buswidth);
 
 			bus_clk_rate[i] = max(bus_clk_rate[i], clk_rate);
+
+			if (bus_clk_rate[i] > RPM_CLK_MAX_LEVEL)
+				bus_clk_rate[i] = RPM_CLK_MAX_LEVEL;
 		}
 	}
 
@@ -198,7 +218,7 @@ int qcom_icc_rpm_set(struct icc_node *src, struct icc_node *dst)
 						sum_avg);
 
 					if (ret) {
-						pr_err("qcom_icc_rpm_smd_send_msg slv %s error %d\n",
+						pr_err("qcom_icc_rpm_smd_send_msg slv %d error %d\n",
 							qn->slv_rpm_id, ret);
 						return ret;
 					}
@@ -213,4 +233,4 @@ int qcom_icc_rpm_set(struct icc_node *src, struct icc_node *dst)
 }
 EXPORT_SYMBOL_GPL(qcom_icc_rpm_set);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

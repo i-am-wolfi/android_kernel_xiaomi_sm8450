@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/device.h>
@@ -10,7 +10,6 @@
 
 int qti_typec_partner_register(struct typec_role_class *chip, int mode)
 {
-
 	if (!chip || !chip->typec_port)
 		return -ENODEV;
 
@@ -47,7 +46,7 @@ struct typec_role_class *qti_typec_class_init(struct device *dev)
 {
 	struct typec_role_class *chip;
 
-	chip = kzalloc(sizeof(*chip), GFP_KERNEL);
+	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
 		return ERR_PTR(-ENOMEM);
 

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2017 Linaro Ltd.
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
  */
-
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/device.h>
@@ -15,7 +13,13 @@
 #include <net/sock.h>
 #include <linux/workqueue.h>
 #include <linux/rcupdate.h>
+#include <trace/events/sock.h>
 #include <linux/soc/qcom/qmi.h>
+#include <linux/ipc_logging.h>
+
+#define QMI_LOG_PAGE_CNT 8
+static void *qmi_ilc;
+#define QMI_INFO(x, ...) ipc_log_string(qmi_ilc, x, ##__VA_ARGS__)
 
 static struct socket *qmi_sock_create(struct qmi_handle *qmi,
 				      struct sockaddr_qrtr *sq);
@@ -99,7 +103,7 @@ static void qmi_recv_del_server(struct qmi_handle *qmi,
  * @node:	id of the dying node
  *
  * Signals the client that all previously registered services on this node are
- * now gone and then calls the bye callback to allow the client client further
+ * now gone and then calls the bye callback to allow the client further
  * cleaning up resources associated with this remote.
  */
 static void qmi_recv_bye(struct qmi_handle *qmi,
@@ -219,13 +223,15 @@ int qmi_add_lookup(struct qmi_handle *qmi, unsigned int service,
 	svc->version = version;
 	svc->instance = instance;
 
+	qmi->svc_id = service;
+
 	list_add(&svc->list_node, &qmi->lookups);
 
 	qmi_send_new_lookup(qmi, svc);
 
 	return 0;
 }
-EXPORT_SYMBOL(qmi_add_lookup);
+EXPORT_SYMBOL_GPL(qmi_add_lookup);
 
 static void qmi_send_new_server(struct qmi_handle *qmi, struct qmi_service *svc)
 {
@@ -282,6 +288,7 @@ int qmi_add_server(struct qmi_handle *qmi, unsigned int service,
 	svc->service = service;
 	svc->version = version;
 	svc->instance = instance;
+	qmi->svc_id = service;
 
 	list_add(&svc->list_node, &qmi->services);
 
@@ -289,7 +296,7 @@ int qmi_add_server(struct qmi_handle *qmi, unsigned int service,
 
 	return 0;
 }
-EXPORT_SYMBOL(qmi_add_server);
+EXPORT_SYMBOL_GPL(qmi_add_server);
 
 /**
  * qmi_txn_init() - allocate transaction id within the given QMI handle
@@ -308,7 +315,7 @@ EXPORT_SYMBOL(qmi_add_server);
  * Return: Transaction id on success, negative errno on failure.
  */
 int qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn,
-		 struct qmi_elem_info *ei, void *c_struct)
+		 const struct qmi_elem_info *ei, void *c_struct)
 {
 	int ret;
 
@@ -329,7 +336,7 @@ int qmi_txn_init(struct qmi_handle *qmi, struct qmi_txn *txn,
 
 	return ret;
 }
-EXPORT_SYMBOL(qmi_txn_init);
+EXPORT_SYMBOL_GPL(qmi_txn_init);
 
 /**
  * qmi_txn_wait() - wait for a response on a transaction
@@ -349,9 +356,8 @@ int qmi_txn_wait(struct qmi_txn *txn, unsigned long timeout)
 
 	ret = wait_for_completion_timeout(&txn->completion, timeout);
 
-	if (txn->result == -ENETRESET) {
+	if (txn->result == -ENETRESET)
 		return txn->result;
-	}
 
 	mutex_lock(&qmi->txn_lock);
 	idr_remove(&qmi->txns, txn->id);
@@ -362,7 +368,7 @@ int qmi_txn_wait(struct qmi_txn *txn, unsigned long timeout)
 	else
 		return txn->result;
 }
-EXPORT_SYMBOL(qmi_txn_wait);
+EXPORT_SYMBOL_GPL(qmi_txn_wait);
 
 /**
  * qmi_txn_cancel() - cancel an ongoing transaction
@@ -376,7 +382,7 @@ void qmi_txn_cancel(struct qmi_txn *txn)
 	idr_remove(&qmi->txns, txn->id);
 	mutex_unlock(&qmi->txn_lock);
 }
-EXPORT_SYMBOL(qmi_txn_cancel);
+EXPORT_SYMBOL_GPL(qmi_txn_cancel);
 
 /**
  * qmi_invoke_handler() - find and invoke a handler for a message
@@ -405,12 +411,15 @@ static void qmi_invoke_handler(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 			break;
 	}
 
-	if (!handler->fn || !handler->decoded_size)
+	if (!handler->fn)
 		return;
 
 	dest = kzalloc(handler->decoded_size, GFP_KERNEL);
-	if (!dest)
+	if (!dest) {
+		QMI_INFO("failed to allocate memory of decoded_size: 0x%zx svc_id:0x%x\n",
+			 handler->decoded_size, qmi->svc_id);
 		return;
+	}
 
 	ret = qmi_decode_message(buf, len, handler->ei, dest);
 	if (ret < 0)
@@ -443,11 +452,15 @@ static void qmi_handle_net_reset(struct qmi_handle *qmi)
 	struct sockaddr_qrtr sq;
 	struct qmi_service *svc;
 	struct socket *sock;
-	long timeo = qmi->sock->sk->sk_sndtimeo;
 
 	sock = qmi_sock_create(qmi, &sq);
 	if (IS_ERR(sock))
 		return;
+
+	mutex_lock(&qmi->sock_lock);
+	sock_release(qmi->sock);
+	qmi->sock = NULL;
+	mutex_unlock(&qmi->sock_lock);
 
 	qmi_recv_del_server(qmi, -1, -1);
 
@@ -455,16 +468,8 @@ static void qmi_handle_net_reset(struct qmi_handle *qmi)
 		qmi->ops.net_reset(qmi);
 
 	mutex_lock(&qmi->sock_lock);
-	/* Already qmi_handle_release() started */
-	if (!qmi->sock) {
-		sock_release(sock);
-		mutex_unlock(&qmi->sock_lock);
-		return;
-	}
-	sock_release(qmi->sock);
 	qmi->sock = sock;
 	qmi->sq = sq;
-	qmi->sock->sk->sk_sndtimeo = timeo;
 	mutex_unlock(&qmi->sock_lock);
 
 	list_for_each_entry(svc, &qmi->lookups, list_node)
@@ -483,9 +488,6 @@ static void qmi_handle_message(struct qmi_handle *qmi,
 	struct qmi_txn *txn = NULL;
 	int ret;
 
-	if (!len)
-		return;
-
 	if (len < sizeof(*hdr)) {
 		pr_err("ignoring short QMI packet\n");
 		return;
@@ -500,6 +502,8 @@ static void qmi_handle_message(struct qmi_handle *qmi,
 
 		/* Ignore unexpected responses */
 		if (!txn) {
+			QMI_INFO("txn_id 0x%x svc_id:0x%x not found for remote[0x%x:0x%x]\n",
+				 hdr->txn_id, qmi->svc_id, sq->sq_node, sq->sq_port);
 			mutex_unlock(&qmi->txn_lock);
 			return;
 		}
@@ -521,6 +525,33 @@ static void qmi_handle_message(struct qmi_handle *qmi,
 
 		qmi_invoke_handler(qmi, sq, &tmp_txn, buf, len);
 	}
+}
+
+static void qmi_log_msg(const void *buf,
+			struct sockaddr_qrtr *sq, unsigned int svc_id)
+{
+	const struct qrtr_ctrl_pkt *pkt = (struct qrtr_ctrl_pkt *)buf;
+	const struct qmi_header *hdr = (struct qmi_header *)buf;
+	unsigned int cmd;
+
+	cmd = le32_to_cpu(pkt->cmd);
+
+	if (cmd == QRTR_TYPE_BYE)
+		QMI_INFO("cmd:0x%x node[0x%x]\n", cmd, sq->sq_node);
+	else if (cmd == QRTR_TYPE_DEL_CLIENT || cmd == QRTR_TYPE_RESUME_TX)
+		QMI_INFO("cmd:0x%x addr[0x%x:0x%x]\n", cmd,
+			  le32_to_cpu(pkt->client.node),
+			  le32_to_cpu(pkt->client.port));
+	else if (cmd == QRTR_TYPE_NEW_SERVER || cmd == QRTR_TYPE_DEL_SERVER)
+		QMI_INFO("cmd:0x%x SVC[0x%x:0x%x] addr[0x%x:0x%x]\n", cmd,
+			  le32_to_cpu(pkt->server.service),
+			  le32_to_cpu(pkt->server.instance),
+			  le32_to_cpu(pkt->server.node),
+			  le32_to_cpu(pkt->server.port));
+	else
+		QMI_INFO("DATA: type:%d txn_id:%d svc:0x%x, msg_id:%d len:%d sq[0x%x:0x%x]\n",
+			 hdr->type, hdr->txn_id, svc_id,
+			 hdr->msg_id, hdr->msg_len, sq->sq_node, sq->sq_port);
 }
 
 static void qmi_data_ready_work(struct work_struct *work)
@@ -548,7 +579,8 @@ static void qmi_data_ready_work(struct work_struct *work)
 
 		if (msglen == -ENETRESET) {
 			qmi_handle_net_reset(qmi);
-
+			QMI_INFO("Invoke ENETRESET on a QMI handle for svc_id:0x%x [0x%x:0x%x]\n",
+				 qmi->svc_id, sq.sq_node, sq.sq_port);
 			/* The old qmi->sock is gone, our work is done */
 			break;
 		}
@@ -557,6 +589,8 @@ static void qmi_data_ready_work(struct work_struct *work)
 			pr_err("qmi recvmsg failed: %zd\n", msglen);
 			break;
 		}
+
+		qmi_log_msg(qmi->recv_buf, &sq, qmi->svc_id);
 
 		if (sq.sq_node == qmi->sq.sq_node &&
 		    sq.sq_port == QRTR_PORT_CTRL) {
@@ -573,14 +607,20 @@ static void qmi_data_ready(struct sock *sk)
 {
 	struct qmi_handle *qmi = NULL;
 
+	trace_sk_data_ready(sk);
+
 	/*
 	 * This will be NULL if we receive data while being in
 	 * qmi_handle_release()
 	 */
+
 	rcu_read_lock();
 	qmi = rcu_dereference_sk_user_data(sk);
-	if (qmi)
+	if (qmi) {
+		QMI_INFO("qmi recv pkt queued for svc_id:0x%x sock[0x%x:0x%x]\n",
+			 qmi->svc_id, qmi->sq.sq_node, qmi->sq.sq_port);
 		queue_work(qmi->wq, &qmi->work);
+	}
 	rcu_read_unlock();
 }
 
@@ -608,21 +648,6 @@ static struct socket *qmi_sock_create(struct qmi_handle *qmi,
 
 	return sock;
 }
-
-/**
- * qmi_set_sndtimeo() - set the sk_sndtimeo of the qmi handle
- * @qmi:	QMI client handle
- * @timeo:	timeout in jiffies.
- *
- * This sets the timeout for the blocking socket send in qmi send.
- */
-void qmi_set_sndtimeo(struct qmi_handle *qmi, long timeo)
-{
-	mutex_lock(&qmi->sock_lock);
-	qmi->sock->sk->sk_sndtimeo = timeo;
-	mutex_unlock(&qmi->sock_lock);
-}
-EXPORT_SYMBOL(qmi_set_sndtimeo);
 
 /**
  * qmi_handle_init() - initialize a QMI client handle
@@ -668,7 +693,7 @@ int qmi_handle_init(struct qmi_handle *qmi, size_t recv_buf_size,
 	if (!qmi->recv_buf)
 		return -ENOMEM;
 
-	qmi->wq = alloc_workqueue("qmi_msg_handler", WQ_UNBOUND|WQ_HIGHPRI, 1);
+	qmi->wq = alloc_ordered_workqueue("qmi_msg_handler", 0);
 	if (!qmi->wq) {
 		ret = -ENOMEM;
 		goto err_free_recv_buf;
@@ -685,6 +710,9 @@ int qmi_handle_init(struct qmi_handle *qmi, size_t recv_buf_size,
 		goto err_destroy_wq;
 	}
 
+	if (!qmi_ilc)
+		qmi_ilc = ipc_log_context_create(QMI_LOG_PAGE_CNT, "qmi_interface", 0);
+
 	return 0;
 
 err_destroy_wq:
@@ -694,7 +722,7 @@ err_free_recv_buf:
 
 	return ret;
 }
-EXPORT_SYMBOL(qmi_handle_init);
+EXPORT_SYMBOL_GPL(qmi_handle_init);
 
 /**
  * qmi_handle_release() - release the QMI client handle
@@ -709,6 +737,8 @@ void qmi_handle_release(struct qmi_handle *qmi)
 	struct qmi_txn *txn;
 	int txn_id;
 
+	QMI_INFO("%s : SVC ID: 0x%x sock[0x%x:0x%x]\n", __func__,
+			qmi->svc_id, qmi->sq.sq_node, qmi->sq.sq_port);
 	mutex_lock(&qmi->sock_lock);
 	sock = qmi->sock;
 	rcu_assign_sk_user_data(sock->sk, NULL);
@@ -746,7 +776,7 @@ void qmi_handle_release(struct qmi_handle *qmi)
 		kfree(svc);
 	}
 }
-EXPORT_SYMBOL(qmi_handle_release);
+EXPORT_SYMBOL_GPL(qmi_handle_release);
 
 /**
  * qmi_send_message() - send a QMI message
@@ -768,7 +798,8 @@ EXPORT_SYMBOL(qmi_handle_release);
 static ssize_t qmi_send_message(struct qmi_handle *qmi,
 				struct sockaddr_qrtr *sq, struct qmi_txn *txn,
 				int type, int msg_id, size_t len,
-				struct qmi_elem_info *ei, const void *c_struct)
+				const struct qmi_elem_info *ei,
+				const void *c_struct)
 {
 	struct msghdr msghdr = {};
 	struct kvec iv;
@@ -819,12 +850,12 @@ static ssize_t qmi_send_message(struct qmi_handle *qmi,
  */
 ssize_t qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 			 struct qmi_txn *txn, int msg_id, size_t len,
-			 struct qmi_elem_info *ei, const void *c_struct)
+			 const struct qmi_elem_info *ei, const void *c_struct)
 {
 	return qmi_send_message(qmi, sq, txn, QMI_REQUEST, msg_id, len, ei,
 				c_struct);
 }
-EXPORT_SYMBOL(qmi_send_request);
+EXPORT_SYMBOL_GPL(qmi_send_request);
 
 /**
  * qmi_send_response() - send a response QMI message
@@ -840,12 +871,12 @@ EXPORT_SYMBOL(qmi_send_request);
  */
 ssize_t qmi_send_response(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 			  struct qmi_txn *txn, int msg_id, size_t len,
-			  struct qmi_elem_info *ei, const void *c_struct)
+			  const struct qmi_elem_info *ei, const void *c_struct)
 {
 	return qmi_send_message(qmi, sq, txn, QMI_RESPONSE, msg_id, len, ei,
 				c_struct);
 }
-EXPORT_SYMBOL(qmi_send_response);
+EXPORT_SYMBOL_GPL(qmi_send_response);
 
 /**
  * qmi_send_indication() - send an indication QMI message
@@ -859,7 +890,8 @@ EXPORT_SYMBOL(qmi_send_response);
  * Return: 0 on success, negative errno on failure.
  */
 ssize_t qmi_send_indication(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
-			    int msg_id, size_t len, struct qmi_elem_info *ei,
+			    int msg_id, size_t len,
+			    const struct qmi_elem_info *ei,
 			    const void *c_struct)
 {
 	struct qmi_txn txn;
@@ -878,6 +910,4 @@ ssize_t qmi_send_indication(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
 
 	return rval;
 }
-EXPORT_SYMBOL(qmi_send_indication);
-
-MODULE_SOFTDEP("pre: qrtr");
+EXPORT_SYMBOL_GPL(qmi_send_indication);

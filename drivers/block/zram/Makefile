@@ -1,4 +1,17 @@
-# SPDX-License-Identifier: GPL-2.0-only
-zram-y	:=	zcomp.o zram_drv.o
+# SPDX-License-Identifier: GPL-2.0
 
-obj-$(CONFIG_ZRAM)	+=	zram.o
+ccflags-y += -I$(src)
+
+obj-$(CONFIG_ZRAM) += zram.o
+zram-objs += zcomp.o zram_drv.o
+
+
+# --- marble: objs upstream restaurados ---
+zram-y	:=	zcomp.o zram_drv.o
+zram-$(CONFIG_ZRAM_BACKEND_LZO)		+= backend_lzorle.o backend_lzo.o
+zram-$(CONFIG_ZRAM_BACKEND_LZ4)		+= backend_lz4.o
+zram-$(CONFIG_ZRAM_BACKEND_LZ4HC)	+= backend_lz4hc.o
+zram-$(CONFIG_ZRAM_BACKEND_ZSTD)	+= backend_zstd.o
+zram-$(CONFIG_ZRAM_BACKEND_DEFLATE)	+= backend_deflate.o
+zram-$(CONFIG_ZRAM_BACKEND_842)		+= backend_842.o
+zram-$(CONFIG_ZRAM_ANDROID_IOCTL)	+= zram_ioctl.o

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/cpu.h>
@@ -17,10 +17,11 @@
 #include "qcom-simple-lpm.h"
 
 static bool cluster_gov_registered;
-bool simple_sleep_disabled = true;
-u64 cur_div = 100;
 static bool suspend_in_progress;
 static struct simple_cluster_governor *cluster_simple_gov_ops;
+
+bool simple_sleep_disabled = true;
+u64 cur_div = 100;
 
 DEFINE_PER_CPU(struct simple_lpm_cpu, simple_lpm_cpu_data);
 
@@ -75,8 +76,10 @@ static int lpm_online_cpu(unsigned int cpu)
 }
 
 /**
- * get_cpus_qos() - Returns the aggrigated PM QoS request.
+ * get_cpus_qos - Returns the aggregated PM QoS request
  * @mask: cpumask of the cpus
+ *
+ * Return: minimum required latency amongst active cpus in @mask
  */
 static inline s64 get_cpus_qos(const struct cpumask *mask)
 {
@@ -112,9 +115,9 @@ void unregister_cluster_simple_governor_ops(struct simple_cluster_governor *ops)
 }
 
 /**
- * lpm_select() - Find the best idle state for the cpu device
+ * lpm_select - Find the best idle state for the cpu device
+ * @drv:       cpuidle driver
  * @dev:       Target cpu
- * @state:     Entered state
  * @stop_tick: Is the tick device stopped
  *
  * Return: Best cpu LPM mode to enter
@@ -164,7 +167,7 @@ static int lpm_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 }
 
 /**
- * lpm_reflect() - Update the state entered by the cpu device
+ * lpm_reflect - Update the state entered by the cpu device
  * @dev:       Target CPU
  * @state:     Entered state
  */
@@ -174,7 +177,7 @@ static void lpm_reflect(struct cpuidle_device *dev, int state)
 }
 
 /**
- * lpm_enable_device() - Initialize the governor's data for the CPU
+ * lpm_enable_device - Initialize the governor's data for the CPU
  * @drv:      cpuidle driver
  * @dev:      Target CPU
  */
@@ -198,7 +201,7 @@ static int lpm_enable_device(struct cpuidle_driver *drv,
 }
 
 /**
- * lpm_disable_device() - Clean up the governor's data for the CPU
+ * lpm_disable_device - Clean up the governor's data for the CPU
  * @drv:      cpuidle driver
  * @dev:      Target CPU
  */
@@ -247,7 +250,7 @@ static void qcom_lpm_suspend_trace(void *unused, const char *action,
 
 static struct cpuidle_governor lpm_simple_governor = {
 	.name =		"qcom-simple-lpm",
-	.rating =	40,
+	.rating =	10,
 	.enable =	lpm_enable_device,
 	.disable =	lpm_disable_device,
 	.select =	lpm_select,
@@ -293,4 +296,4 @@ sysfs_fail:
 module_init(qcom_lpm_simple_governor_init);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. simple LPM governor");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

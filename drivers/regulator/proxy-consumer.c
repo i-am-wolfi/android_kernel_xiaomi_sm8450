@@ -2,7 +2,6 @@
 /*
  * Copyright (c) 2019, The Linux Foundation. All rights reserved.
  */
-
 #define pr_fmt(fmt) "%s: " fmt, __func__
 
 #include <linux/bitops.h>
@@ -396,4 +395,4 @@ late_initcall_sync(regulator_proxy_consumer_remove_all);
 #endif
 
 MODULE_DESCRIPTION("Regulator proxy consumer library");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

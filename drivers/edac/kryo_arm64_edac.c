@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/kernel.h>
@@ -11,15 +12,15 @@
 #include <linux/cpu.h>
 #include <linux/cpu_pm.h>
 #include <linux/interrupt.h>
-#include <linux/notifier.h>
+#include <linux/panic_notifier.h>
 #include <linux/of_irq.h>
 
 #include <asm/cputype.h>
 
-#include "edac_mc.h"
-#include "edac_device.h"
+#include "drivers/edac/edac_mc.h"
+#include "drivers/edac/edac_device.h"
 
-#ifdef CONFIG_EDAC_KRYO_ARM64_PANIC_ON_UE
+#if IS_ENABLED(CONFIG_EDAC_KRYO_ARM64_PANIC_ON_UE)
 #define ARM64_ERP_PANIC_ON_UE 1
 #else
 #define ARM64_ERP_PANIC_ON_UE 0
@@ -31,12 +32,12 @@
 
 #define QCOM_CPU_PART_KRYO4XX_GOLD 0x804
 #define QCOM_CPU_PART_KRYO5XX_GOLD 0xD0D
+#define QCOM_CPU_PART_A78_GOLD 0xD4B
 #define QCOM_CPU_PART_KRYO4XX_SILVER_V1 0x803
 #define QCOM_CPU_PART_KRYO4XX_SILVER_V2 0x805
 
 #define QCOM_CPU_PART_KRYO6XX_SILVER_V1 0xD05
 #define QCOM_CPU_PART_KRYO6XX_GOLDPLUS 0xD44
-#define QCOM_CPU_PART_KRYO6XX_GOLDPRIME 0xD4B
 
 #define L1_GOLD_IC_BIT 0x1
 #define L1_GOLD_DC_BIT 0x4
@@ -51,6 +52,7 @@
 
 #define KRYO_ERRXSTATUS_VALID(a)	((a >> 30) & 0x1)
 #define KRYO_ERRXSTATUS_UE(a)	((a >> 29) & 0x1)
+#define KRYO_ERRXSTATUS_DE(a)	((a >> 23) & 0x1)
 #define KRYO_ERRXSTATUS_SERR(a)	(a & 0xFF)
 
 #define KRYO_ERRXMISC_LVL(a)		((a >> 1) & 0x7)
@@ -101,8 +103,44 @@ static void kryo_edac_handle_ce(struct edac_device_ctl_info *edac_dev,
 				int inst_nr, int block_nr, const char *msg)
 {
 	edac_device_handle_ce(edac_dev, inst_nr, block_nr, msg);
-#ifdef CONFIG_EDAC_KRYO_ARM64_PANIC_ON_CE
+#if IS_ENABLED(CONFIG_EDAC_KRYO_ARM64_PANIC_ON_CE)
 	panic("EDAC %s CE: %s\n", edac_dev->ctl_name, msg);
+#endif
+}
+
+static void kryo_edac_handle_de(struct edac_device_ctl_info *edac_dev,
+				int inst_nr, int block_nr, const char *msg)
+{
+	struct edac_device_instance *instance;
+	struct edac_device_block *block = NULL;
+
+	if ((inst_nr >= edac_dev->nr_instances) || (inst_nr < 0)) {
+		edac_device_printk(
+			edac_dev, KERN_ERR,
+			"INTERNAL ERROR: 'instance' out of range (%d >= %d)\n",
+			inst_nr, edac_dev->nr_instances);
+		return;
+	}
+
+	instance = edac_dev->instances + inst_nr;
+
+	if ((block_nr >= instance->nr_blocks) || (block_nr < 0)) {
+		edac_device_printk(
+			edac_dev, KERN_ERR,
+			"INTERNAL ERROR: instance %d 'block' out of range (%d >= %d)\n",
+			inst_nr, block_nr, instance->nr_blocks);
+		return;
+	}
+
+	if (instance->nr_blocks > 0)
+		block = instance->blocks + block_nr;
+
+	edac_device_printk(edac_dev, KERN_WARNING,
+			   "DE: %s instance: %s block: %s '%s'\n",
+			   edac_dev->ctl_name, instance->name,
+			   block ? block->name : "N/A", msg);
+#if IS_ENABLED(CONFIG_EDAC_KRYO_ARM64_PANIC_ON_DE)
+	panic("EDAC %s DE: %s\n", edac_dev->ctl_name, msg);
 #endif
 }
 
@@ -112,21 +150,32 @@ struct errors_edac {
 			int inst_nr, int block_nr, const char *msg);
 };
 
-static const struct errors_edac errors[] = {
-	{"Kryo L1 Correctable Error", kryo_edac_handle_ce },
-	{"Kryo L1 Uncorrectable Error", edac_device_handle_ue },
-	{"Kryo L2 Correctable Error", kryo_edac_handle_ce },
-	{"Kryo L2 Uncorrectable Error", edac_device_handle_ue },
-	{"L3 Correctable Error", kryo_edac_handle_ce },
-	{"L3 Uncorrectable Error", edac_device_handle_ue },
+enum kryo_lx_sb_db_error {
+	/* L1 errors */
+	KRYO_L1_CE,
+	KRYO_L1_UE,
+	KRYO_L1_DE,
+	/* L2 errors */
+	KRYO_L2_CE,
+	KRYO_L2_UE,
+	KRYO_L2_DE,
+	/* L3 errors */
+	KRYO_L3_CE,
+	KRYO_L3_UE,
+	KRYO_L3_DE,
 };
 
-#define KRYO_L1_CE 0
-#define KRYO_L1_UE 1
-#define KRYO_L2_CE 2
-#define KRYO_L2_UE 3
-#define KRYO_L3_CE 4
-#define KRYO_L3_UE 5
+static const struct errors_edac errors[] = {
+	[KRYO_L1_CE] = {"Kryo L1 Correctable Error", kryo_edac_handle_ce },
+	[KRYO_L1_UE] = {"Kryo L1 Uncorrectable Error", edac_device_handle_ue },
+	[KRYO_L1_DE] = {"Kryo L1 Deferred Error", kryo_edac_handle_de },
+	[KRYO_L2_CE] = {"Kryo L2 Correctable Error", kryo_edac_handle_ce },
+	[KRYO_L2_UE] = {"Kryo L2 Uncorrectable Error", edac_device_handle_ue },
+	[KRYO_L2_DE] = {"Kryo L2 Deferred Error", kryo_edac_handle_de },
+	[KRYO_L3_CE] = {"L3 Correctable Error", kryo_edac_handle_ce },
+	[KRYO_L3_UE] = {"L3 Uncorrectable Error", edac_device_handle_ue },
+	[KRYO_L3_DE] = {"L3 Deferred Error", kryo_edac_handle_de },
+};
 
 #define DATA_BUF_ERR		0x2
 #define CACHE_DATA_ERR		0x6
@@ -151,7 +200,7 @@ static void l1_l2_irq_enable(void *info)
 {
 	int irq = *(int *)info;
 
-	enable_percpu_irq(irq, IRQ_TYPE_LEVEL_HIGH);
+	enable_percpu_irq(irq, irq_get_trigger_type(irq));
 }
 
 static void l1_l2_irq_disable(void *info)
@@ -166,20 +215,19 @@ static int request_erp_irq(struct platform_device *pdev, const char *propname,
 			void *ed, int percpu)
 {
 	int rc;
-	struct resource *r;
 	struct erp_drvdata *drv = ed;
 	struct erp_drvdata *temp = NULL;
+	int irq;
 
-	r = platform_get_resource_byname(pdev, IORESOURCE_IRQ, propname);
-
-	if (!r) {
+	irq = platform_get_irq_byname(pdev, propname);
+	if (irq < 0) {
 		pr_err("ARM64 CPU ERP: Could not find <%s> IRQ property. Proceeding anyway.\n",
 			propname);
 		goto out;
 	}
 
 	if (!percpu) {
-		rc = devm_request_threaded_irq(&pdev->dev, r->start, NULL,
+		rc = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 					       handler,
 					       IRQF_ONESHOT | IRQF_TRIGGER_HIGH,
 					       desc,
@@ -187,7 +235,7 @@ static int request_erp_irq(struct platform_device *pdev, const char *propname,
 
 		if (rc) {
 			pr_err("ARM64 CPU ERP: Failed to request IRQ %d: %d (%s / %s). Proceeding anyway.\n",
-			       (int) r->start, rc, propname, desc);
+				irq, rc, propname, desc);
 			goto out;
 		}
 
@@ -201,17 +249,17 @@ static int request_erp_irq(struct platform_device *pdev, const char *propname,
 		temp = raw_cpu_ptr(drv->erp_cpu_drvdata);
 		temp->erp_cpu_drvdata = drv;
 
-		rc = request_percpu_irq(r->start, handler, desc,
+		rc = request_percpu_irq(irq, handler, desc,
 				drv->erp_cpu_drvdata);
 
 		if (rc) {
 			pr_err("ARM64 CPU ERP: Failed to request IRQ %d: %d (%s / %s). Proceeding anyway.\n",
-			       (int) r->start, rc, propname, desc);
+			       irq, rc, propname, desc);
 			goto out_free;
 		}
 
-		drv->ppi = r->start;
-		on_each_cpu(l1_l2_irq_enable, &(r->start), 1);
+		drv->ppi = irq;
+		on_each_cpu(l1_l2_irq_enable, &irq, 1);
 	}
 
 	return 0;
@@ -254,6 +302,10 @@ static void dump_err_reg(int errorcode, int level, u64 errxstatus, u64 errxmisc,
 	case BUS_ERROR:
 		edac_printk(KERN_CRIT, EDAC_CPU, "Bus Error\n");
 		break;
+
+	default:
+		edac_printk(KERN_CRIT, EDAC_CPU, "Unknown Error\n");
+		break;
 	}
 
 	if (level == L3)
@@ -293,7 +345,7 @@ static void kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
 	case QCOM_CPU_PART_KRYO4XX_GOLD:
 	case QCOM_CPU_PART_KRYO5XX_GOLD:
 	case QCOM_CPU_PART_KRYO6XX_GOLDPLUS:
-	case QCOM_CPU_PART_KRYO6XX_GOLDPRIME:
+	case QCOM_CPU_PART_A78_GOLD:
 		switch (KRYO_ERRXMISC_LVL_GOLD(errxmisc)) {
 		case L1_GOLD_DC_BIT:
 		case L1_GOLD_IC_BIT:
@@ -321,6 +373,9 @@ static void kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
 		if (KRYO_ERRXSTATUS_UE(errxstatus))
 			dump_err_reg(KRYO_L1_UE, level, errxstatus, errxmisc,
 					edev_ctl);
+		else if (KRYO_ERRXSTATUS_DE(errxstatus))
+			dump_err_reg(KRYO_L1_DE, level, errxstatus, errxmisc,
+					edev_ctl);
 		else
 			dump_err_reg(KRYO_L1_CE, level, errxstatus, errxmisc,
 					edev_ctl);
@@ -328,6 +383,9 @@ static void kryo_parse_l1_l2_cache_error(u64 errxstatus, u64 errxmisc,
 	case L2:
 		if (KRYO_ERRXSTATUS_UE(errxstatus))
 			dump_err_reg(KRYO_L2_UE, level, errxstatus, errxmisc,
+					edev_ctl);
+		else if (KRYO_ERRXSTATUS_DE(errxstatus))
+			dump_err_reg(KRYO_L2_DE, level, errxstatus, errxmisc,
 					edev_ctl);
 		else
 			dump_err_reg(KRYO_L2_CE, level, errxstatus, errxmisc,
@@ -385,7 +443,8 @@ static void kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 	errxstatus = read_errxstatus_el1();
 	errxmisc = read_errxmisc_el1();
 
-	if (KRYO_ERRXSTATUS_VALID(errxstatus)) {
+	if (KRYO_ERRXSTATUS_VALID(errxstatus) &&
+		KRYO_ERRXMISC_LVL(errxmisc) == L3_BIT) {
 		if (l3_is_bus_error(errxstatus)) {
 			if (edev_ctl->panic_on_ue) {
 				spin_unlock_irqrestore(&local_handler_lock, flags);
@@ -397,6 +456,10 @@ static void kryo_check_l3_scu_error(struct edac_device_ctl_info *edev_ctl)
 			edac_printk(KERN_CRIT, EDAC_CPU, "Detected L3 uncorrectable error\n");
 			dump_err_reg(KRYO_L3_UE, L3, errxstatus, errxmisc,
 				edev_ctl);
+		} else if (KRYO_ERRXSTATUS_DE(errxstatus)) {
+			edac_printk(KERN_CRIT, EDAC_CPU, "Detected L3 Deferred error\n");
+			dump_err_reg(KRYO_L3_DE, L3, errxstatus, errxmisc,
+					edev_ctl);
 		} else {
 			edac_printk(KERN_CRIT, EDAC_CPU, "Detected L3 correctable error\n");
 			dump_err_reg(KRYO_L3_CE, L3, errxstatus, errxmisc,
@@ -479,7 +542,7 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct erp_drvdata *drv;
 	int rc = 0;
-	int fail = 0;
+	int erp_pass = 0;
 	int num_irqs = 0;
 
 	init_regs_on_cpu(true);
@@ -490,7 +553,7 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	drv->edev_ctl = edac_device_alloc_ctl_info(0, "cpu",
-					num_possible_cpus(), "L", 3, 1, NULL, 0,
+					num_possible_cpus(), "L", 3, 1,
 					edac_device_alloc_index());
 
 	if (!drv->edev_ctl)
@@ -512,17 +575,6 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		goto out_mem;
 
 	panic_handler_drvdata = drv;
-
-	if (request_erp_irq(pdev, "l1-l2-faultirq",
-			"KRYO L1-L2 ECC FAULTIRQ",
-			kryo_l1_l2_handler, drv, 1))
-		fail++;
-
-	if (request_erp_irq(pdev, "l3-scu-faultirq",
-			"KRYO L3-SCU ECC FAULTIRQ",
-			kryo_l3_scu_handler, drv, 0))
-		fail++;
-
 	num_irqs = platform_irq_count(pdev);
 	if (num_irqs == 0) {
 		pr_err("KRYO ERP: No irqs found for error reporting\n");
@@ -535,7 +587,28 @@ static int kryo_cpu_erp_probe(struct platform_device *pdev)
 		goto out_dev;
 	}
 
-	if (fail == platform_irq_count(pdev)) {
+	if (!request_erp_irq(pdev, "l1-l2-faultirq",
+			"KRYO L1-L2 ECC FAULTIRQ",
+			kryo_l1_l2_handler, drv, 1))
+		erp_pass++;
+
+	if (!request_erp_irq(pdev, "l3-scu-faultirq",
+			"KRYO L3-SCU ECC FAULTIRQ",
+			kryo_l3_scu_handler, drv, 0))
+		erp_pass++;
+
+	if (!request_erp_irq(pdev, "l3-c0-scu-faultirq",
+			"KRYO L3-SCU ECC FAULTIRQ CLUSTER 0",
+			kryo_l3_scu_handler, drv, 0))
+		erp_pass++;
+
+	if (!request_erp_irq(pdev, "l3-c1-scu-faultirq",
+			"KRYO L3-SCU ECC FAULTIRQ CLUSTER 1",
+			kryo_l3_scu_handler, drv, 0))
+		erp_pass++;
+
+	/* Return if none of the IRQ is valid */
+	if (!erp_pass) {
 		pr_err("KRYO ERP: Could not request any IRQs. Giving up.\n");
 		rc = -ENODEV;
 		goto out_dev;
@@ -552,7 +625,7 @@ out_mem:
 	return rc;
 }
 
-static int kryo_cpu_erp_remove(struct platform_device *pdev)
+static void kryo_cpu_erp_remove(struct platform_device *pdev)
 {
 	struct erp_drvdata *drv = dev_get_drvdata(&pdev->dev);
 	struct edac_device_ctl_info *edac_ctl = drv->edev_ctl;
@@ -566,8 +639,6 @@ static int kryo_cpu_erp_remove(struct platform_device *pdev)
 	cpu_pm_unregister_notifier(&(drv->nb_pm));
 	edac_device_del_device(edac_ctl->dev);
 	edac_device_free_ctl_info(edac_ctl);
-
-	return 0;
 }
 
 static const struct of_device_id kryo_cpu_erp_match_table[] = {
@@ -586,5 +657,5 @@ static struct platform_driver kryo_cpu_erp_driver = {
 
 module_platform_driver(kryo_cpu_erp_driver);
 
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Kryo EDAC driver");

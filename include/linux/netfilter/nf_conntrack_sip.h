@@ -115,7 +115,7 @@ struct nf_nat_sip_hooks {
 			    unsigned int *datalen);
 
 	void (*seq_adjust)(struct sk_buff *skb,
-			   unsigned int protoff, s32 off);
+			   unsigned int protoff, s16 off);
 
 	unsigned int (*expect)(struct sk_buff *skb,
 			       unsigned int protoff,
@@ -164,7 +164,7 @@ struct nf_nat_sip_hooks {
 				  unsigned int medialen,
 				  union nf_inet_addr *rtp_addr);
 };
-extern const struct nf_nat_sip_hooks *nf_nat_sip_hooks;
+extern const struct nf_nat_sip_hooks __rcu *nf_nat_sip_hooks;
 
 int ct_sip_parse_request(const struct nf_conn *ct, const char *dptr,
 			 unsigned int datalen, unsigned int *matchoff,

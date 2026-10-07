@@ -47,10 +47,6 @@ struct dbc_info_context {
 #define DBC_DOOR_BELL_TARGET(p)		(((p) & 0xff) << 8)
 
 #define DBC_MAX_PACKET			1024
-#define DBC_MAX_STRING_LENGTH		64
-#define DBC_STRING_MANUFACTURER		"Linux Foundation"
-#define DBC_STRING_PRODUCT		"Linux USB Debug Target"
-#define DBC_STRING_SERIAL		"0001"
 #define	DBC_CONTEXT_SIZE		64
 
 /*
@@ -63,11 +59,31 @@ struct dbc_info_context {
 #define DBC_PORTSC_LINK_CHANGE		BIT(22)
 #define DBC_PORTSC_CONFIG_CHANGE	BIT(23)
 
+/*
+ * The maximum length of a string descriptor is 255, because the bLength
+ * field in the usb_string_descriptor struct is __u8.  In practice the
+ * maximum length is 254, because a string descriptor consists of a 2 byte
+ * header followed by UTF-16 characters (2 bytes each). This allows for
+ * only 126 characters (code points) in the string, which is where
+ * USB_MAX_STRING_LEN comes from.
+ */
+#define USB_MAX_STRING_DESC_LEN		254
+
 struct dbc_str_descs {
-	char	string0[DBC_MAX_STRING_LENGTH];
-	char	manufacturer[DBC_MAX_STRING_LENGTH];
-	char	product[DBC_MAX_STRING_LENGTH];
-	char	serial[DBC_MAX_STRING_LENGTH];
+	char	string0[USB_MAX_STRING_DESC_LEN];
+	char	manufacturer[USB_MAX_STRING_DESC_LEN];
+	char	product[USB_MAX_STRING_DESC_LEN];
+	char	serial[USB_MAX_STRING_DESC_LEN];
+};
+
+/*
+ * NULL terminated UTF-8 strings used to create UTF-16 strings
+ * (with maxiumum USB_MAX_STRING_LEN 2 byte characters).
+ */
+struct dbc_str {
+	char	manufacturer[USB_MAX_STRING_LEN+1];
+	char	product[USB_MAX_STRING_LEN+1];
+	char	serial[USB_MAX_STRING_LEN+1];
 };
 
 #define DBC_PROTOCOL			1	/* GNU Remote Debug Command */
@@ -81,6 +97,7 @@ enum dbc_state {
 	DS_ENABLED,
 	DS_CONNECTED,
 	DS_CONFIGURED,
+	DS_MAX
 };
 
 struct dbc_ep {
@@ -93,13 +110,16 @@ struct dbc_ep {
 
 #define DBC_QUEUE_SIZE			16
 #define DBC_WRITE_BUF_SIZE		8192
-
+#define DBC_POLL_INTERVAL_DEFAULT	64	/* milliseconds */
+#define DBC_POLL_INTERVAL_MAX		5000	/* milliseconds */
+#define DBC_XFER_INACTIVITY_TIMEOUT	10	/* milliseconds */
 /*
  * Private structure for DbC hardware state:
  */
 struct dbc_port {
 	struct tty_port			port;
 	spinlock_t			port_lock;	/* port access */
+	int				minor;
 
 	struct list_head		read_pool;
 	struct list_head		read_queue;
@@ -107,7 +127,7 @@ struct dbc_port {
 	struct tasklet_struct		push;
 
 	struct list_head		write_pool;
-	struct kfifo			write_fifo;
+	unsigned int			tx_boundary;
 
 	bool				registered;
 	bool				tx_running;
@@ -129,12 +149,19 @@ struct xhci_dbc {
 	struct xhci_erst		erst;
 	struct xhci_container_ctx	*ctx;
 
-	struct dbc_str_descs		*string;
-	dma_addr_t			string_dma;
-	size_t				string_size;
+	struct dbc_str_descs		*str_descs;
+	dma_addr_t			str_descs_dma;
+	size_t				str_descs_size;
+	struct dbc_str			str;
+	u16				idVendor;
+	u16				idProduct;
+	u16				bcdDevice;
+	u8				bInterfaceProtocol;
 
 	enum dbc_state			state;
 	struct delayed_work		event_work;
+	unsigned int			poll_interval;	/* ms */
+	unsigned long			xfer_timestamp;
 	unsigned			resume_required:1;
 	struct dbc_ep			eps[2];
 
@@ -180,6 +207,7 @@ struct dbc_request {
 enum evtreturn {
 	EVT_ERR	= -1,
 	EVT_DONE,
+	EVT_XFER_DONE,
 	EVT_GSER,
 	EVT_DISC,
 };
@@ -195,10 +223,17 @@ static inline struct dbc_ep *get_out_ep(struct xhci_dbc *dbc)
 }
 
 #ifdef CONFIG_USB_XHCI_DBGCAP
-int xhci_dbc_init(struct xhci_hcd *xhci);
-void xhci_dbc_exit(struct xhci_hcd *xhci);
-int xhci_dbc_tty_probe(struct xhci_hcd *xhci);
+int xhci_create_dbc_dev(struct xhci_hcd *xhci);
+void xhci_remove_dbc_dev(struct xhci_hcd *xhci);
+int xhci_dbc_init(void);
+void xhci_dbc_exit(void);
+int dbc_tty_init(void);
+void dbc_tty_exit(void);
+int xhci_dbc_tty_probe(struct device *dev, void __iomem *res, struct xhci_hcd *xhci);
 void xhci_dbc_tty_remove(struct xhci_dbc *dbc);
+struct xhci_dbc *xhci_alloc_dbc(struct device *dev, void __iomem *res,
+				 const struct dbc_driver *driver);
+void xhci_dbc_remove(struct xhci_dbc *dbc);
 struct dbc_request *dbc_alloc_request(struct xhci_dbc *dbc,
 				      unsigned int direction,
 				      gfp_t flags);
@@ -209,15 +244,21 @@ int xhci_dbc_suspend(struct xhci_hcd *xhci);
 int xhci_dbc_resume(struct xhci_hcd *xhci);
 #endif /* CONFIG_PM */
 #else
-static inline int xhci_dbc_init(struct xhci_hcd *xhci)
+static inline int xhci_create_dbc_dev(struct xhci_hcd *xhci)
 {
 	return 0;
 }
 
-static inline void xhci_dbc_exit(struct xhci_hcd *xhci)
+static inline void xhci_remove_dbc_dev(struct xhci_hcd *xhci)
 {
 }
-
+static inline int xhci_dbc_init(void)
+{
+	return 0;
+}
+static inline void xhci_dbc_exit(void)
+{
+}
 static inline int xhci_dbc_suspend(struct xhci_hcd *xhci)
 {
 	return 0;

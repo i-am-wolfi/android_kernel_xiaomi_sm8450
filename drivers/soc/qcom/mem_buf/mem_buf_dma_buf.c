@@ -1,16 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #define pr_fmt(fmt) "mem_buf_vmperm: " fmt
 
 #include <linux/highmem.h>
 #include <linux/mem-buf-exporter.h>
+#include <linux/gunyah/gh_mem_notifier.h>
+#include <linux/debugfs.h>
 #include "mem-buf-dev.h"
+#include "mem-buf-gh.h"
 #include "mem-buf-ids.h"
 
+/*
+ * @dtor - See mem_buf_dma_buf_set_destructor()
+ * @kref - A refcount for @sgt and @sgt's private data, which
+ *	is expected to contain a 'struct mem_buf_vmperm'
+ * @rcu - Usage based off of mm/shrinker.c
+ */
 struct mem_buf_vmperm {
+	struct list_head list;
 	u32 flags;
 	int current_vm_perms;
 	u32 mapcount;
@@ -20,11 +31,25 @@ struct mem_buf_vmperm {
 	unsigned int max_acl_entries;
 	struct dma_buf *dmabuf;
 	struct sg_table *sgt;
+	size_t size;
 	gh_memparcel_handle_t memparcel_hdl;
 	struct mutex lock;
 	mem_buf_dma_buf_destructor dtor;
 	void *dtor_data;
+	struct kref kref;
+	void (*sg_release)(void *buffer);
+	void (*kref_release)(struct kref *kref);
+	void *buffer;
+	struct rcu_head rcu;
 };
+
+/*
+ * Xarrays have an internal lock; load/store operations dont't need to
+ * hold vmperm_list_lock.
+ */
+static DEFINE_XARRAY(vmperm_xa);
+static LIST_HEAD(vmperm_list);
+static DEFINE_MUTEX(vmperm_list_lock);
 
 /*
  * Ensures the vmperm can hold at least nr_acl_entries.
@@ -100,16 +125,37 @@ static void mem_buf_vmperm_update_state(struct mem_buf_vmperm *vmperm, int *vmid
  */
 static void mem_buf_vmperm_set_err(struct mem_buf_vmperm *vmperm)
 {
-	get_dma_buf(vmperm->dmabuf);
+	kref_get(&vmperm->kref);
 	vmperm->flags |= MEM_BUF_WRAPPER_FLAG_ERR;
 }
 
+/*
+ * kref release callback for mem_buf_vmperm.
+ *
+ * When vmperm->kref reaches zero, this function calls the wrapper-specific
+ * sg_release() callback (e.g., qcom_sg_release()) to release the
+ * associated qcom_sg_buffer and trigger the final vmperm cleanup.
+ */
+
+static void vmperm_kref_release(struct kref *kref)
+{
+	struct mem_buf_vmperm *vmperm =
+		container_of(kref, struct mem_buf_vmperm, kref);
+
+	vmperm->sg_release(vmperm->buffer);
+}
+
+/* Must be freed via mem_buf_vmperm_free. */
 static struct mem_buf_vmperm *mem_buf_vmperm_alloc_flags(
 	struct sg_table *sgt, u32 flags,
-	int *vmids, int *perms, u32 nr_acl_entries)
+	int *vmids, int *perms, u32 nr_acl_entries,
+	void (*sg_release)(void  *),
+	void *buffer,
+	gh_memparcel_handle_t hdl)
 {
 	struct mem_buf_vmperm *vmperm;
-	int ret;
+	struct scatterlist *sg;
+	int ret, i;
 
 	vmperm = kzalloc(sizeof(*vmperm), GFP_KERNEL);
 	if (!vmperm)
@@ -118,55 +164,75 @@ static struct mem_buf_vmperm *mem_buf_vmperm_alloc_flags(
 	mutex_init(&vmperm->lock);
 	mutex_lock(&vmperm->lock);
 	ret = mem_buf_vmperm_resize(vmperm, nr_acl_entries);
-	if (ret)
+	if (ret) {
+		mutex_unlock(&vmperm->lock);
 		goto err_resize_state;
-
+	}
 	mem_buf_vmperm_update_state(vmperm, vmids, perms,
 					nr_acl_entries);
 	mutex_unlock(&vmperm->lock);
 	vmperm->sgt = sgt;
+	for_each_sgtable_sg(sgt, sg, i)
+		vmperm->size += sg->length;
+
+	kref_init(&vmperm->kref);
+
 	vmperm->flags = flags;
-	vmperm->memparcel_hdl = MEM_BUF_MEMPARCEL_INVALID;
+	vmperm->memparcel_hdl = hdl;
+	vmperm->sg_release = sg_release;
+	vmperm->kref_release = vmperm_kref_release;
+	vmperm->buffer = buffer;
+
+	/*
+	 * Hold an additional refcount, which represents the need to call
+	 * mem_buf_vmperm_try_reclaim() on this memparcel_hdl.
+	 * If it succeeds, the refcount is dropped.
+	 */
+	if (hdl != MEM_BUF_MEMPARCEL_INVALID) {
+		if (xa_insert(&vmperm_xa, hdl, vmperm, GFP_KERNEL))
+			goto err_xa;
+
+		kref_get(&vmperm->kref);
+	}
+
+	mutex_lock(&vmperm_list_lock);
+	list_add_rcu(&vmperm->list, &vmperm_list);
+	mutex_unlock(&vmperm_list_lock);
 
 	return vmperm;
 
+err_xa:
+	kfree(vmperm->perms);
+	kfree(vmperm->vmids);
 err_resize_state:
-	mutex_unlock(&vmperm->lock);
 	kfree(vmperm);
 	return ERR_PTR(-ENOMEM);
 }
 
-/* Must be freed via mem_buf_vmperm_release. */
 struct mem_buf_vmperm *mem_buf_vmperm_alloc_accept(struct sg_table *sgt,
-	gh_memparcel_handle_t memparcel_hdl)
+	gh_memparcel_handle_t memparcel_hdl, int *vmids, int *perms,
+	unsigned int nr_acl_entries, void (*sg_release)(void *),
+	void *buffer)
 {
-	int vmids[1];
-	int perms[1];
-	struct mem_buf_vmperm *vmperm;
-
-	vmids[0] = current_vmid;
-	perms[0] = PERM_READ | PERM_WRITE | PERM_EXEC;
-	vmperm = mem_buf_vmperm_alloc_flags(sgt,
-		MEM_BUF_WRAPPER_FLAG_ACCEPT,
-		vmids, perms, 1);
-	if (IS_ERR(vmperm))
-		return vmperm;
-
-	vmperm->memparcel_hdl = memparcel_hdl;
-	return vmperm;
+	return  mem_buf_vmperm_alloc_flags(sgt, MEM_BUF_WRAPPER_FLAG_ACCEPT,
+		vmids, perms, nr_acl_entries, sg_release, buffer, memparcel_hdl);
 }
-EXPORT_SYMBOL(mem_buf_vmperm_alloc_accept);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_alloc_accept);
 
 struct mem_buf_vmperm *mem_buf_vmperm_alloc_staticvm(struct sg_table *sgt,
-	int *vmids, int *perms, u32 nr_acl_entries)
+	int *vmids, int *perms, u32 nr_acl_entries, void (*sg_release)(void *),
+	void *buffer)
 {
 	return mem_buf_vmperm_alloc_flags(sgt,
 		MEM_BUF_WRAPPER_FLAG_STATIC_VM,
-		vmids, perms, nr_acl_entries);
+		vmids, perms, nr_acl_entries, sg_release, buffer,
+		MEM_BUF_MEMPARCEL_INVALID);
 }
-EXPORT_SYMBOL(mem_buf_vmperm_alloc_staticvm);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_alloc_staticvm);
 
-struct mem_buf_vmperm *mem_buf_vmperm_alloc(struct sg_table *sgt)
+struct mem_buf_vmperm *mem_buf_vmperm_alloc(struct sg_table *sgt,
+		void (*sg_release)(void *),
+		void *buffer)
 {
 	int vmids[1];
 	int perms[1];
@@ -174,9 +240,10 @@ struct mem_buf_vmperm *mem_buf_vmperm_alloc(struct sg_table *sgt)
 	vmids[0] = current_vmid;
 	perms[0] = PERM_READ | PERM_WRITE | PERM_EXEC;
 	return mem_buf_vmperm_alloc_flags(sgt, 0,
-		vmids, perms, 1);
+		vmids, perms, 1, sg_release, buffer,
+		MEM_BUF_MEMPARCEL_INVALID);
 }
-EXPORT_SYMBOL(mem_buf_vmperm_alloc);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_alloc);
 
 static int __mem_buf_vmperm_reclaim(struct mem_buf_vmperm *vmperm)
 {
@@ -187,61 +254,115 @@ static int __mem_buf_vmperm_reclaim(struct mem_buf_vmperm *vmperm)
 	ret = mem_buf_unassign_mem(vmperm->sgt, vmperm->vmids,
 				   vmperm->nr_acl_entries,
 				   vmperm->memparcel_hdl);
-	if (ret) {
-		pr_err_ratelimited("Reclaim failed\n");
-		mem_buf_vmperm_set_err(vmperm);
+	if (ret)
 		return ret;
-	}
 
 	mem_buf_vmperm_update_state(vmperm, new_vmids, new_perms, 1);
 	vmperm->flags &= ~MEM_BUF_WRAPPER_FLAG_LENDSHARE;
+	xa_erase(&vmperm_xa, vmperm->memparcel_hdl);
 	vmperm->memparcel_hdl = MEM_BUF_MEMPARCEL_INVALID;
+	kref_put(&vmperm->kref, vmperm->kref_release);
 	return 0;
 }
 
 static int mem_buf_vmperm_relinquish(struct mem_buf_vmperm *vmperm)
 {
 	int ret;
-	struct gh_sgl_desc *sgl_desc;
-
-	sgl_desc = mem_buf_sgt_to_gh_sgl_desc(vmperm->sgt);
-	if (IS_ERR(sgl_desc))
-		return PTR_ERR(sgl_desc);
-
-	ret = mem_buf_unmap_mem_s1(sgl_desc);
-	kvfree(sgl_desc);
+	/*
+	 * mem_buf_retrieve_release() uses memunmap_pages() to remove
+	 * this from the linux page tables. This occurs after the
+	 * stage 2 pagetable mapping is removed below.
+	 */
+	ret = mem_buf_unmap_mem_s2(vmperm->memparcel_hdl);
 	if (ret)
 		return ret;
 
-	ret = mem_buf_unmap_mem_s2(vmperm->memparcel_hdl);
-	return ret;
+	ret = gh_rm_mem_notify(vmperm->memparcel_hdl, GH_RM_MEM_NOTIFY_OWNER_RELEASED,
+			GH_MEM_NOTIFIER_TAG_MEM_BUF, NULL);
+	if (ret)
+		pr_err("%s: gh_rm_mem_notify failed\n", __func__);
+
+	xa_erase(&vmperm_xa, vmperm->memparcel_hdl);
+	vmperm->memparcel_hdl = MEM_BUF_MEMPARCEL_INVALID;
+	vmperm->flags &= ~MEM_BUF_WRAPPER_FLAG_ACCEPT;
+	kref_put(&vmperm->kref, vmperm->kref_release);
+	return 0;
 }
 
-int mem_buf_vmperm_release(struct mem_buf_vmperm *vmperm)
+static void vmperm_rcu_cb(struct rcu_head *head)
+{
+	struct mem_buf_vmperm *vmperm = container_of(head, struct mem_buf_vmperm, rcu);
+
+	kfree(vmperm->perms);
+	kfree(vmperm->vmids);
+	mutex_destroy(&vmperm->lock);
+	kfree(vmperm);
+}
+
+void mem_buf_vmperm_free(struct mem_buf_vmperm *vmperm)
+{
+	WARN_ON(vmperm->flags & MEM_BUF_WRAPPER_FLAG_LENDSHARE);
+	WARN_ON(vmperm->flags & MEM_BUF_WRAPPER_FLAG_ACCEPT);
+
+	mutex_lock(&vmperm_list_lock);
+	list_del_rcu(&vmperm->list);
+	mutex_unlock(&vmperm_list_lock);
+
+	call_rcu(&vmperm->rcu, vmperm_rcu_cb);
+}
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_free);
+
+void mem_buf_vmperm_put(struct mem_buf_vmperm *vmperm)
+{
+	kref_put(&vmperm->kref, vmperm->kref_release);
+}
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_put);
+
+/*
+ * Attempt to return to the default security state. For memory in the
+ * LENDSHARE state, this is full access by the current VM. For memory
+ * in the ACCEPT state, this is no access by the current VM.
+ *
+ * This function can fail; the hypervisor or other system entities
+ * may hold references to memory in a secure state.
+ *
+ * When called from a gunyah notifier, do nothing unless in 'zombie state'.
+ * A memory-region is considered a 'zombie' if the local dma-buf is closed.
+ */
+int mem_buf_vmperm_try_reclaim(struct mem_buf_vmperm *vmperm, bool from_notifier)
 {
 	int ret = 0;
 
-	if (vmperm->dtor) {
-		ret = vmperm->dtor(vmperm->dtor_data);
-		if (ret)
-			goto exit;
+	mutex_lock(&vmperm->lock);
+	if (from_notifier && !(vmperm->flags & MEM_BUF_WRAPPER_FLAG_ZOMBIE)) {
+		mutex_unlock(&vmperm->lock);
+		return 0;
 	}
 
-	mutex_lock(&vmperm->lock);
+	if (vmperm->dtor) {
+		ret = vmperm->dtor(vmperm->dtor_data);
+		/*
+		 * Clear dtor to prevent it from being called later by gh_notifier path.
+		 * Errors are logged, but otherwise ignored (can't unclose a dmabuf's file).
+		 */
+		vmperm->dtor = NULL;
+		if (ret)
+			pr_err_ratelimited("dma-buf destructor %pS hdl: %#x failed with %d\n",
+					vmperm->dtor, vmperm->memparcel_hdl, ret);
+	}
+
 	if (vmperm->flags & MEM_BUF_WRAPPER_FLAG_LENDSHARE)
 		ret = __mem_buf_vmperm_reclaim(vmperm);
 	else if (vmperm->flags & MEM_BUF_WRAPPER_FLAG_ACCEPT)
 		ret = mem_buf_vmperm_relinquish(vmperm);
 
+	if (ret)
+		vmperm->flags |= MEM_BUF_WRAPPER_FLAG_ZOMBIE;
 	mutex_unlock(&vmperm->lock);
-exit:
-	kfree(vmperm->perms);
-	kfree(vmperm->vmids);
-	mutex_destroy(&vmperm->lock);
-	kfree(vmperm);
+
 	return ret;
 }
-EXPORT_SYMBOL(mem_buf_vmperm_release);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_try_reclaim);
 
 int mem_buf_dma_buf_attach(struct dma_buf *dmabuf, struct dma_buf_attachment *attachment)
 {
@@ -250,7 +371,7 @@ int mem_buf_dma_buf_attach(struct dma_buf *dmabuf, struct dma_buf_attachment *at
 	ops  = container_of(dmabuf->ops, struct mem_buf_dma_buf_ops, dma_ops);
 	return ops->attach(dmabuf, attachment);
 }
-EXPORT_SYMBOL(mem_buf_dma_buf_attach);
+EXPORT_SYMBOL_GPL(mem_buf_dma_buf_attach);
 
 struct mem_buf_vmperm *to_mem_buf_vmperm(struct dma_buf *dmabuf)
 {
@@ -262,16 +383,20 @@ struct mem_buf_vmperm *to_mem_buf_vmperm(struct dma_buf *dmabuf)
 	ops = container_of(dmabuf->ops, struct mem_buf_dma_buf_ops, dma_ops);
 	return ops->lookup(dmabuf);
 }
-EXPORT_SYMBOL(to_mem_buf_vmperm);
+EXPORT_SYMBOL_GPL(to_mem_buf_vmperm);
 
-static bool mem_buf_uncached(struct dma_buf *dmabuf)
+bool is_mem_buf_dma_buf(struct dma_buf *dmabuf)
 {
-	struct mem_buf_dma_buf_ops *ops;
-
-	ops = container_of(dmabuf->ops, struct mem_buf_dma_buf_ops, dma_ops);
-	return ops->uncached(dmabuf);
+	return !IS_ERR(to_mem_buf_vmperm(dmabuf));
 }
+EXPORT_SYMBOL_GPL(is_mem_buf_dma_buf);
 
+/*
+ * No new users of this API should be added.
+ *
+ * @dtor - Called during dma_buf->ops->release(). The return value is ignored;
+ * as the dma-buf file is already closed.
+ */
 int mem_buf_dma_buf_set_destructor(struct dma_buf *buf,
 				   mem_buf_dma_buf_destructor dtor,
 				   void *dtor_data)
@@ -281,12 +406,14 @@ int mem_buf_dma_buf_set_destructor(struct dma_buf *buf,
 	if (IS_ERR(vmperm))
 		return PTR_ERR(vmperm);
 
+	mutex_lock(&vmperm->lock);
 	vmperm->dtor = dtor;
 	vmperm->dtor_data = dtor_data;
+	mutex_unlock(&vmperm->lock);
 
 	return 0;
 }
-EXPORT_SYMBOL(mem_buf_dma_buf_set_destructor);
+EXPORT_SYMBOL_GPL(mem_buf_dma_buf_set_destructor);
 
 /*
  * With CFI enabled, ops->attach must be set from *this* modules in order
@@ -323,7 +450,7 @@ mem_buf_dma_buf_export(struct dma_buf_export_info *exp_info,
 	vmperm->dmabuf = dmabuf;
 	return dmabuf;
 }
-EXPORT_SYMBOL(mem_buf_dma_buf_export);
+EXPORT_SYMBOL_GPL(mem_buf_dma_buf_export);
 
 void mem_buf_vmperm_pin(struct mem_buf_vmperm *vmperm)
 {
@@ -331,7 +458,7 @@ void mem_buf_vmperm_pin(struct mem_buf_vmperm *vmperm)
 	vmperm->mapcount++;
 	mutex_unlock(&vmperm->lock);
 }
-EXPORT_SYMBOL(mem_buf_vmperm_pin);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_pin);
 
 void mem_buf_vmperm_unpin(struct mem_buf_vmperm *vmperm)
 {
@@ -340,7 +467,23 @@ void mem_buf_vmperm_unpin(struct mem_buf_vmperm *vmperm)
 		vmperm->mapcount--;
 	mutex_unlock(&vmperm->lock);
 }
-EXPORT_SYMBOL(mem_buf_vmperm_unpin);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_unpin);
+
+static bool mem_buf_check_rw_perm(struct mem_buf_vmperm *vmperm)
+{
+	u32 perms = PERM_READ | PERM_WRITE;
+	bool ret = false;
+
+	mutex_lock(&vmperm->lock);
+	if (vmperm->flags & MEM_BUF_WRAPPER_FLAG_ERR)
+		goto unlock;
+	if (!(((vmperm->current_vm_perms & perms) == perms) && vmperm->mapcount))
+		goto unlock;
+	ret = true;
+unlock:
+	mutex_unlock(&vmperm->lock);
+	return ret;
+}
 
 /*
  * DC IVAC requires write permission, so no CMO on read-only buffers.
@@ -349,22 +492,23 @@ EXPORT_SYMBOL(mem_buf_vmperm_unpin);
  */
 bool mem_buf_vmperm_can_cmo(struct mem_buf_vmperm *vmperm)
 {
-	u32 perms = PERM_READ | PERM_WRITE;
-	bool ret = false;
-
-	mutex_lock(&vmperm->lock);
-	if (((vmperm->current_vm_perms & perms) == perms) && vmperm->mapcount)
-		ret = true;
-	mutex_unlock(&vmperm->lock);
-	return ret;
+	return mem_buf_check_rw_perm(vmperm);
 }
-EXPORT_SYMBOL(mem_buf_vmperm_can_cmo);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_can_cmo);
+
+bool mem_buf_vmperm_can_vmap(struct mem_buf_vmperm *vmperm)
+{
+	return mem_buf_check_rw_perm(vmperm);
+}
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_can_vmap);
 
 bool mem_buf_vmperm_can_mmap(struct mem_buf_vmperm *vmperm, struct vm_area_struct *vma)
 {
 	bool ret = false;
 
 	mutex_lock(&vmperm->lock);
+	if (vmperm->flags & MEM_BUF_WRAPPER_FLAG_ERR)
+		goto unlock;
 	if (!vmperm->mapcount)
 		goto unlock;
 	if (!(vmperm->current_vm_perms & PERM_READ))
@@ -380,23 +524,10 @@ unlock:
 	mutex_unlock(&vmperm->lock);
 	return ret;
 }
-EXPORT_SYMBOL(mem_buf_vmperm_can_mmap);
-
-bool mem_buf_vmperm_can_vmap(struct mem_buf_vmperm *vmperm)
-{
-	u32 perms = PERM_READ | PERM_WRITE;
-	bool ret = false;
-
-	mutex_lock(&vmperm->lock);
-	if (((vmperm->current_vm_perms & perms) == perms) && vmperm->mapcount)
-		ret = true;
-	mutex_unlock(&vmperm->lock);
-	return ret;
-}
-EXPORT_SYMBOL(mem_buf_vmperm_can_vmap);
+EXPORT_SYMBOL_GPL(mem_buf_vmperm_can_mmap);
 
 static int validate_lend_vmids(struct mem_buf_lend_kernel_arg *arg,
-				int op)
+				u32 op)
 {
 	int i;
 	bool found = false;
@@ -447,17 +578,49 @@ static bool validate_lend_mapcount(struct mem_buf_vmperm *vmperm,
 	return false;
 }
 
+/*
+ * Notice - lending to VMs which don't exist yet is allowed, but notifying
+ * vmids that don't exist is not. Since we don't have a good way to
+ * check if a vmid exists (yet), send one notification at a time.
+ */
+static void mem_buf_lend_notify(struct mem_buf_vmperm *vmperm)
+{
+	int ret, i;
+	struct gh_notify_vmid_desc *vmid_desc;
+
+	vmid_desc = kzalloc(struct_size(vmid_desc, vmid_entries, 1),
+				GFP_KERNEL);
+	if (!vmid_desc)
+		return;
+
+	vmid_desc->n_vmid_entries = 1;
+	for (i = 0; i < vmperm->nr_acl_entries; i++) {
+		vmid_desc->vmid_entries[0].vmid = vmperm->vmids[i];
+
+		ret = gh_rm_mem_notify(vmperm->memparcel_hdl, GH_RM_MEM_NOTIFY_RECIPIENT_SHARED,
+				GH_MEM_NOTIFIER_TAG_MEM_BUF, vmid_desc);
+		if (ret)
+			pr_err("%s: gh_rm_mem_notify failed for vmid %d\n",
+				__func__, vmperm->vmids[i]);
+	}
+	kfree(vmid_desc);
+}
+
 static int mem_buf_lend_internal(struct dma_buf *dmabuf,
 			struct mem_buf_lend_kernel_arg *arg,
-			int op)
+			u32 op)
 {
 	struct mem_buf_vmperm *vmperm;
 	struct sg_table *sgt;
 	int ret;
 
-	if (!arg->nr_acl_entries || !arg->vmids || !arg->perms ||
-	    mem_buf_check_vmids(arg->vmids, arg->nr_acl_entries))
+	if (!arg->nr_acl_entries || !arg->vmids || !arg->perms)
 		return -EINVAL;
+
+	if (!mem_buf_dev) {
+		pr_err("%s: mem-buf driver not probed!\n", __func__);
+		return -ENODEV;
+	}
 
 	vmperm = to_mem_buf_vmperm(dmabuf);
 	if (IS_ERR(vmperm)) {
@@ -472,6 +635,12 @@ static int mem_buf_lend_internal(struct dma_buf *dmabuf,
 		return ret;
 
 	mutex_lock(&vmperm->lock);
+	if (vmperm->flags & MEM_BUF_WRAPPER_FLAG_ERR) {
+		pr_err_ratelimited("dma-buf is not in a usable state!\n");
+		mutex_unlock(&vmperm->lock);
+		return -EINVAL;
+	}
+
 	if (vmperm->flags & MEM_BUF_WRAPPER_FLAG_STATIC_VM) {
 		pr_err_ratelimited("dma-buf is staticvm type!\n");
 		mutex_unlock(&vmperm->lock);
@@ -500,10 +669,8 @@ static int mem_buf_lend_internal(struct dma_buf *dmabuf,
 	 * whether they require cache maintenance prior to caling this function
 	 * for backwards compatibility with ion we will always do CMO.
 	 */
-	if (!mem_buf_uncached(dmabuf)) {
-		dma_map_sgtable(mem_buf_dev, vmperm->sgt, DMA_TO_DEVICE, 0);
-		dma_unmap_sgtable(mem_buf_dev, vmperm->sgt, DMA_TO_DEVICE, 0);
-	}
+	dma_map_sgtable(mem_buf_dev, vmperm->sgt, DMA_TO_DEVICE, 0);
+	dma_unmap_sgtable(mem_buf_dev, vmperm->sgt, DMA_TO_DEVICE, 0);
 
 	ret = mem_buf_vmperm_resize(vmperm, arg->nr_acl_entries);
 	if (ret)
@@ -520,9 +687,24 @@ static int mem_buf_lend_internal(struct dma_buf *dmabuf,
 			arg->nr_acl_entries);
 	vmperm->flags |= MEM_BUF_WRAPPER_FLAG_LENDSHARE;
 	vmperm->memparcel_hdl = arg->memparcel_hdl;
-
+	kref_get(&vmperm->kref);
 	mutex_unlock(&vmperm->lock);
+
+	if (vmperm->memparcel_hdl != MEM_BUF_MEMPARCEL_INVALID) {
+		ret = xa_insert(&vmperm_xa, vmperm->memparcel_hdl, vmperm,
+					GFP_KERNEL);
+		if (ret) {
+			pr_err_ratelimited("xa_insert failed for memparcel %x\n",
+						vmperm->memparcel_hdl);
+			goto err_xa;
+		}
+		mem_buf_lend_notify(vmperm);
+	}
+
 	return 0;
+err_xa:
+	mem_buf_vmperm_try_reclaim(vmperm, false);
+	return ret;
 
 err_assign:
 err_resize:
@@ -531,7 +713,7 @@ err_resize:
 }
 
 /*
- * Kernel API for Sharing, Lending, Recieving or Reclaiming
+ * Kernel API for Sharing, Lending, Receiving or Reclaiming
  * a dma-buf from a remote Virtual Machine.
  */
 int mem_buf_lend(struct dma_buf *dmabuf,
@@ -539,7 +721,7 @@ int mem_buf_lend(struct dma_buf *dmabuf,
 {
 	return mem_buf_lend_internal(dmabuf, arg, GH_RM_TRANS_TYPE_LEND);
 }
-EXPORT_SYMBOL(mem_buf_lend);
+EXPORT_SYMBOL_GPL(mem_buf_lend);
 
 int mem_buf_share(struct dma_buf *dmabuf,
 			struct mem_buf_lend_kernel_arg *arg)
@@ -592,7 +774,7 @@ int mem_buf_share(struct dma_buf *dmabuf,
 	kfree(perms);
 	return ret;
 }
-EXPORT_SYMBOL(mem_buf_share);
+EXPORT_SYMBOL_GPL(mem_buf_share);
 
 int mem_buf_reclaim(struct dma_buf *dmabuf)
 {
@@ -629,23 +811,46 @@ int mem_buf_reclaim(struct dma_buf *dmabuf)
 	mutex_unlock(&vmperm->lock);
 	return ret;
 }
-EXPORT_SYMBOL(mem_buf_reclaim);
+EXPORT_SYMBOL_GPL(mem_buf_reclaim);
 
 bool mem_buf_dma_buf_exclusive_owner(struct dma_buf *dmabuf)
 {
 	struct mem_buf_vmperm *vmperm;
 	bool ret = false;
+	u32 flags = MEM_BUF_WRAPPER_FLAG_STATIC_VM |
+		MEM_BUF_WRAPPER_FLAG_LENDSHARE |
+		MEM_BUF_WRAPPER_FLAG_ACCEPT;
 
 	vmperm = to_mem_buf_vmperm(dmabuf);
 	if (WARN_ON(IS_ERR(vmperm)))
 		return false;
 
 	mutex_lock(&vmperm->lock);
-	ret = !vmperm->flags;
+	ret = !(vmperm->flags & flags);
 	mutex_unlock(&vmperm->lock);
 	return ret;
 }
-EXPORT_SYMBOL(mem_buf_dma_buf_exclusive_owner);
+EXPORT_SYMBOL_GPL(mem_buf_dma_buf_exclusive_owner);
+
+int mem_buf_dma_buf_get_vmperm(struct dma_buf *dmabuf, const int **vmids,
+		const int **perms, int *nr_acl_entries)
+{
+	struct mem_buf_vmperm *vmperm;
+
+	vmperm = to_mem_buf_vmperm(dmabuf);
+	if (IS_ERR(vmperm))
+		return PTR_ERR(vmperm);
+
+	mutex_lock(&vmperm->lock);
+
+	*vmids = vmperm->vmids;
+	*perms = vmperm->perms;
+	*nr_acl_entries = vmperm->nr_acl_entries;
+
+	mutex_unlock(&vmperm->lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mem_buf_dma_buf_get_vmperm);
 
 int mem_buf_dma_buf_copy_vmperm(struct dma_buf *dmabuf, int **vmids,
 		int **perms, int *nr_acl_entries)
@@ -686,5 +891,153 @@ err_vmids:
 	mutex_unlock(&vmperm->lock);
 	return ret;
 }
-EXPORT_SYMBOL(mem_buf_dma_buf_copy_vmperm);
+EXPORT_SYMBOL_GPL(mem_buf_dma_buf_copy_vmperm);
 
+int mem_buf_dma_buf_get_memparcel_hdl(struct dma_buf *dmabuf,
+				      gh_memparcel_handle_t *memparcel_hdl)
+{
+	struct mem_buf_vmperm *vmperm;
+
+	vmperm = to_mem_buf_vmperm(dmabuf);
+	if (IS_ERR(vmperm))
+		return PTR_ERR(vmperm);
+
+	if (vmperm->memparcel_hdl == MEM_BUF_MEMPARCEL_INVALID)
+		return -EINVAL;
+
+	*memparcel_hdl = vmperm->memparcel_hdl;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mem_buf_dma_buf_get_memparcel_hdl);
+
+#ifdef CONFIG_QCOM_MEM_BUF_DEV_GH
+static void *gh_rm_mem_notifier_cookie;
+
+/* Find the object with matching memparcel_hdl, and grab a reference */
+static struct mem_buf_vmperm *vmperm_lookup(u32 hdl)
+{
+	struct mem_buf_vmperm *vmperm;
+
+	rcu_read_lock();
+	vmperm = xa_load(&vmperm_xa, hdl);
+	if (vmperm && !kref_get_unless_zero(&vmperm->kref))
+		vmperm = NULL;
+	rcu_read_unlock();
+
+	return vmperm;
+}
+
+/*
+ * Treat NOTIF_MEM_RELEASED as a hint. For example, if a buffer is shared
+ * with both TUIVM and OEMVM, then we would only receive 2 MEM_RELEASED
+ * calls if TUIVM and OEMVM both support sending notifications.
+ */
+static void mem_buf_vmperm_gh_notifier(enum gh_mem_notifier_tag tag, unsigned long action,
+					void *data, void *_msg)
+{
+	struct mem_buf_vmperm *vmperm;
+	struct gh_rm_notif_mem_released_payload *msg = _msg;
+
+	if (action != GH_RM_NOTIF_MEM_RELEASED)
+		return;
+
+	/* Acquire refcount */
+	vmperm = vmperm_lookup(msg->mem_handle);
+	if (!vmperm) {
+		pr_debug("%s: No vmperm for handle %d\n", __func__, msg->mem_handle);
+		return;
+	}
+
+	mem_buf_vmperm_try_reclaim(vmperm, true);
+	/* Drop refcount from vmperm_lookup */
+	kref_put(&vmperm->kref, vmperm->kref_release);
+}
+
+static int mem_buf_vmperm_gh_notifier_register(void)
+{
+	gh_rm_mem_notifier_cookie = gh_mem_notifier_register(GH_MEM_NOTIFIER_TAG_MEM_BUF,
+						mem_buf_vmperm_gh_notifier, NULL);
+	if (IS_ERR(gh_rm_mem_notifier_cookie)) {
+		pr_err("Failed: gh_mem_notifier_register\n");
+		return PTR_ERR(gh_rm_mem_notifier_cookie);
+	}
+	return 0;
+}
+#else /* CONFIG_QCOM_MEM_BUF_DEV_GH */
+static int mem_buf_vmperm_gh_notifier_register(void)
+{
+	return 0;
+}
+#endif /* CONFIG_QCOM_MEM_BUF_DEV_GH */
+
+struct summary_data {
+	int vmid;
+	size_t total;
+	size_t total_pss;
+};
+
+#define TO_MB(x) (x >> 20)
+
+static int summary_show(struct seq_file *s, void *unused)
+{
+	struct summary_data d[] = {
+		{.vmid = VMID_TVM},
+		{.vmid = VMID_OEMVM},
+		{.vmid = VMID_CP_BITSTREAM},
+		{.vmid = VMID_CP_PIXEL},
+		{.vmid = VMID_CP_NON_PIXEL},
+	};
+	struct mem_buf_vmperm *vmperm;
+	size_t total_pss = 0;
+	int i, j;
+
+	mutex_lock(&vmperm_list_lock);
+	list_for_each_entry(vmperm, &vmperm_list, list) {
+		mutex_lock(&vmperm->lock);
+		for (i = 0; i < vmperm->nr_acl_entries; i++) {
+			for (j = 0; j < ARRAY_SIZE(d); j++) {
+				if (vmperm->vmids[i] == d[j].vmid) {
+					d[j].total += vmperm->size;
+					d[j].total_pss += vmperm->size / vmperm->nr_acl_entries;
+					total_pss += d[j].total_pss;
+				}
+			}
+		}
+		mutex_unlock(&vmperm->lock);
+	}
+	mutex_unlock(&vmperm_list_lock);
+
+	seq_printf(s, "%10s %10s %10s\n", "VMID", "SIZE-MB", "PSS-SIZE-MB");
+	for (j = 0; j < ARRAY_SIZE(d); j++)
+		seq_printf(s, "%#10x %10zu %10zu\n", d[j].vmid, TO_MB(d[j].total),
+			   TO_MB(d[j].total_pss));
+	seq_printf(s, "\nTotal Pss: %zu\n", TO_MB(total_pss));
+
+	return 0;
+}
+
+static int summary_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, summary_show, NULL);
+}
+
+static const struct file_operations summary_fops = {
+	.open		= summary_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+
+int mem_buf_dma_buf_init(void)
+{
+	int ret;
+
+	ret = mem_buf_vmperm_gh_notifier_register();
+	if (ret)
+		return ret;
+
+	debugfs_create_file("mem_buf_summary", 0400, mem_buf_debugfs_root, NULL,
+			    &summary_fops);
+	return 0;
+}
