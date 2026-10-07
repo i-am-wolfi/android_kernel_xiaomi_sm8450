@@ -106,7 +106,7 @@ jobs:
         run: |
           set -o pipefail
           export PATH="/usr/lib/llvm-19/bin:/usr/local/bin:$PATH"
-          make ARCH=arm64 LLVM=1 LLVM_IAS=1 dtbs 2>&1 | tee /tmp/dtbs.log | tail -n 30
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 KCPPFLAGS="-I$PWD" dtbs 2>&1 | tee /tmp/dtbs.log | tail -n 30
         timeout-minutes: 15
 
       - name: Build Image.gz + modules + dtbs (sem LTO, log completo)
@@ -114,7 +114,7 @@ jobs:
           set -o pipefail
           export PATH="/usr/lib/llvm-19/bin:/usr/local/bin:$PATH"
           nproc; free -g | head -n 2
-          make -j$(nproc) CC="ccache clang" Image.gz modules dtbs 2>&1 | tee /tmp/build.log | tail -n 30
+          make -j$(nproc) CC="ccache clang" KCPPFLAGS="-I$PWD" Image.gz modules dtbs 2>&1 | tee /tmp/build.log | tail -n 30
           echo "--- ccache ---"; ccache -s | head -n 12
         timeout-minutes: 300
 
