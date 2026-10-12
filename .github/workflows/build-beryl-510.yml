@@ -1,0 +1,36 @@
+name: build-beryl-510
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive, fetch-depth: 1 }
+      - name: Unshallow KernelSU-Next
+        run: |
+          cd KernelSU-Next
+          git fetch --unshallow --tags || git fetch --tags --force
+          git describe --tags
+          cd ..
+      - name: Swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a; sudo rm -f /swapfile; df -h /
+          sudo fallocate -l 24G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+      - name: Dependências
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi bc bison flex libssl-dev libelf-dev cpio
+          echo "/usr/lib/llvm-18/bin" >> $GITHUB_PATH
+      - name: Build marble beryl 5.10
+        run: |
+          M="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          make $M gki_defconfig vendor/parrot_GKI.config vendor/marble_GKI.config
+          echo "RELEASE=$(make $M -s kernelrelease 2>&1)"
+          make $M -j$(nproc) Image
+      - uses: actions/upload-artifact@v4
+        with: { name: Image-beryl-marble, path: out/arch/arm64/boot/Image }
