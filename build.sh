@@ -144,6 +144,14 @@ build_modules() {
         echo_e "Unable to locate ksu module!"
     fi
 
+    susfs_path="$(find $modules_out -name 'susfs_guard_lkm.ko' -print -quit)"
+    if [ -n "$susfs_path" ]; then
+        mv "$susfs_path" out
+        echo_i "Copied to out/susfs_guard_lkm.ko"
+    else
+        echo_w "Unable to locate susfs module!"
+    fi
+
     echo_i "Building techpack modules..."
     for module in $MODULES; do
         echo -e "\nBuilding $module..."
@@ -252,7 +260,8 @@ m ./scripts/kconfig/merge_config.sh $DEFCONFIGS vendor/${TARGET}_GKI.config
 scripts/config --file out/.config \
     --set-str LOCALVERSION "-$BRANCH" \
     -d LOCALVERSION_AUTO \
-    -m CONFIG_KSU
+    -m CONFIG_KSU \
+    -m CONFIG_KSU_SUSFS
 $NO_LTO && {
     scripts/config --file out/.config \
         --set-str LOCALVERSION "-${BRANCH}-nolto" \
