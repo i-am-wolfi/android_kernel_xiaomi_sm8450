@@ -134,6 +134,7 @@ build_modules() {
     m modules
     rm -rf out/modules out/*.ko
     m INSTALL_MOD_PATH=modules INSTALL_MOD_STRIP=1 modules_install
+    modules_out="out/modules/lib/modules/$(ls -t out/modules/lib/modules/ | head -n1)"
 
     ksu_path="$(find $modules_out -name 'kernelsu.ko' -print -quit)"
     if [ -n "$ksu_path" ]; then
@@ -154,7 +155,6 @@ build_modules() {
     first_stage_modules="$(cat modules.list.msm.waipio)"
     second_stage_modules="$(cat modules.list.second_stage modules.list.second_stage.$TARGET)"
     vendor_dlkm_modules="$(cat modules.list.vendor_dlkm modules.list.vendor_dlkm.$TARGET)"
-    modules_out="out/modules/lib/modules/$(ls -t out/modules/lib/modules/ | head -n1)"
 
     rm -rf $VBOOT_DIR && mkdir -p $VBOOT_DIR
     rm -rf $VDLKM_DIR && mkdir -p $VDLKM_DIR
@@ -256,7 +256,7 @@ scripts/config --file out/.config \
 $NO_LTO && {
     scripts/config --file out/.config \
         --set-str LOCALVERSION "-${BRANCH}-nolto" \
-        -d LTO_CLANG_FULL -e LTO_NONE
+        -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE
     echo_i "Disabled LTO!"
 }
 
